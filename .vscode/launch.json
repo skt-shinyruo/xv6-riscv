@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "xv6: attach to QEMU gdb",
+      "type": "gdb",
+      "request": "attach",
+      "target": "127.0.0.1:26000",
+      "remote": true,
+      "executable": "${workspaceFolder}/kernel/kernel",
+      "cwd": "${workspaceFolder}",
+      "gdbpath": "/usr/bin/gdb-multiarch",
+      "debugger_args": [
+        "--nx"
+      ],
+      "valuesFormatting": "disabled",
+      "stopAtConnect": true,
+      "autorun": [
+        "set architecture riscv:rv64",
+        "set confirm off",
+        "set disassemble-next-line auto",
+        "set riscv use-compressed-breakpoints yes"
+      ]
+    }
+  ]
+}
