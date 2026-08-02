@@ -79,7 +79,7 @@ inode 缓存、目录查找、块映射、日志提交与控制台内部算法�
 - `fork()` 给子进程填充对应 fd 槽，同时增加每个非空 `struct file` 的 `ref`；它不新建全局 file 槽。
 - 对同一路径再次 `open()` 会新建 `struct file`，即使底层最终是同一个 inode。
 
-全局表采用固定数组和线性扫描，没有动态扩容、空闲链表或每用户配额。资源耗尽统一以 `-1` 向系统调用层报告，不提供 `EMFILE`、`ENFILE` 等细分错误码。
+全局表采用固定数组和线性扫描，没有动态扩容、空闲链表或每用户配额。fd 槽和全局 file 槽耗尽时，相关系统调用以 `-1` 报告，且不区分 `EMFILE`、`ENFILE`。这不是全内核的统一耗尽规则：`iget()` 找不到 inode cache 槽、`bget()` 找不到可复用 buffer 时会 panic；物理页、磁盘 dinode、数据块、日志和 VirtIO descriptor 又各有返回、等待或 panic 语义。完整对照见[资源失败矩阵](../reference/resource-failure-matrix.md)。
 
 ## 4. `struct file`：打开实例的状态
 
@@ -405,6 +405,8 @@ inode sleeplock同时保护 inode 内容和同一 inode 上 I/O 的关键区。�
 
 `copyout()` 失败同样返回 `-1`；已经生成快照不会改变任何文件状态。
 
+当前 `struct stat` 在两个 16-bit 字段与 64-bit `size` 之间有 4 字节 ABI padding；`filestat()` 的栈上 `struct stat st` 未先整体清零，而 `stati()` 只写具名字段，因此这 4 字节可能泄露旧内核栈内容。该问题也列入[系统调用文档的实现边界](system-calls.md)。调用者不能把 padding 当作稳定数据，内核修复应先清零完整结构再赋值。
+
 `kernel/file.h` 还提供设备号编码宏：`mkdev(major, minor)` 把两个 16 位部分组合成 `uint`，`major(dev)` 和 `minor(dev)` 再拆分。设备 inode 自身另有 `ip->major`/`ip->minor`；当前打开文件分派只复制前者到 `f->major`。不能从 `stat.dev` 推断这个设备 inode 的驱动主编号。
 
 ## 11. `filewrite()` 的三种后端
@@ -588,7 +590,7 @@ while i < n:
 
 写者在有空间时持续持有 `pipe.lock`，其他写者无法插入。但缓冲满时 `sleep()` 会释放锁；多个写者可能在唤醒和再次填充之间交错。当前源码没有独立 `PIPE_BUF` 承诺，也不保证任意长度 write 作为整体不可分割。
 
-特别是大于 512 字节的写必然至少等待一次，除非读者同步消费。文档不应把单写者测试 `pipe1` 推广成多写者原子性保证。
+特别是成功写入大于 512 字节的单次调用必然至少等待一次：writer 在填充缓冲时一直持有 `pipe.lock`，reader 只有在 writer 因满缓冲进入 `sleep()` 并释放该锁后才能消费。文档不应把单写者测试 `pipe1` 推广成多写者原子性保证。
 
 ## 17. `piperead()`：空缓冲、EOF 和部分读取
 
@@ -738,7 +740,7 @@ pipe 是字节流而不是消息队列。一次 `write()` 的边界不存入缓�
 审阅或修改本模块时，应逐项保持以下不变量：
 
 1. `ftable.file[i].ref == 0` 表示该槽可重新分配；认领和引用变化只能在 `ftable.lock` 下进行。
-2. 每个已安装的 `p->ofile[fd]` 对应 `struct file.ref` 中恰好一个引用。
+2. 在系统调用入口/出口、进程已发布和调度点等稳定边界，每个已安装的 `p->ofile[fd]` 对应 `struct file.ref` 中恰好一个引用。构造过程有受控窗口：`sys_dup()` 先由 `fdalloc()` 安装 fd、再 `filedup()`；`sys_open()` 也会在 file 字段完全初始化前安装 fd。当前单线程进程和未返回用户态保证这些中间状态不被本进程并发观察；引入线程后必须改成原子发布协议。
 3. `fdalloc()` 成功只转移引用，不新建引用；`dup()`/`fork()` 才调用 `filedup()`。
 4. 最后一次 `fileclose()` 不得在持有 `ftable.lock` 时调用可能睡眠的底层关闭。
 5. `FD_INODE`/`FD_DEVICE` 的 file 在存活期间持有一个 inode 引用，最终关闭在日志事务内 `iput()`。

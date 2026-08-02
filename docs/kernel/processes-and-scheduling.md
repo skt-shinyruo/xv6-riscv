@@ -130,7 +130,7 @@ CPU c 的 scheduler context  <--swtch-->  进程 p 的 kernel context
 | `chan` | 必须持有 `p->lock` | `SLEEPING` 时的等待通道，醒来后清零 |
 | `killed` | 必须持有 `p->lock` | 延迟终止请求，不代表已经退出 |
 | `xstate` | 必须持有 `p->lock` | `kexit()` 写、父进程 `kwait()` 读的退出状态 |
-| `pid` | 必须持有 `p->lock` | 当前逻辑进程 id；`UNUSED` 时为 0 |
+| `pid` | 修改、槽复用和跨 owner 读取必须持有 `p->lock`；当前进程可依赖自身生命周期稳定读取，`procdump` 是诊断例外 | 当前逻辑进程 id；`UNUSED` 时为 0 |
 | `parent` | 必须持有全局 `wait_lock` | 父进程关系；不能只持子进程锁修改 |
 | `kstack` | 槽固定，进程私有 | 内核栈的固定虚拟地址；槽释放时不销毁 |
 | `sz` | 运行中的进程私有 | 用户地址空间逻辑大小，可能包含延迟分配空洞 |
@@ -151,14 +151,14 @@ CPU c 的 scheduler context  <--swtch-->  进程 p 的 kernel context
 | `wait_lock` | 所有 `p->parent` 及 exit/wait/reparent 协议 | 必须在任何相关 `p->lock` 之前获取 |
 | `p->lock` | `state/chan/killed/xstate/pid`、调度资格及内核栈排他使用 | scheduler 与进程会跨 `swtch()` 转移持有权 |
 
-全局锁顺序是：
+进程等待/父子协议中的两条关键顺序是：
 
 ```text
 wait_lock -> 任意子进程或当前进程的 p->lock
 条件锁 lk -> 等待者的 p->lock          （sleep/wakeup 协议）
 ```
 
-不能反向持有 `p->lock` 再获取 `wait_lock`。`sched()` 更严格：进入时只能持有当前进程自己的 `p->lock`。
+这不是全内核锁图；`allocproc()` 等路径还会从 `p->lock` 获取 allocator、file、inode 或 `pid_lock`。完整调用图见[同步与锁](synchronization.md#111-当前源码的跨模块依赖图)。父子关系路径不能反向持有 `p->lock` 再获取 `wait_lock`。`sched()` 更严格：进入时只能持有当前进程自己的 `p->lock`。
 
 ## 4. 初始化与永久内核栈
 
@@ -359,7 +359,7 @@ prepare_return()
   -> allocproc()，得到持锁的 USED 子进程 np
   -> uvmcopy(p->pagetable, np->pagetable, p->sz)
   -> np->sz = p->sz
-  -> 整页复制 trapframe
+  -> 结构体赋值复制 288 字节 trapframe（不是整页复制）
   -> np->trapframe->a0 = 0
   -> 对每个非空 ofile 调用 filedup()
   -> np->cwd = idup(p->cwd)
@@ -714,7 +714,7 @@ p->state == SLEEPING && p->chan == chan
 
 修改进程代码时应逐条检查以下陈述：
 
-1. CPU 0 在其他 hart 和 scheduler 尚不可运行的 `procinit()` 启动阶段可以无锁建立每个槽的初始 `state=UNUSED`；此后只有持有目标 `p->lock` 的代码才能改变 `state/chan/killed/xstate/pid`。`procdump()` 的无锁只读是有意的诊断折中。
+1. CPU 0 在其他 hart 和 scheduler 尚不可运行的 `procinit()` 启动阶段可以无锁建立每个槽的初始 `state=UNUSED`；此后只有持有目标 `p->lock` 的代码才能改变 `state/chan/killed/xstate/pid`。拥有自身执行权的当前进程可无锁读取生命周期稳定的 `pid` 等私有状态；另一个 hart 不能据此读取正在回收的槽。`procdump()` 的无锁只读是有意的诊断折中。
 2. 已发布进程的 `parent` 读取或写入都在 `wait_lock` 下；父子关系不由 `p->lock` 保护。唯一受控例外是 `freeproc()` 回滚尚未发布、`parent` 仍为 0 的构造失败槽；正常 wait 回收时调用者同时持有 `wait_lock`。
 3. `wait_lock` 总是在任意 `p->lock` 之前获取。
 4. 进程进入 `sched()` 前已把状态改为非 `RUNNING`，只持有自己的 `p->lock`，且中断关闭。

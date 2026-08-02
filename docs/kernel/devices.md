@@ -128,6 +128,8 @@ device raises IRQ
 
 UART 在 handler 内读取 ISR/LSR/RHR，VirtIO 在 handler 内确认设备 MMIO interrupt status；`devintr()` 在这些设备级处理之后才 complete PLIC。代码即使遇到未知非零 IRQ 也会 `printk()` 并 complete，避免永久占住该 PLIC source。claim 返回零时既不调用 handler 也不 complete，但 `devintr()` 仍对这次 external trap 返回 1。timer interrupt 返回 2，只有该返回值会让 trap 层考虑 `yield()`。
 
+`devintr()` 每次 external trap 只执行一次 claim，不循环清空 PLIC。UART handler 可以在这一次 source 服务中排空当前 RX 字节，VirtIO handler可以消费当前全部 used entries；其他 pending source 留给之后的 trap或另一个 hart。对未知的 level-triggered source，complete只结束本次 in-service状态；若驱动没有清除设备级电平，gateway会立即再次置 pending，形成中断风暴，而不是因 complete永久消失。
+
 ## 5. UART 初始化
 
 `uartinit()` 直接配置 16550A：
@@ -227,14 +229,13 @@ w: 已发布给 read() 的可读边界
 e: 当前编辑位置
 ```
 
-忽略 `uint` 回绕时，概念不变量是：
+忽略 `uint` 回绕时，可以把概念顺序画成 `r <= w <= e`。真正跨回绕仍成立、且源码可以依赖的不变量应写成无符号距离：
 
 ```text
-r <= w <= e
-e - r <= INPUT_BUF_SIZE
+(uint)(w-r) <= (uint)(e-r) <= INPUT_BUF_SIZE
 ```
 
-数组访问时才对 `INPUT_BUF_SIZE` 取模；计数器不会在每绕一圈时清零。代码不做 `r <= w <= e` 的有序比较，只比较相等性以及无符号差 `e-r`，因此计数器按 32 位模算术回绕后，只要占用量始终不超过 128，缓冲区距离仍然成立。
+数组访问时才对 `INPUT_BUF_SIZE` 取模；计数器不会在每绕一圈时清零。代码不做原始计数器的有序比较，只比较相等性以及无符号差 `e-r`；因为两个距离始终不超过 128，32 位模算术回绕后仍能唯一解释已发布区和编辑区长度。
 
 `r..w` 是已经发布、用户可读的数据，可能包含多行；`w..e` 是最近一次发布可读边界之后、仍可被 backspace 或 kill-line 修改的编辑区。总占用量 `e-r` 同时包括已发布但尚未读取的数据和当前编辑数据。
 
@@ -337,7 +338,7 @@ Spinlock 获取会通过 `push_off()` 关闭当前 CPU 中断。因此中断处�
 
 ## 14. 失败与限制
 
-- 未知非零 PLIC IRQ：内核打印后 complete；claim 为零时不 complete，但这两种 external trap 都返回“已识别设备中断”。没有动态驱动注册。
+- 未知非零 PLIC IRQ：内核打印后 complete；若设备级 level 原因仍有效，会立即再次 pending并可能形成中断风暴。claim 为零时不 complete，但这两种 external trap 都返回“已识别设备中断”。每次 trap只 claim一个 source，没有动态驱动注册。
 - UART 永远不出现 THRE：同步输出永久忙等；当 `tx_busy=1` 时，后续字节或其他 writer 依赖 TX interrupt 清条件，也没有 timeout。
 - 同步输出不取 `tx_lock`、不更新 `tx_busy`；中断式输出只看 `tx_busy`，写 THR 前不检查 LSR。并发时不仅消息可按字符交错，sync 写入后 async writer 还可能在 THR 尚未 ready 时直接写，某次 THRE interrupt 也可能清除并非由同一输出者对应的 busy。启用的硬件 FIFO 能吸收有限字节，但驱动没有软件层面的统一所有权或溢出处理。
 - 输入占用达到 128 字节时会强制发布可读边界，但 reader 释放空间之前的新字符被丢弃；驱动没有 overrun、parity、framing 等接收错误报告。

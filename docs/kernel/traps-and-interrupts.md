@@ -60,7 +60,7 @@
 | cause | 请求/pending 的来源 | 到 S-mode 的路由 | cause 分类开关 | CSR 之前的上游门 |
 | --- | --- | --- | --- | --- |
 | supervisor external interrupt，code 9 | PLIC 对本 hart supervisor context 产生 notification，反映为 `sip.SEIP` pending | `mideleg.SEI=1` | `sie.SEIE=1` | 设备自身的 interrupt enable/ack，以及 PLIC priority、pending、context enable 和 threshold |
-| supervisor timer interrupt，code 5 | Sstc 在 `time >= stimecmp` 时使 `sip.STIP` pending | `mideleg.STI=1` | `sie.STIE=1` | `menvcfg.STCE=1` 与 `mcounteren.TM=1` 共同开放 S-mode 的 `stimecmp`，TM 还开放 `time`；将 compare 写到未来值使当前请求解除并预约下次请求 |
+| supervisor timer interrupt，code 5 | Sstc 在 `time >= stimecmp` 时使 `sip.STIP` pending | `mideleg.STI=1` | `sie.STIE=1` | `menvcfg.STCE=1` 开放 S-mode 的 `stimecmp`，`mcounteren.TM=1` 独立开放 `time` 读取；handler 的 read-time/write-compare 路径需要两者 |
 | 来自 U-mode 的同步异常 | 当前指令执行直接产生，不经 pending 位 | `medeleg[cause]=1` | 无；不受 `sie` 控制 | 例如 `ecall`、页表翻译或权限检查 |
 
 对前两类目标为 S-mode 的中断，当 pending、delegation 和对应 `sie` 位均满足后，当前特权级再决定 `SIE` 的作用：
@@ -322,7 +322,7 @@ userret                      （起初仍是内核页表）
 
 ### 9.1 时钟路径
 
-每个 hart 在 `start()` 中同时设置 `menvcfg.STCE` 与 `mcounteren.TM`；二者共同使已由硬件实现的 Sstc `stimecmp` 可供 S-mode 使用，TM 还开放 `time`，然后首次设置：
+每个 hart 在 `start()` 中同时设置 `menvcfg.STCE` 与 `mcounteren.TM`：前者使已由硬件实现的 Sstc `stimecmp` 可供 S-mode 使用，后者允许 S-mode 读取 `time`。两项作用独立，而下面这条 read-time/write-compare 路径同时需要它们：
 
 ```text
 stimecmp = time + 1,000,000

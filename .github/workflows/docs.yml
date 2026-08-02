@@ -1,0 +1,17 @@
+name: docs
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  traceability:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Check documentation traceability
+        run: ./docs/check-docs.sh

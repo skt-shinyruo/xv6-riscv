@@ -59,7 +59,7 @@ readelf -A kernel/kernel
 3. `medeleg/mideleg` 尝试把低 16 个实现支持的 cause 委托给 S-mode；CSR 是 WARL，写入 1 不保证读回仍为 1；
 4. `sie.SEIE/STIE` 打开 S-mode 外部/时钟类别；`sstatus.SIE` 只在当前正处于 S-mode 时作为全局门；
 5. `pmpcfg0` 的 entry 0 被配置为 TOR，给 S-mode 物理地址读、写、执行权限；
-6. Sstc 的 `menvcfg.STCE` 与 `mcounteren.TM` 必须同时为 1，S-mode 才能访问 `stimecmp`；`TM` 还同时开放 `time` 读取。任一位缺失都不能由另一位替代。
+6. Sstc 的 `menvcfg.STCE` 控制 S-mode 对 `stimecmp` 的访问及比较功能；`mcounteren.TM` 独立控制 S-mode 读取 `time`。`clockintr()` 的 `w_stimecmp(r_time()+1000000)` 同时需要两者，但 TM 不授予 `stimecmp` 权限，STCE 也不授予 `time` 读取权限。
 
 `pmpcfg0=0xf` 的低配置字节可逐位解码为 `R=W=X=1`、`A=01 (TOR)`、`L=0`；同一 CSR 中 entries 1 到 7 的配置字节被写成零，即 OFF。代码没有配置实现可能提供的更高编号 PMP entry。entry 0 没有前一项，所以 TOR 下界是 0，上界是实现实际接受的 `pmpaddr0 << 2`。源码写入 `pmpaddr0=0x3fffffffffffff`，名义上把上界推到 `2^56-4`，但 `pmpaddr0` 是 WARL，未实现的高地址位可以读回为零；因此严格结论只是它覆盖当前实现所需的低物理地址窗口，不能把这个常量解读成对任意物理地址宽度的“全部内存”承诺。`L=0` 还表示 entry 未锁定；当前代码在 `mret` 后不再回到 M-mode 修改它。
 
@@ -83,6 +83,8 @@ Sv39 来自 privileged v1.12 的 address-translation 章节。当前实现选择
 叶 PTE 的 R/W/X 合法组合和 `PTE_U` 权限由硬件执行。当前代码创建映射时不预置 Accessed/Dirty，且没有 A/D software-fault handler，因此依赖平台硬件更新 A/D；完整后果见[虚拟内存](../kernel/memory.md)。
 
 `sfence.vma` 是地址翻译同步，不是普通数据 cache flush，也不保证 VirtIO DMA 可见性。反过来，virtqueue 的 `__atomic_thread_fence(__ATOMIC_SEQ_CST)` 不能替代修改 PTE 后的 TLB 同步。内核把 UART、VirtIO 和 PLIC 以普通 `PTE_R|PTE_W` 恒等映射建立，未显式设置 PBMT/cache 属性；这依赖 QEMU/目标平台的 PMA 将这些物理区识别为设备内存，并不构成可移植的 cacheability 或 I/O-ordering 声明。
+
+`sfence.vma` 也不等价于 `fence.i`。当前 `kexec()` 先由数据 store 填充新代码页，`uvmcopy()` 还会复制可能可执行的页，但仓库没有任何 `fence.i` 或跨 hart instruction-cache 同步协议；进程又可能迁移到另一个 hart 执行。当前 QEMU 行为使这些路径可用，不能据此宣称适用于一般的非一致 I-cache 实现。移植到真实硬件时，必须在新指令对本 hart可取指前执行适当 `FENCE.I`，并为可能执行该地址空间的其他 hart 定义远端同步/调度协议。
 
 ## 5. psABI、系统调用 ABI 与汇编边界
 

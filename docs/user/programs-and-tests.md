@@ -267,7 +267,9 @@ ALL TESTS PASSED
 
 | 用例 | 核心断言 |
 |---|---|
-| `truncate1/2/3` | `O_TRUNC` 的大小、块复用和多种打开序列 |
+| `truncate1` | `O_TRUNC` 立即把同一 inode 的 size 置 0；截断前已打开的 fd 看到新 EOF，随后写入后各 fd 仍按各自旧 offset 读取 |
+| `truncate2` | 一个 fd 的 offset 在另一个 open 截断后越过新 EOF时，当前 xv6 再写返回 `-1` 而不是 panic |
+| `truncate3` | 一个进程反复 open/write/read，另一个并发 create+truncate+write；两者返回值正确、无崩溃，child 状态为 0 |
 | `iput`、`exitiput` | 最后引用释放、exit 关闭等路径不会死锁或泄漏 inode |
 | `openiput` | 目录写打开失败与并发 unlink 的 inode 释放路径；只有按源码注释在 `sys_open()` 的 `namei()` 后临时插入多次 `yield()`，才会可靠制造目标交错，未修改内核时运行不构成该竞态的充分验证 |
 | `opentest` | 只验证已有路径 `echo` 能打开、路径 `doesnotexist` 不能打开；不覆盖重复 open 或模式边界 |

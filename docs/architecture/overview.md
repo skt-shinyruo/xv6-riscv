@@ -168,11 +168,14 @@ MAXVA
 | `NOFILE` | 16 | 每进程 fd 表 |
 | `NFILE` | 100 | 全局 open-file descriptions |
 | `NINODE` | 50 | 同时缓存的内存 inode 数量 |
+| `NDEV` | 10 | `devsw[]` 的 major 编号上界；合法 major 为 0..9 |
+| `ROOTDEV` | 1 | 当前唯一根文件系统设备号；不等于 console major 或 PLIC IRQ |
 | `MAXARG` | 32 | `exec` 内核 argv 数组 |
 | `MAXOPBLOCKS` | 10 | 单个 `begin_op()`/`end_op()` 日志操作区间的空间预算 |
 | `LOGBLOCKS` | 30 | redo log 最多记录的不同 home blocks |
 | `NBUF` | 30 | buffer cache；还必须容纳被日志 pin 的 block |
 | `FSSIZE` | 2000 | `mkfs` 生成的块数 |
+| `MAXPATH` | 128 | 系统调用把用户路径导入固定内核缓冲区时的上界 |
 | `USERSTACK` | 1 | `exec` 分配的用户栈页数，不含 guard page |
 
 修改日志相关三个常量时，必须同时检查 `begin_op()` 的预留公式、`filewrite()` 的分批上限和提交阶段所需的临时 buffer；完整推导见[文件系统与日志资源上界](../kernel/resource-bounds.md)。修改 `NCPU` 时必须保证 QEMU 的 `CPUS` 不超过它。

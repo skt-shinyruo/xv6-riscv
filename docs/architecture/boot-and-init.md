@@ -60,7 +60,7 @@ Makefile 使用的核心启动参数是：
 -machine virt -bios none -kernel kernel/kernel -m 128M -smp $(CPUS)
 ```
 
-完整参数还用 `-global virtio-mmio.force-legacy=false` 强制现代 VirtIO MMIO 接口，并把 `fs.img` 连接为 block device；这与 `virtio_disk_init()` 要求 MMIO version 2 相互依赖。Makefile 的版本检查以 7.2 为名义下限，以覆盖本实现使用的 Sstc 支持；但它把 `major.minor` 当十进制数交给 `bc`，不是可靠的语义版本比较，也不能替代 Sstc 能力探测。
+完整参数还用 `-global virtio-mmio.force-legacy=false` 强制现代 VirtIO MMIO 接口，并把 `fs.img` 连接为 block device；这与 `virtio_disk_init()` 要求 MMIO version 2 相互依赖。只有 `make qemu` 依赖名义上的 7.2 版本检查，`make qemu-gdb` 不依赖它；该检查又把 `major.minor` 当十进制数交给 `bc`，不是可靠的语义版本比较，也不能替代 Sstc 能力探测。
 
 `-bios none` 取消的是外部固件/OpenSBI payload，并不会移除 QEMU 机器自身的 MROM reset stub。xv6 也不解析固件可能传入的设备树参数：`_entry` 立即改写 `a0/a1`，设备地址和 RAM 上界全部来自编译期的 `memlayout.h`。
 
@@ -104,7 +104,7 @@ sp = stack0 + (mhartid + 1) * 4096
 
 `medeleg`、`mideleg` 写入 `0xffff`，将可委托的异常/中断交给 supervisor。`sie` 开启 supervisor external interrupt 和 supervisor timer interrupt 对应位。
 
-写入委托寄存器并不等于立刻允许普通中断：全局 `sstatus.SIE` 的开启由后续 supervisor 代码控制。
+写入委托寄存器并不等于立刻允许普通中断。源码在安装 `stvec` 前也没有显式清 `sstatus.SIE`；它依赖 QEMU 交接时该位为 0，并由 `mret` 原样带入 S-mode。当前第一次显式 `intr_on()` 在 `scheduler()` 中，发生在 `trapinithart()` 之后。换启动环境时必须把 `SIE=0` 作为入口前提验证，而不能把它误认为 `start()` 已主动建立的状态。
 
 ### 5.4 开放物理内存
 
@@ -115,8 +115,8 @@ PMP entry 0 被配置为覆盖宽范围并允许读写执行，使 supervisor �
 `timerinit()`：
 
 1. 设置 `menvcfg` 的 STCE 位；
-2. 设置 `mcounteren` 的 TM 位；STCE 与 TM 共同允许 supervisor 访问 `stimecmp`，TM 还允许读取 `time`，缺少任一位都会使 `stimecmp` 访问非法；
-3. 把首次 `stimecmp` 设为 `time + 1000000`。
+2. 设置 `mcounteren` 的 TM 位，使 S-mode 可以读取 `time`；`menvcfg.STCE` 单独控制 S-mode 对 `stimecmp` 的访问和比较功能，TM 不授予 `stimecmp` 权限；
+3. 把首次 `stimecmp` 设为 `time + 1000000`。后续 S-mode 的 `clockintr()` 同时读取 `time` 并写 `stimecmp`，所以整条表达式需要 TM 与 STCE 两项权限，但两者作用不同。
 
 后续每次 timer interrupt 都由 `clockintr()` 再次设置 `stimecmp`。这版实现不使用旧版 xv6 的 machine-mode timer scratch/软件中断转发方案。
 
@@ -174,6 +174,22 @@ publish started = 1
 - buffer、inode、file 表和 VirtIO 必须在文件系统被任何进程使用前完成；
 - `userinit` 经 `allocproc()` 建立首进程、空用户页表和 trapframe，并用 `namei("/")` 取得当前目录的内存 inode 引用，最后将它置为 `RUNNABLE`。路径 `/` 没有待遍历的分量，所以这里的 `namei()` 只执行 `iget()`，不会 `ilock()` inode 或发起磁盘 I/O。
 
+### 7.1 `kvmmake()` 实际建立的映射
+
+| 虚拟范围 | 物理范围 | PTE 权限 | 说明 |
+|---|---|---|---|
+| `UART0..UART0+PGSIZE` | 恒等 | R/W | 16550A MMIO |
+| `VIRTIO0..VIRTIO0+PGSIZE` | 恒等 | R/W | VirtIO MMIO transport |
+| `PLIC..PLIC+0x4000000` | 恒等 | R/W | PLIC priority/pending/contexts 窗口 |
+| `KERNBASE..etext` | 恒等 | R/X | 内核 text 与 trampoline 原始位置，不可写 |
+| `etext..PHYSTOP` | 恒等 | R/W | 内核其余静态数据与可分配 RAM，不可执行 |
+| `TRAMPOLINE` 一页 | `_trampoline` 物理页 | R/X | 同一代码页的高地址别名 |
+| 每个 `KSTACK(i)` 一页 | 启动时分配的页 | R/W | 相邻低地址页不映射，作为 guard |
+
+当前链接脚本把 `.rodata` 放在 `etext` 之后，所以它实际落入 R/W 映射，并没有硬件只读保护。分页前的内核 ELF 又是单个 RWE `PT_LOAD`；ELF segment flags、section 名称和最终 PTE 权限是三套不同事实。`stack0` 位于 `etext..PHYSTOP` 的 R/W 恒等映射中，各 hart 4 KiB slice 相邻且没有 guard/canary；它会继续作为 scheduler 栈，而不只是临时启动栈。
+
+`mappages()` 创建叶 PTE 时不预置 A/D 位。若平台只支持以 page fault 交给软件设置 A/D 的 Svade 行为，`kvminithart()` 写入 `satp` 后的第一次内核取指就可能 fault；此时 `trapinithart()` 尚未执行，`stvec` 还没有有效 supervisor 向量，当前内核无法恢复。因而“硬件自动更新 A/D”是启用分页前的启动前提，而不是普通运行期降级路径。
+
 ## 8. 其他 hart 的汇合
 
 非零 hart 在未分页的早期栈上轮询 `started`。CPU 0 完成共享初始化后执行顺序一致性 fence，再写 `started = 1`；其他 hart 观察到非零后也执行 fence，然后完成自己的：
@@ -182,7 +198,7 @@ publish started = 1
 kvminithart -> trapinithart -> plicinithart -> scheduler
 ```
 
-`volatile` 阻止编译器把轮询优化掉，原子 fence 负责跨 CPU 的可见性顺序。这个协议假定只有 CPU 0 写 `started`，其他 CPU 只读。
+`volatile` 阻止编译器把轮询优化掉，两个 `__atomic_thread_fence(__ATOMIC_SEQ_CST)` 在当前 GCC/RISC-V 产物中形成 fence + 普通 store/load 的发布/观察序列。`started` 本身却不是 C11 `_Atomic`，并发普通读写在 ISO C 抽象机中仍是 data race；所以这只是当前工具链和目标机器层面的实现协议，不是可移植 C 原子发布。协议还假定只有 CPU 0 写，其他 CPU 只读；可移植加固应改用带 release/acquire 语义的原子对象。
 
 非零 hart 不能重新执行 `kvminit()`、`procinit()` 等全局初始化，否则会替换共享页表或重置已经可见的锁/状态。
 
