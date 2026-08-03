@@ -53,7 +53,7 @@ int sysinfo(struct sysinfo *out);
 
 ## 5. 验收条件
 
-- `docs/check-docs.sh` 的 syscall propagation 检查通过，生成 stub 与源码一致；
+- 系统调用号、用户声明、生成 stub、内核分派和 handler 经人工/静态核对一致；
 - 合法调用返回 0，所有 reserved 字段为 0，数值在容量范围内；
 - null、`MAXVA`、只读用户页和跨有效/无效页的输出地址返回 -1，内核不 panic；
 - 合法 lazy 输出页按当前 `copyout` 策略物化并成功；

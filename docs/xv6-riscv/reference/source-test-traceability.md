@@ -13,14 +13,14 @@
         -> 解释它的主文档
         -> 改动必须保持的不变量
         -> 能发现一部分违反的现有测试
-        -> 仍未被自动验证的空白
+        -> 仍未有充分证据覆盖的空白
 ```
 
 “测试”列只表示相关证据，不表示完备证明。证据强度按以下标签区分：
 
 | 标签 | 含义 | 典型例子 |
 |---|---|---|
-| S | 静态核对：编译、链接、符号或文档漂移 | `make`、`docs/check-docs.sh` |
+| S | 静态核对：编译、链接、符号或人工文档审阅 | `make`、符号/ABI 对照、链接审阅 |
 | F | 正常功能路径 | `opentest`、`exectest` |
 | B | 参数、容量或错误边界 | `copyin`、`sbrkfail`、`diskfull` |
 | C | 并发或调度压力 | `preempt`、`manywrites`、`grind` |
@@ -62,7 +62,7 @@
 |---|---|---|---|---|
 | `kernel/trampoline.S:uservec/userret`、`kernel/trap.c:usertrap/prepare_return` | [Trap 与中断](../kernel/traps-and-interrupts.md)、[系统调用往返](../flows/syscall-round-trip.md)、[trampoline.S](../assembly/trampoline.md) | 用户 GPR/`sepc`/`sstatus` 完整保存恢复；`satp`、`stvec` 和 trapframe 只在中断关闭窗口切换；返回前 killed 状态统一处理 | F/B: 所有 syscall、用户 fault 和 `killstatus` | 没有逐寄存器往返测试；嵌套 trap 返回窗口和 CSR 前后态未自动核对 |
 | `kernel/kernelvec.S:kernelvec`、`kernel/trap.c:kerneltrap/clockintr/devintr` | [Trap 与中断](../kernel/traps-and-interrupts.md)、[设备](../kernel/devices.md)、[kernelvec.S](../assembly/kernel-trap-vector.md)、[timer 抢占与迁移](../flows/timer-preemption-and-migration.md) | C ABI caller-saved 状态完整；kernel trap 返回原 `sepc/sstatus`；timer 只在可抢占进程上 yield；PLIC claim/complete 配对 | C: `preempt`、多核 I/O 测试 | 未注入每个 kernel 指令点的 timer；未知 level IRQ 重触发没有测试 |
-| `kernel/syscall.h`、`kernel/syscall.c:syscall/argraw/argaddr/argstr`、`user/usys.pl`、`user/user.h` | [系统调用](../kernel/system-calls.md)、[用户 ABI](../user/runtime-and-abi.md) | 系统调用号、用户 stub、分发表、handler 和声明一一对应；参数寄存器及返回值宽度一致；未知号不越界 | S: `docs/check-docs.sh` 核对四处名称；F/B: `usertests` | checker 只核对名称，不解析 C 类型或 `sbrk` 的仓库特有双参数 ABI |
+| `kernel/syscall.h`、`kernel/syscall.c:syscall/argraw/argaddr/argstr`、`user/usys.pl`、`user/user.h` | [系统调用](../kernel/system-calls.md)、[用户 ABI](../user/runtime-and-abi.md) | 系统调用号、用户 stub、分发表、handler 和声明一一对应；参数寄存器及返回值宽度一致；未知号不越界 | S: 人工/静态核对四处名称；F/B: `usertests` | 名称核对不解析 C 类型或 `sbrk` 的仓库特有双参数 ABI |
 | `kernel/sysproc.c:sys_fork/sys_exit/sys_wait/sys_sbrk/...` | [系统调用](../kernel/system-calls.md)、[进程与调度](../kernel/processes-and-scheduling.md)、[kill 阻塞进程](../flows/kill-blocked-process.md) | 参数取得后委托正确内核 primitive；错误/kill/部分副作用符合各 syscall 契约 | B/C: 进程、时间和 sbrk 相关 quick tests | `pause`/`uptime` 精度、溢出和多 hart 时间可见性覆盖较弱 |
 
 ## 6. fd、file、pipe 和命名层
@@ -70,7 +70,7 @@
 | 源码与关键符号 | 主文档 | 必须保持的不变量 | 现有证据 | 明确空白 |
 |---|---|---|---|---|
 | `kernel/file.c:filealloc/filedup/fileclose/fileread/filewrite`、`kernel/file.h` | [文件与管道](../kernel/files-and-pipes.md)、[资源失败矩阵](resource-failure-matrix.md) | `file.ref` 等于稳定边界上的 fd/临时引用总和；最后 close 按类型转移并释放 owner；inode write 分片满足日志预算；共享 offset 的串行化前提明确 | F/B: `sharedfd`、`writetest`、`bigwrite`、`badwrite` | 没有独立耗尽 `NFILE` 的确定性测试；device/pipe 没有统一 offset 锁 |
-| `kernel/fcntl.h`、`kernel/stat.h` | [系统调用](../kernel/system-calls.md)、[用户 ABI](../user/runtime-and-abi.md)、[文件与管道](../kernel/files-and-pipes.md) | 用户/内核共享的 open flags、字段宽度、布局和返回语义一致；复制给用户的完整对象已初始化 | S: 用户程序编译；F/B: open/fstat 相关 tests | checker 不解析 C ABI 布局；当前 `struct stat` padding 未清零的问题需要独立回归 |
+| `kernel/fcntl.h`、`kernel/stat.h` | [系统调用](../kernel/system-calls.md)、[用户 ABI](../user/runtime-and-abi.md)、[文件与管道](../kernel/files-and-pipes.md) | 用户/内核共享的 open flags、字段宽度、布局和返回语义一致；复制给用户的完整对象已初始化 | S: 用户程序编译；F/B: open/fstat 相关 tests | 静态证据不解析 C ABI 布局；当前 `struct stat` padding 未清零的问题需要独立回归 |
 | `kernel/sysfile.c:argfd/fdalloc/sys_dup/sys_open/sys_close/sys_pipe` | [系统调用](../kernel/system-calls.md)、[文件与管道](../kernel/files-and-pipes.md) | fd 槽安装与 file ref 在系统调用稳定边界匹配；多阶段失败清除已安装槽；create 后 fd 耗尽允许名字这一已记录副作用 | B: fd 类 tests、`pipe1`、`manywrites`；C: `grind` | 未逐故障点检查 open/pipe 构造回滚；`NOFILE` 与 `NFILE` 原因不可由 `-1` 区分 |
 | `kernel/pipe.c:pipealloc/pipewrite/piperead/pipeclose` | [文件与管道](../kernel/files-and-pipes.md)、[pipeline fd 拓扑](../flows/pipeline-fd-topology.md) | `readopen/writeopen` 与 file 引用生命周期匹配；buffer 计数单调且不越容量；条件改变和 wakeup 在 pipe 锁协议内；broken pipe 保留已写前缀 | B/C: `pipe1`、`sharedfd`、`grind` pipeline | 多 writer 的精确交错、零长度行为和 killed partial write 未独立断言 |
 | `kernel/sysfile.c:create/sys_link/sys_unlink/sys_mkdir/sys_chdir` | [文件系统](../kernel/filesystem.md)、[文件系统事务](../flows/filesystem-transaction.md)、[文件系统一致性](../filesystem/filesystem-consistency.md)、[unlink 与 orphan 恢复](../flows/unlink-crash-orphan-recovery.md) | 所有会 `iput` 的命名路径在事务内；目录 `.`/`..`、parent nlink 和目标 nlink 一致；禁止目录硬链接和删除 `.`/`..` | B/C: `subdir`、`rmdot`、`dirfile`、`linktest`、`linkunlink`、`concreate`、`createdelete` | 测试只从 API 观察，未离线扫描完整目录图、重复名字或错误 nlink |
@@ -110,7 +110,7 @@
 
 ## 10. `usertests` 注册项反向索引
 
-下面列出当前所有注册名。`docs/check-docs.sh` 从源码提取注册项，并要求每个名字在文档中出现；新增函数但忘记登记仍不会被发现，因此增加测试时必须同时修改数组。
+下面列出当前所有注册名。新增测试时必须同时修改注册数组和本表，并在测试文档中记录实际 oracle；遗漏登记需要通过人工审阅发现。
 
 | 领域 | 注册测试 |
 |---|---|
@@ -121,11 +121,11 @@
 | lazy VM | `lazy_alloc`, `lazy_unmap`, `lazy_copy`, `lazy_sbrk` |
 | slow 文件系统/内存 | `bigdir`, `manywrites`, `badwrite`, `execout`, `diskfull`, `outofinodes` |
 
-源码中的 `fsfull()` 没有注册到两个数组，因此不属于默认或单项可运行集合。追踪脚本检查“已注册名字有文档”，不把任意形似测试的函数误判为可运行项。
+源码中的 `fsfull()` 没有注册到两个数组，因此不属于默认或单项可运行集合。本节只记录已注册的测试；新增或移除测试时必须人工同步本表和测试文档。
 
 ## 11. 手写输入文件完整清单
 
-本节是文件级基线。检查脚本动态扫描同类扩展名；新增手写实现文件若没有在任一文档中以完整路径出现会失败。生成物、目标文件和磁盘镜像不进入基线。
+本节是文件级基线。新增手写实现文件时，应人工确认它已在相应专题或矩阵中以完整路径出现。生成物、目标文件和磁盘镜像不进入基线。
 
 ### 11.1 内核
 
@@ -164,7 +164,7 @@ user/zombie.c            mkfs/mkfs.c              Makefile
 test-xv6.py
 ```
 
-`user/usys.S` 由 `user/usys.pl` 生成，不是手写真源；`kernel/kernel`、`*.o`、`*.d`、`*.asm`、`*.sym`、`user/_*`、`mkfs/mkfs` 和 `fs.img` 同样是生成物。根目录 `README` 是 `fs.img` 内容输入，`.gdbinit.tmpl-riscv` 与 `.vscode/*.json` 是调试配置；它们分别由[构建文档](../build/build-link-and-fs-image.md)和[调试文档](../build/vscode-debug.md)维护，但不被实现源码扫描器当作内核行为输入。
+`user/usys.S` 由 `user/usys.pl` 生成，不是手写真源；`kernel/kernel`、`*.o`、`*.d`、`*.asm`、`*.sym`、`user/_*`、`mkfs/mkfs` 和 `fs.img` 同样是生成物。根目录 `README` 是 `fs.img` 内容输入，`.gdbinit.tmpl-riscv` 与 `.vscode/*.json` 是调试配置；它们分别由[构建文档](../build/build-link-and-fs-image.md)和[调试文档](../build/vscode-debug.md)维护，但不属于实现源码行为清单。
 
 ## 12. 当前覆盖空白总表
 
@@ -177,37 +177,10 @@ test-xv6.py
 | 内存模型和 DMA | QEMU 上压力未失败不代表 RVWMO/设备发布证明 | 对关键 fence 建 litmus/事件 trace；分别标注 CPU、TLB、DMA、磁盘持久性边界 |
 | cache/queue 联合耗尽 | 现有 I/O 压力没有观测 buffer pin 和 descriptor owner | 导出只读计数器，构造 NBUF 持有与第三笔 VirtIO 请求等待；buffer 设计见[缓存改造实验](../labs/buffer-cache.md) |
 | console/IRQ 故障 | 交互输入无法稳定复现满缓冲、丢 IRQ、未知 source | 用 QEMU monitor/测试设备或内核注入点脚本化字符和 IRQ 序列 |
-| syscall ABI 类型漂移 | 当前 checker 只比名称 | 从单一描述生成号、stub、声明和分派，编译 ABI 静态断言 |
+| syscall ABI 类型漂移 | 当前名称核对不覆盖类型 | 从单一描述生成号、stub、声明和分派，编译 ABI 静态断言 |
 | 性能和活性 | 功能通过不提供复杂度、公平性或延迟上界 | 按[可扩展性分析](../analysis/scalability.md)记录扫描次数、锁等待和 I/O 放大；固定工作量/CPU 数做回归阈值 |
 
-## 13. 自动漂移检查的设计边界
-
-仓库根目录运行：
-
-```sh
-./docs/check-docs.sh
-```
-
-`.github/workflows/docs.yml` 在每次 push 和 pull request 上运行同一命令，并把权限收窄为只读仓库内容。CI 不生成或提交文档；矩阵仍由维护者基于源码语义更新，脚本负责拒绝已知的文件级断边。修改 checker 时必须先在仓库根目录和仓库外工作目录各运行一次，避免依赖调用者的当前目录。
-
-脚本执行四类保守检查：
-
-1. 用户清单中的 P0/P1/P2 文档、核心既有文档和 CI workflow 都作为必备基线存在。
-2. 对 Markdown 中目标以 `.md` 结尾或带 `#fragment` 的简单相对链接，只检查目标文件存在；fragment 被剥离但不验证锚点。
-3. 动态枚举 `kernel/*.{c,h,S}`、`kernel/*.ld`、`user/*.{c,h}`、`user/*.ld`、`user/*.pl`、`mkfs/*.c`、`Makefile` 和 `test-xv6.py`，要求完整路径出现在本文第 2 至 9 节的语义矩阵中；第 11 节的静态清单不能自证覆盖。
-4. 从 `kernel/syscall.h` 读取 `SYS_name`，检查 `user/usys.pl` 的 entry、`kernel/syscall.c` 的分发表、`user/user.h` 的名字和系统调用文档；并从 `usertests.c` 提取注册字符串，要求每项在 `user/programs-and-tests.md` 有 oracle 入口，而不是只在本文反向索引中出现。
-
-为了减少误报，脚本刻意不做以下事情：
-
-- 不验证 Markdown 标题到 anchor 的 renderer 特定规则；
-- 不解析带标题、换行、转义或空格目标的复杂 Markdown link，也不访问 HTTP 链接；
-- 不把一次字符串出现当作语义正确，不证明矩阵行描述仍与实现一致；
-- 不运行编译、QEMU、测试、fsck 或性能测量；
-- 不比较生成文件，因为生成文件应由其真源和构建规则重建。
-
-因此 checker 通过仅表示“文件级追踪边没有明显断裂”。语义审阅和动态验证仍是变更验收的一部分。
-
-## 14. 维护规则
+## 13. 维护规则
 
 修改实现时按以下顺序更新，不接受只补最后一个链接的做法：
 
@@ -217,7 +190,7 @@ test-xv6.py
 4. 新增系统调用必须同时更新号、用户声明、stub、分派、handler、ABI 文档和至少一个成功/失败测试。
 5. 新增 `usertests` 项必须登记数组、使用唯一资源名、检查所有关键返回值、清理成功和失败路径，并在测试文档记录实际 oracle。
 6. 修改磁盘格式、日志容量或 VirtIO ring 时，必须更新生产者和消费者两端以及离线/崩溃验证；成功 boot 不是格式兼容证明。
-7. 运行 `./docs/check-docs.sh`、`make`、相关单项、quick suite；涉及资源、并发或持久化时再运行完整 suite、确定性故障注入与 crash 恢复。
+7. 运行 `make`、相关单项和 quick suite；涉及资源、并发或持久化时再运行完整 suite、确定性故障注入与 crash 恢复。
 8. 测试失败要保存源码 commit、QEMU/CPU 数、镜像来源、命令、seed/failpoint/crash point 和完整输出，使结果可复现。
 
 追踪矩阵的价值不在于让每格看起来“已覆盖”，而在于让未覆盖项保持可见。新增一条弱压力测试不应删除证明空白；只有加入能稳定触发目标状态且拥有强 oracle 的验证后，才能缩小对应空白。

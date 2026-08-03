@@ -414,7 +414,7 @@ pipealloc() 创建 rf/wf 和 pipe 页
 - 提交点之后，旧地址空间已经不存在，不能再回到原 `ecall` 后的指令；
 - `kexec()` 返回的 `argc` 经分派器写入新 trapframe 的 `a0`，而新 `argv` 地址已放入 `a1`，恰好成为新程序 `main(argc, argv)` 的参数。
 
-参数页回滚和新页表回滚是两层不同的所有权协议，不能只检查其中一层。更完整的 ELF 和栈布局见 `docs/kernel/exec.md`。
+参数页回滚和新页表回滚是两层不同的所有权协议，不能只检查其中一层。更完整的 ELF 和栈布局见 `docs/xv6-riscv/kernel/exec.md`。
 
 ## 10. 文件系统事务、锁与可睡眠性
 

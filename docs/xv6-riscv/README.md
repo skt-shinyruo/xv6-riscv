@@ -47,14 +47,6 @@ make qemu-gdb
 - 修改 `NPROC` 等固定资源参数，结合[资源上界](kernel/resource-bounds.md)观察失败和回收边界；
 - 锁实验只在可丢弃的工作树和磁盘镜像中进行，并用重复压力测试判断竞态，不能用一次未失败证明正确。
 
-文档自身的文件级追踪、系统调用映射、注册测试和相对链接可以从仓库任意目录检查：
-
-```sh
-./docs/check-docs.sh
-```
-
-该脚本也由 `.github/workflows/docs.yml` 在 push 和 pull request 上执行。它不替代语义审阅、构建、QEMU 测试或离线一致性检查；它只阻止可机械发现的文档漂移。
-
 ## 架构与内核
 
 | 文档 | 主要问题 |
@@ -85,7 +77,7 @@ make qemu-gdb
 |---|---|
 | [全局正确性不变量](correctness/global-invariants.md) | 进程、页表、fd、inode、buffer、日志和 IRQ 的状态、所有权、锁图、等待图、happens-before 与证明依赖 |
 | [资源失败矩阵](reference/resource-failure-matrix.md) | 所有固定容量、耗尽行为、恢复性、资源归还点和对应测试 |
-| [源码到测试追踪矩阵](reference/source-test-traceability.md) | 源码/符号到文档、不变量、现有证据和空白的双向索引，以及自动漂移检查边界 |
+| [源码到测试追踪矩阵](reference/source-test-traceability.md) | 源码/符号到文档、不变量、现有证据和未覆盖项的双向索引 |
 | [可重复故障注入](verification/fault-injection.md) | 第 N 次 OOM、槽位耗尽、指定调度交错、VirtIO hold 和日志精确 crash point |
 | [可伸缩性分析](analysis/scalability.md) | 调度/唤醒扫描、reparent、稀疏页表、目录/bitmap、锁竞争、I/O 放大和 VirtIO 并发上限 |
 

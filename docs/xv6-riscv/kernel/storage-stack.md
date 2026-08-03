@@ -6,11 +6,11 @@
 
 | 源码 | 责任 |
 |---|---|
-| [`kernel/buf.h`](../../kernel/buf.h) | `struct buf` 的缓存、锁、引用和设备所有权字段 |
-| [`kernel/bio.c`](../../kernel/bio.c) | 固定大小 buffer cache、查找/替换、读写、pin/unpin |
-| [`kernel/log.c`](../../kernel/log.c) | 物理 redo log、空间预留、批量提交和启动恢复 |
-| [`kernel/virtio.h`](../../kernel/virtio.h) | VirtIO MMIO 寄存器、descriptor、avail/used ring 格式 |
-| [`kernel/virtio_disk.c`](../../kernel/virtio_disk.c) | 设备协商、请求 descriptor 链、通知、睡眠和完成中断 |
+| [`kernel/buf.h`](../../../kernel/buf.h) | `struct buf` 的缓存、锁、引用和设备所有权字段 |
+| [`kernel/bio.c`](../../../kernel/bio.c) | 固定大小 buffer cache、查找/替换、读写、pin/unpin |
+| [`kernel/log.c`](../../../kernel/log.c) | 物理 redo log、空间预留、批量提交和启动恢复 |
+| [`kernel/virtio.h`](../../../kernel/virtio.h) | VirtIO MMIO 寄存器、descriptor、avail/used ring 格式 |
+| [`kernel/virtio_disk.c`](../../../kernel/virtio_disk.c) | 设备协商、请求 descriptor 链、通知、睡眠和完成中断 |
 
 关联入口包括 `kernel/fs.c` 的 `bread()/log_write()` 调用、`kernel/file.c:filewrite()` 的事务分批、`kernel/trap.c:devintr()` 的中断分派，以及 `kernel/param.h` 中相互耦合的 `MAXOPBLOCKS/LOGBLOCKS/NBUF`。PLIC 的 priority、claim/complete 与每 hart 路由见[设备文档](devices.md)。
 

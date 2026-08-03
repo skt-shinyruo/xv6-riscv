@@ -2,7 +2,7 @@
 
 本文为当前仓库的 `fs.img` 定义一套可执行的一致性规范，并给出一个默认只读的简化 `fsck` 算法。它回答的不是“正常源码想做什么”，而是三个更严格的问题：一个镜像在恢复日志后必须满足哪些关系；当前内核实际检查了哪些关系；检查器如何在不信任 superblock、日志头、块指针和目录项的前提下安全地产生诊断。
 
-相关实现为 [`kernel/fs.h`](../../kernel/fs.h)、[`kernel/fs.c`](../../kernel/fs.c)、[`kernel/log.c`](../../kernel/log.c)、[`kernel/bio.c`](../../kernel/bio.c) 与 [`mkfs/mkfs.c`](../../mkfs/mkfs.c)。运行期对象、事务和设备路径分别见[文件系统](../kernel/filesystem.md)、[存储栈](../kernel/storage-stack.md)和[一次文件系统事务](../flows/filesystem-transaction.md)。本文所依赖的跨层前提见[全局正确性不变量](../correctness/global-invariants.md)，恶意镜像与掉电不属于当前内核保护目标这一事实见[信任与失败模型](../architecture/trust-and-failure-model.md)。
+相关实现为 [`kernel/fs.h`](../../../kernel/fs.h)、[`kernel/fs.c`](../../../kernel/fs.c)、[`kernel/log.c`](../../../kernel/log.c)、[`kernel/bio.c`](../../../kernel/bio.c) 与 [`mkfs/mkfs.c`](../../../mkfs/mkfs.c)。运行期对象、事务和设备路径分别见[文件系统](../kernel/filesystem.md)、[存储栈](../kernel/storage-stack.md)和[一次文件系统事务](../flows/filesystem-transaction.md)。本文所依赖的跨层前提见[全局正确性不变量](../correctness/global-invariants.md)，恶意镜像与掉电不属于当前内核保护目标这一事实见[信任与失败模型](../architecture/trust-and-failure-model.md)。
 
 ## 1. 判定对象与术语
 

@@ -59,7 +59,7 @@
 
 ## 4. 用户入口和退出状态
 
-基线 [user/ulib.c](../../user/ulib.c) 的 `start()` 不接收参数，以无原型声明调用 `main()`，忽略其返回值并总是 `exit(0)`。目标代码的 `start(int argc, char **argv)` 将内核构造的启动参数原样传给 `main`，再把返回值交给 `exit`。
+基线 [user/ulib.c](../../../user/ulib.c) 的 `start()` 不接收参数，以无原型声明调用 `main()`，忽略其返回值并总是 `exit(0)`。目标代码的 `start(int argc, char **argv)` 将内核构造的启动参数原样传给 `main`，再把返回值交给 `exit`。
 
 两个提交主题分别明确写了“传播 main 返回值”和“修复 start 参数”，因而这里无需猜测动机。可观察效果有两项：
 
@@ -72,7 +72,7 @@
 
 ## 5. 用户态 64 位格式化
 
-[user/printf.c](../../user/printf.c) 中 `printint()` 的内部无符号量由 32 位 `uint` 改为 `unsigned long long`。基线已经从可变参数读取 64 位的 `ld/lld/lu/llu/lx/llx`，但随即存进 32 位变量，因此高 32 位被截断。目标代码保留完整值再逐位取模。
+[user/printf.c](../../../user/printf.c) 中 `printint()` 的内部无符号量由 32 位 `uint` 改为 `unsigned long long`。基线已经从可变参数读取 64 位的 `ld/lld/lu/llu/lx/llx`，但随即存进 32 位变量，因此高 32 位被截断。目标代码保留完整值再逐位取模。
 
 这不改变 `%d/%u/%x` 的 32 位约定，也不改变 `%p` 的固定 16 个十六进制数字格式。回归至少应比较：
 
@@ -89,7 +89,7 @@
 
 基线 `piperead()` 先执行 `pi->nread++`，随后调用 `copyout()`。如果用户目标地址无效，或者惰性页在 `copyout()` 中无法分配，字节已经从环形缓冲区逻辑删除；首字节失败还会返回 0，而 0 通常表示管道 EOF。
 
-目标 [kernel/pipe.c](../../kernel/pipe.c) 改为：
+目标 [kernel/pipe.c](../../../kernel/pipe.c) 改为：
 
 1. 用当前 `nread` 只读取候选字节。
 2. `copyout()` 成功后才递增 `nread`。
@@ -108,7 +108,7 @@ copyout(addr + i) 成功 happens-before nread++
 
 ## 7. `sbrk` 顶部边界
 
-目标在 eager 路径 [kernel/proc.c](../../kernel/proc.c) 的 `growproc()` 和 lazy 路径 [kernel/sysproc.c](../../kernel/sysproc.c) 的 `sys_sbrk()` 中都拒绝 `addr + n > TRAPFRAME`。这保护用户页表顶部的 `TRAPFRAME` 和 `TRAMPOLINE` 固定映射。
+目标在 eager 路径 [kernel/proc.c](../../../kernel/proc.c) 的 `growproc()` 和 lazy 路径 [kernel/sysproc.c](../../../kernel/sysproc.c) 的 `sys_sbrk()` 中都拒绝 `addr + n > TRAPFRAME`。这保护用户页表顶部的 `TRAPFRAME` 和 `TRAMPOLINE` 固定映射。
 
 边界语义是：
 
@@ -141,13 +141,13 @@ copyout(addr + i) 成功 happens-before nread++
 
 ### 9.1 `kernelvec` 不保存 `tp`
 
-基线保存 `tp`，但返回路径本来就不恢复它；目标 [kernel/kernelvec.S](../../kernel/kernelvec.S) 把这次保存也注释掉。当前约定用 `tp` 保存当前 hart id，而 `kerneltrap()` 可能在 timer 中断中 `yield()`，进程恢复时可能位于不同 hart。恢复旧 `tp` 反而会让 `cpuid()` 错认 hart，因此返回路径保留恢复时的当前值是必要约定。
+基线保存 `tp`，但返回路径本来就不恢复它；目标 [kernel/kernelvec.S](../../../kernel/kernelvec.S) 把这次保存也注释掉。当前约定用 `tp` 保存当前 hart id，而 `kerneltrap()` 可能在 timer 中断中 `yield()`，进程恢复时可能位于不同 hart。恢复旧 `tp` 反而会让 `cpuid()` 错认 hart，因此返回路径保留恢复时的当前值是必要约定。
 
 本提交实际删除的是死存储，正常语义意图不变。风险来自未来维护：任何被 `kernelvec` 调用的代码都不得把 `tp` 当作普通 caller-saved 临时寄存器。定向验证应在多个 hart 上制造高频 timer yield，并在锁、`mycpu()` 与 `myproc()` 路径中断言 hart id 合法。
 
 ### 9.2 `timerinit` 不重复写 `mie.STIE`
 
-目标 [kernel/start.c](../../kernel/start.c) 已在委托后通过 `w_sie(... | SIE_STIE)` 使能 supervisor timer interrupt，故 `timerinit()` 中再次写 `mie` 的代码被删除。提交主题只声称“无需设置两次”；本文据此把它归为预期无行为变化的低层清理。
+目标 [kernel/start.c](../../../kernel/start.c) 已在委托后通过 `w_sie(... | SIE_STIE)` 使能 supervisor timer interrupt，故 `timerinit()` 中再次写 `mie` 的代码被删除。提交主题只声称“无需设置两次”；本文据此把它归为预期无行为变化的低层清理。
 
 回归必须观察 ticks 持续增长，并证明 CPU 密集用户进程会被抢占。若以后改变 `mideleg`、Sstc 使用方式或启动特权级，这一结论必须重新审计，不能机械沿用。
 
@@ -155,7 +155,7 @@ copyout(addr + i) 成功 happens-before nread++
 
 ### 10.1 `printf` 改名为 `printk`
 
-`241bdd0` 把 [kernel/printk.c](../../kernel/printk.c)、对象文件、声明、初始化函数和所有内核调用点从 `printf` 系列改为 `printk` 系列。用户态 `printf` 不变，内核输出格式和设备路径也没有实质改写。
+`241bdd0` 把 [kernel/printk.c](../../../kernel/printk.c)、对象文件、声明、初始化函数和所有内核调用点从 `printf` 系列改为 `printk` 系列。用户态 `printf` 不变，内核输出格式和设备路径也没有实质改写。
 
 这项变化的价值可从最终命名直接看出：内核输出与用户库同名 API 不再混淆。但本地提交没有记录更具体的动机，故不作进一步归因。风险主要在树外代码和工具：补丁中的 `printf()`、GDB 的 `break printf`、符号抓取脚本以及只替换部分调用点都会失败。回归除启动和 panic 输出外，还应运行：
 
@@ -168,7 +168,7 @@ rg -n '\bprintk(init)?\b' kernel Makefile
 
 ### 10.2 `uartgetc` 收窄为文件内符号
 
-`c358af1` 从 [kernel/defs.h](../../kernel/defs.h) 删除 `uartgetc`，并在 `uart.c` 中声明为 `static`。运行行为不变，但树外调用者不能再链接该符号。测试是 clean build 和 `nm kernel/kernel` 的符号可见性检查；未来若其他驱动需要直接轮询 UART，必须先重新定义所有权接口，而不是私自复制声明。
+`c358af1` 从 [kernel/defs.h](../../../kernel/defs.h) 删除 `uartgetc`，并在 `uart.c` 中声明为 `static`。运行行为不变，但树外调用者不能再链接该符号。测试是 clean build 和 `nm kernel/kernel` 的符号可见性检查；未来若其他驱动需要直接轮询 UART，必须先重新定义所有权接口，而不是私自复制声明。
 
 ### 10.3 仅注释中的命名同步
 
@@ -176,7 +176,7 @@ rg -n '\bprintk(init)?\b' kernel Makefile
 
 ## 11. 文件系统结构的编译器契约
 
-`4f1bdde` 给 [kernel/fs.h](../../kernel/fs.h) 的 `dirent.name[DIRSIZ]` 添加 `__attribute__((nonstring))`，并注明 14 字节名称可能没有结尾 NUL。结构体字段大小、对齐和磁盘格式没有改变；变化是阻止编译器把它误当普通 C 字符串并产生错误诊断或优化假设。
+`4f1bdde` 给 [kernel/fs.h](../../../kernel/fs.h) 的 `dirent.name[DIRSIZ]` 添加 `__attribute__((nonstring))`，并注明 14 字节名称可能没有结尾 NUL。结构体字段大小、对齐和磁盘格式没有改变；变化是阻止编译器把它误当普通 C 字符串并产生错误诊断或优化假设。
 
 为兼容不认识该属性的编译器，内核 CFLAGS 加入 `-Wno-unknown-attributes`；`c14b639` 把同一选项补到宿主机编译的 `mkfs`。这形成一个双工具链契约：交叉编译器和宿主编译器都包含同一头文件，但可能对属性支持不同。
 
@@ -205,7 +205,7 @@ rg -n '\bprintk(init)?\b' kernel Makefile
 
 ## 13. 测试工具和诊断变化
 
-`b39b788` 把 [test-xv6.py](../../test-xv6.py) 的 `rm fs.img` 改为 `rm -f fs.img`。因此 `make clean` 后第一次由测试驱动重建文件系统不会因镜像本来就不存在而提前报错。验收序列是：
+`b39b788` 把 [test-xv6.py](../../../test-xv6.py) 的 `rm fs.img` 改为 `rm -f fs.img`。因此 `make clean` 后第一次由测试驱动重建文件系统不会因镜像本来就不存在而提前报错。验收序列是：
 
 ```bash
 make clean
@@ -302,7 +302,7 @@ make clean
 | `tp`/timer 清理 | 普通多核启动间接覆盖 | 高频抢占、迁移时核对 hart id | ticks 前进，跨 hart 恢复后 `cpuid()` 正确 |
 | `printk` 改名 | clean build 和启动输出 | 符号扫描、panic 路径 | 无残留内核调用；输出未丢失 |
 | 14 字节目录名 | `usertests fourteen` | kernel/mkfs 双侧 `sizeof` 断言 | 构建无告警，镜像兼容，名字操作成功 |
-| 测试驱动复位 | 可人工复现 | CI 从无 `fs.img` 的 clean tree 启动 | 驱动完成重建并进入测试 |
+| 测试驱动复位 | 可人工复现 | 回归测试从无 `fs.img` 的干净工作树启动 | 驱动完成重建并进入测试 |
 
 不能把 `./test-xv6.py -q usertests` 一次成功当作全部差异的证明。尤其是 64 位格式化、非零 `main` 返回值、失败后管道字节保留、弱内存序和错误诊断路径，目前需要定向测试或静态检查。
 

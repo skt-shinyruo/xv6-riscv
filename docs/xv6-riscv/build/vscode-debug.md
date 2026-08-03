@@ -25,7 +25,7 @@ code --list-extensions | grep -E 'webfreak.debug|ms-vscode.cpptools'
 
 ## VSCode 配置
 
-仓库中的 [`.vscode/extensions.json`](../../.vscode/extensions.json) 声明了工作区推荐扩展，其中 `webfreak.debug` 提供下面使用的 Native Debug 配置；`ms-vscode.cpptools` 提供 C 语言编辑能力。推荐项只负责提示安装，真正的调试参数位于 [`.vscode/launch.json`](../../.vscode/launch.json)：
+仓库中的 [`.vscode/extensions.json`](../../../.vscode/extensions.json) 声明了工作区推荐扩展，其中 `webfreak.debug` 提供下面使用的 Native Debug 配置；`ms-vscode.cpptools` 提供 C 语言编辑能力。推荐项只负责提示安装，真正的调试参数位于 [`.vscode/launch.json`](../../../.vscode/launch.json)：
 
 ```json
 {
@@ -58,7 +58,7 @@ code --list-extensions | grep -E 'webfreak.debug|ms-vscode.cpptools'
 
 这里使用的是 Native Debug 扩展的 `"type": "gdb"`，不是 C/C++ 扩展的 `"type": "cppdbg"`。`cppdbg` 在当前环境中会因为 RISC-V 架构名 `riscv:rv64` 报 `Parameter 'arch'`。
 
-仓库还提供 [`.gdbinit.tmpl-riscv`](../../.gdbinit.tmpl-riscv)，供 `make qemu-gdb` 生成本地 `.gdbinit`。模板中的 `symbol-file kernel/kernel` 加载内核符号，`target remote 127.0.0.1:1234` 使用 `1234` 作为占位端口；Makefile 生成 `.gdbinit` 时会把它替换为：
+仓库还提供 [`.gdbinit.tmpl-riscv`](../../../.gdbinit.tmpl-riscv)，供 `make qemu-gdb` 生成本地 `.gdbinit`。模板中的 `symbol-file kernel/kernel` 加载内核符号，`target remote 127.0.0.1:1234` 使用 `1234` 作为占位端口；Makefile 生成 `.gdbinit` 时会把它替换为：
 
 ```text
 GDBPORT = uid % 5000 + 25000

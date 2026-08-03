@@ -495,13 +495,13 @@ panic/crash/tear 用例不能在同一 kernel 实例中清理。它们使用独�
 
 `./test-xv6.py crash` 会重建并修改 `fs.img`，而且仍是非确定性 crash 基线；运行前必须确认当前镜像可丢弃且没有另一个 QEMU 使用它。确定性 suite 实现后应保留这个旧入口作为压力补充，但精确 crash-point 用例才承担提交窗口证明。
 
-## 12. CI 分层与验收标准
+## 12. 测试分层与验收标准
 
 建议按成本分层：
 
-- 每次提交：普通 quick usertests；无规则的 fault build；N=1 的 fork/exec/pipe 回滚；NOFILE；sleep/wakeup 两种顺序。
-- 每日：所有 kalloc site 的 N 扫描；NPROC/NFILE；log admission；VirtIO descriptor；完整 usertests。
-- 破坏性/隔离 runner：NINODE/NBUF/oversized-log 的预期 panic；所有精确 crash point；orphan；synthetic tear；`grind`。
+- 快速回归层：普通 quick usertests；无规则的 fault build；N=1 的 fork/exec/pipe 回滚；NOFILE；sleep/wakeup 两种顺序。
+- 完整回归层：所有 kalloc site 的 N 扫描；NPROC/NFILE；log admission；VirtIO descriptor；完整 usertests。
+- 破坏性隔离层：NINODE/NBUF/oversized-log 的预期 panic；所有精确 crash point；orphan；synthetic tear；`grind`。
 
 一个用例只有同时满足以下条件才通过：
 

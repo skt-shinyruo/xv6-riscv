@@ -2,7 +2,7 @@
 
 当 S-mode 内核执行期间发生 timer、外部中断或异常，处理器依据 `stvec` 跳到 `kernelvec`。这条路径不切页表、不换栈，也不使用进程的用户 trapframe；它在当前内核栈上保存一组精确限定的 GPR，调用 `kerneltrap()`，再恢复现场并执行 `sret`。
 
-本文逐条对应 [`kernel/kernelvec.S`](../../kernel/kernelvec.S)、[`kernel/trap.c`](../../kernel/trap.c) 和 [`kernel/proc.h`](../../kernel/proc.h)。这里的“活跃”指：为了让被打断的内核 continuation 正确继续，某个入口值仍必须能从寄存器、当前保存帧或更深的 C 栈帧中恢复。
+本文逐条对应 [`kernel/kernelvec.S`](../../../kernel/kernelvec.S)、[`kernel/trap.c`](../../../kernel/trap.c) 和 [`kernel/proc.h`](../../../kernel/proc.h)。这里的“活跃”指：为了让被打断的内核 continuation 正确继续，某个入口值仍必须能从寄存器、当前保存帧或更深的 C 栈帧中恢复。
 
 ## 1. 入口契约与硬件动作
 
