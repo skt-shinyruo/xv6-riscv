@@ -1,0 +1,4 @@
+interface:
+  display_name: "Guided Code Questions"
+  short_description: "Guide code reading from architecture to end-to-end flow"
+  default_prompt: "Use $generate-code-questions to guide me from the selected code high-level architecture through implementation details to an end-to-end synthesis."
