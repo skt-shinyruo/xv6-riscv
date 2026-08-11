@@ -53,7 +53,7 @@
 | 内核格式化输出符号改名为 `printk` | `241bdd0` | 输出内容不变；源码符号、对象名和调试断点名改变 | 外部补丁、脚本和断点仍引用 `printf` | 构建、启动 banner、panic/未知系统调用路径 |
 | `dirent.name` 标记为 `nonstring` | `4f1bdde`、`c14b639` | 磁盘布局不变，编译器获知 14 字节名字可能无 NUL | 主机编译器属性兼容、误把字段当 C 字符串 | clean build + `usertests fourteen` |
 | 工具链选择和目标 ISA 被固定 | `e90b257`、`5474d4b`、`3c85134`、`7f5dfd3` | 接受 `riscv64-none-elf-`，固定 `rv64gc` 和 GNU99，不再声明未直接使用的 `AS` | 非 GCC 工具链、ISA 漂移、汇编规则遗漏参数 | 两种已支持前缀的 clean build + ELF 属性检查 |
-| 测试复位和 `exectest` 诊断更可靠 | `b39b788`、`214bf4c` | `fs.img` 不存在不再中止复位；重定向 stdout 后错误仍可见 | 测试假阳性、保存的错误 fd 泄漏仅限失败路径 | `make clean` 后跑驱动；故意破坏 `echo` 路径 |
+| 测试复位和 `exectest` 诊断更可靠 | `b39b788`、`214bf4c` | `fs.img` 不存在不再中止复位；重定向 stdout 后错误仍可见 | 测试假阳性；额外诊断 fd 在成功 `exec` 后也会由 `echo` 继承到退出 | `make clean` 后跑驱动；故意破坏 `echo` 路径 |
 
 下面逐项给出前态、后态、风险和验证责任。
 
@@ -83,7 +83,7 @@
 %llu 18446744073709551615 -> 18446744073709551615
 ```
 
-残余风险是 `printint()` 对最小有符号 64 位数执行负号转换的 C 语义；本次提交只解决截断，没有提供完整标准库式 `printf` 合规保证。测试应针对当前支持的格式集合，而不是假定宽度、精度或浮点格式存在。
+残余风险是 `printint()` 对最小有符号 64 位数执行 `x = -xx`：一元负号先在有符号 `long long` 中求值，`LLONG_MIN` 无可表示正值，属于 C 溢出未定义行为，之后再赋给无符号量并不能补救。`vprintf()` 的 `%ld/%lld` 分支还用 `va_arg(ap, uint64)` 取得调用者通常以有符号 `long/long long` 传入的值，严格 C 可变参数类型也不匹配。本次提交只解决内部无符号工作变量的 32 位截断，没有提供完整标准库式 `printf` 合规保证；测试应单列 `INT64_MIN`，并只针对当前支持的格式集合，而不是假定宽度、精度或浮点格式存在。
 
 ## 6. 管道读取与失败原子性
 
@@ -128,6 +128,8 @@ copyout(addr + i) 成功 happens-before nread++
 
 随后 `b51eab7` 删除锁获取后的额外顺序一致栅栏和释放前的额外顺序一致栅栏，因为 acquire exchange 与 release store 已经表达锁所需的单向排序。这不承诺整个机器上的所有原子操作形成单一全序；它承诺前一持有者临界区中的写，通过 release/acquire 同步后对后一持有者可见。
 
+这次 API 替换也没有把 `started` 或 `forkret.first` 变成原子对象：两处仍是普通对象配合 `__atomic_thread_fence()`，其中 `started` 的跨 hart 普通读写在 ISO C 抽象机中仍构成 data race。相对基线，目标保持了当前 GCC/RISC-V 下原有 fence 协议，不能把提交名解读成已经获得可移植的 C11 发布/获取；若要建立该保证，应把发布 store 和观察 load 本身改为 release/acquire 原子访问。
+
 提交说明称在当时的 GCC 15.2.0 上生成机器码不变，这是提交者记录的观察，不应提升为所有工具链上的保证。主要回归责任是：
 
 - `make` 后检查 `kernel/kernel.asm`，获取路径应有 acquire 语义，释放路径应在清零前提供 release 语义。
@@ -168,7 +170,7 @@ rg -n '\bprintk(init)?\b' kernel Makefile
 
 ### 10.2 `uartgetc` 收窄为文件内符号
 
-`c358af1` 从 [kernel/defs.h](../../../kernel/defs.h) 删除 `uartgetc`，并在 `uart.c` 中声明为 `static`。运行行为不变，但树外调用者不能再链接该符号。测试是 clean build 和 `nm kernel/kernel` 的符号可见性检查；未来若其他驱动需要直接轮询 UART，必须先重新定义所有权接口，而不是私自复制声明。
+`c358af1` 从 [kernel/defs.h](../../../kernel/defs.h) 删除 `uartgetc`，并在 `uart.c` 中声明为 `static`。运行行为不变，但树外调用者不能再链接该符号。该提交主题写的是 `drop uartputc from defs.h`，与实际 diff 的 `uartgetc` 不一致；归因应以 diff 和最终符号为准，不能据标题把 `uartputc_sync` 误记成被移除。测试是 clean build 和 `nm kernel/kernel` 的符号可见性检查；未来若其他驱动需要直接轮询 UART，必须先重新定义所有权接口，而不是私自复制声明。
 
 ### 10.3 仅注释中的命名同步
 
@@ -214,7 +216,7 @@ make clean
 
 该脚本捕获重建异常后只打印错误而没有立即重新抛出，这是既有行为；`rm -f` 只修复“文件不存在”这一已知前置状态，不证明所有重建失败都能使测试快速失败。
 
-`214bf4c` 改进 `exectest`：子进程在关闭 fd 1 前 `dup(1)` 保存诊断 fd，失败消息写到保存的 fd；父进程还把非零状态打印出来并统一以测试失败退出。正常 `exec("echo", ...)` 的被测行为不变。验证诊断路径不能只运行成功测试；可临时在隔离工作树中让 `echo` 不可打开或让期望 fd 断言失败，确认错误出现在控制台。README 同提交的另一个变化只是贡献者名单更新。
+`214bf4c` 改进 `exectest`：子进程在关闭 fd 1 前 `dup(1)` 保存诊断 fd，失败消息写到保存的 fd；父进程还把非零状态打印出来并统一以测试失败退出。成功路径的预期输出仍不变，但 fd 环境并非完全不变：xv6 没有 close-on-exec，故保存的 `errfd` 也会被成功执行的 `echo` 继承，直到该短命进程退出。验证诊断路径不能只运行成功测试；可临时在隔离工作树中让 `echo` 不可打开或让期望 fd 断言失败，确认错误出现在控制台。README 同提交的另一个变化只是贡献者名单更新。
 
 `8402fc9` 添加的 `lazy_sbrk` 属于测试覆盖增量，已在第 7 节说明。它本身不改变内核运行时，但与 `c71a6c4` 共同定义了可执行的边界规格。
 
@@ -229,7 +231,7 @@ make clean
 | `sbrk` 有 eager/lazy 第二参数 | 基线 `sys_sbrk` 和 `user.h` 已存在 | 本区间只新增顶部边界检查 |
 | `copyin/copyout` 可经 `vmfault` 补页，`copyinstr` 不补 | 基线 `kernel/vm.c` 已是该实现 | 本区间只修复管道消费次序 |
 | 日志恢复后 `ireclaim` 扫描 orphan inode | 基线 `kernel/fs.c` 已调用并实现 | 非本区间新增 |
-| UART 每字节等待 THRE 中断 | 基线 `kernel/uart.c` 已有 `tx_busy/sleep/wakeup` 协议 | 本区间只有注释、符号可见性和 `printk` 名称变化 |
+| UART 用单字节 `tx_busy` 与 THRE 中断推进；只有下一字节遇 busy 才睡眠 | 基线 `kernel/uart.c` 已有 `tx_busy/sleep/wakeup` 协议 | 本区间只有注释、符号可见性和 `printk` 名称变化 |
 
 这张表很重要：它阻止后来者把“当前仓库与另一份教程不同”误写成“当前分支相对 rev5 新增”。如果未来要追溯这六项的真正来源，必须把比较基线继续向 `7d7adbb` 之前移动，并重新做历史审计。
 
@@ -296,7 +298,7 @@ make clean
 | `sbrk` 顶部边界 | `usertests lazy_sbrk` | 失败前后 `sbrk(0)` 不变 | eager/lazy 到边界成功，越界失败，内核不 panic |
 | 管道 copyout 提交点 | `copyout`、`lazy_copy`、`pipe1` | 错误后重读同一标记字节；跨页部分成功 | 不丢未复制字节，不把错误报成 EOF |
 | 用户入口 ABI | `exectest` 间接覆盖参数和零状态 | 专用 `return 37` 程序 | `argc/argv` 正确，父进程得到 37 |
-| 64 位打印 | 没有明确的边界断言 | 格式化输出 golden test | 高 32 位和符号正确 |
+| 64 位打印 | 没有明确的边界断言 | 格式化输出 golden test，包含 `INT64_MIN` | 高 32 位和符号正确；不得依赖有符号溢出 |
 | spinlock 内存序 | 多数并发测试间接覆盖 | 多 hart 长时 `grind/stressfs` + 汇编检查 | 无死锁、竞态症状；指令有预期 aq/release 排序 |
 | VirtIO 栅栏 | 文件系统测试间接覆盖 | 并发 I/O、不同优化级别/编译器 | 无状态 panic、丢完成或数据错乱 |
 | `tp`/timer 清理 | 普通多核启动间接覆盖 | 高频抢占、迁移时核对 hart id | ticks 前进，跨 hart 恢复后 `cpuid()` 正确 |

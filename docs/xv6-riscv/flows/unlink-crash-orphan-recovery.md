@@ -7,7 +7,7 @@
 | 状态 | 位置 | 含义 |
 |---|---|---|
 | directory entry | 目录数据块 | 名称是否可达 inode number |
-| `dinode.nlink` | 磁盘 inode | 非 `.` 的目录链接计数；目录另计孩子 `..` 贡献 |
+| `dinode.nlink` | 磁盘 inode | root 可达树中非 `.` 的目录链接计数；目录另计可达孩子 `..` 贡献，recoverable orphan 的陈旧 `..` 不计 |
 | `inode.ref` | 内存 inode cache | 内核指针/打开 file/cwd/path lookup 临时引用 |
 | block bitmap | 磁盘 bitmap | inode 数据/间接块是否仍占用 |
 
@@ -41,7 +41,9 @@ last close: fileclose -> begin_op -> iput
 after: no name, no ref, free dinode and blocks
 ```
 
-`iput()` 在 `itable.lock` 下检查 `ref==1 && valid && nlink==0`，并在仍持该锁时取得 inode sleeplock，因此检查成立时不会已有其他引用者持有该 sleeplock。随后它释放 `itable.lock` 再截断；此时新的 `iget()` 仍可增加 `ref` 并取得指针，但遵守 inode API 的调用者只有在随后取得 sleeplock 后才能读字段，届时会观察已经清空并置 `valid=0` 的状态。最后的 `ref--` 再受 `itable.lock` 保护，从而保证 cache 槽身份和字段串行化；协议并不禁止回收期间出现新的引用。
+`iput()` 在 `itable.lock` 下检查 `ref==1 && valid && nlink==0`，并在仍持该锁时取得 inode sleeplock，因此检查成立时不会已有其他引用者持有该 sleeplock。随后它释放 `itable.lock` 再截断，低层 `iget(dev,inum)` 就能按相同 identity 增加 `ref`；普通文件失去最后名字后通常没有新的路径来源，但孤儿目录的陈旧 `..` 是正常 API 的反例。
+
+具体地，P 先 `chdir("/a/b")`，Q 再依次 unlink `/a/b` 和 `/a`。P 只 pin `b`，所以 `a` 可以进入最后一次 `iput()`，但 `b` 的磁盘 `..` 仍保存 `a` 的 inum。若 P 此时 `chdir("..")`，`namex()->dirlookup()->iget(a)` 可在回收者已取得 `a` sleeplock并释放 `itable.lock` 后把 ref 从 1 增到 2；随后 `ilock(a)` 等待截断完成，重读到 `type==0` 并触发 `panic("ilock: no type")`。若查找发生在回收之后，旧 inum 为 free 时仍会 panic；复用成普通文件时 `chdir()` 返回 -1；复用成另一个目录时则可能错误进入无关目录。表锁只串行化 cache ref 计数，当前协议没有封堵这条回收期间或回收后的 stale-`..` 解析路径。
 
 ## 4. unlink commit 的 crash matrix
 
@@ -74,10 +76,10 @@ type != 0, nlink == 0, blocks still allocated, no directory entry
 
 - 已释放一部分块但事务 header durable 时，replay 统一安装 bitmap/inode 新状态；之后扫描不会再次把已清 type 的 inode当 orphan。
 - header 未提交时，home 应保持旧的完整 orphan，下一次扫描重试。
-- 这依赖 log header 自身良构；当前 `read_head()` 不验证 `n`、目标范围或重复项，损坏 header 可能把 replay 写到任意块。
+- 这依赖 log header 自身良构；当前 `read_head()` 不验证 `n`、目标范围或重复项。正的合法数量配恶意目标即可把 replay 写到任意块，`n>LOGBLOCKS` 还会在复制列表时越界；负 `n` 则使复制/安装循环执行零次并被 recovery 清零。它们都不是可靠的损坏报告，但执行路径并不相同。
 - `ireclaim` 把磁盘 `nlink==0` 当真。若该值是静默损坏而名称仍指向 inode，它会删除仍可达数据；离线 fsck 应先做全局 link-count 对照。
 - 未链接但 `type!=0` 且 `nlink>0` 的 inode不会被回收，属于泄漏/损坏而不是 xv6 orphan 状态。
-- 目录 unlink 只有空目录可通过，且父 `nlink` 更新必须和目标变化同事务；目录环或坏 `..` 不在运行时修复范围。
+- 目录 unlink 只有空目录可通过，且父 `nlink` 更新必须和目标变化同事务；目录环或 root 可达目录的坏 `..` 不在运行时修复范围。recoverable orphan 允许范围合法、非自指但指向 free/复用 inode 的陈旧 `..`，`ireclaim` 不会跟随它。
 
 ## 7. 精确 crash 测试
 
@@ -101,3 +103,7 @@ IRECLAIM_LOG_DATA(k) / HEADER / HOME(k) / CLEAR
 6. 多次重启结果相同，空闲块数回到预期，其他文件内容哈希不变。
 
 对 sector tearing 的结构负例，应选择会破坏 bitmap、dinode、dirent 或 log-header 关系的 1024B 元数据写，把其中一半替换为旧/新数据并要求 checker 报告不一致。普通文件数据没有 checksum，撕裂后仍可能结构合法；此类 fixture 只能由预先记录的内容 hash 检出，不能伪称 fsck 必然发现。
+
+stale-`..` 需要单独的破坏性定点交错。让 P 停在 cwd `/a/b`，Q 依次 unlink `/a/b` 和 `/a`；在 Q 的最后 `iput(a)` 已取得 `a` sleeplock并释放 `itable.lock`、但尚未执行 `itrunc(a)` 时暂停 Q，再让 P 执行 `chdir("..")`。强 oracle 是 `dirlookup()->iget(a)` 把 cache ref 从 1 增到 2、P 随后阻塞在 `ilock(a)`；恢复 Q 后，P 读到已清 type 并命中 `panic("ilock: no type")`。仅靠随机 `yield()` 不能证明这个窄窗口。
+
+另用独立镜像测试回收后的 inode-number reuse：在 `/a` 已释放后把其 inum 分别复用为普通文件和目录，再从仍存活的 `b` 解析 `..`。当前结果分别应是 `chdir()` 返回 -1 和错误进入新目录；这两个 oracle 证明目录项没有 generation，而不是把 free-inode panic 误当成唯一失败方式。三类用例都会故意触发内核崩溃或错误导航，必须与正常 crash-recovery 镜像隔离。

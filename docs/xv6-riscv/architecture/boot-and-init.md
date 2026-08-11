@@ -64,6 +64,8 @@ Makefile 使用的核心启动参数是：
 
 `-bios none` 取消的是外部固件/OpenSBI payload，并不会移除 QEMU 机器自身的 MROM reset stub。xv6 也不解析固件可能传入的设备树参数：`_entry` 立即改写 `a0/a1`，设备地址和 RAM 上界全部来自编译期的 `memlayout.h`。
 
+“不采用 ELF `e_entry`”属于 QEMU loader/MROM 生成结果，不能只从 `kernel.ld` 推断。对当前 QEMU 8.2.2 的区分性检查是：在临时 ELF 副本中只把 `e_entry` 改为 `0x80000010`、不移动任何 `PT_LOAD` 字节，MROM 的跳转常量仍是 `0x80000000`。因此当前启动同时要求 loader 把 segment 放到其物理地址，并要求 `_entry` 的实际装载地址等于固定 handoff；只核对 ELF header 的 entry 不足以证明可启动。
+
 本实现依赖的交接条件是：
 
 1. 每个 hart 先从 QEMU MROM reset vector `0x1000` 执行，再被 stub 交给固定物理地址 `0x80000000` 的 `_entry`；这个目标不是由 ELF `e_entry` 决定；
@@ -236,19 +238,22 @@ kvminithart -> trapinithart -> plicinithart -> scheduler
 
 `user/init.c` 随后完成用户空间最后一段启动：
 
-1. 打开或创建设备节点 `console`，确保 fd 0 可用；
-2. 用 `dup(0)` 建立 fd 1 和 fd 2，因此标准输入、输出和错误都指向 console；
+1. 在初始进程没有继承 fd 的正常前提下，打开或创建设备节点 `console`，第一次成功的 `open()` 得到 fd 0；
+2. 用两次 `dup(0)` 取得 fd 1 和 fd 2，因此标准输入、输出和错误都指向 console；
 3. `fork()` 一个 child，child 执行 `exec("sh", argv)`；
 4. parent 反复 `wait()`，回收 shell 以及转交给 init 的孤儿；shell 退出后重新创建它。
+
+这段代码的成功路径依赖“fd 表起初全空”，却没有把它验证成错误路径：首次 `open()` 失败后，`mknod()`、第二次 `open()` 以及两个 `dup()` 的返回值都未检查，也未断言得到的编号恰为 0、1、2。当前首进程由 `allocproc()` 的清零静态槽创建且没有继承文件，因此有效镜像上的编号成立；若 console 节点创建、设备 major 或 fd 分配失败，`init` 仍会继续，后续诊断和 `$ ` 甚至可能因 fd 2 无效而不可见。
 
 `user/sh.c:getcmd()` 每次读命令前执行 `write(2, "$ ", 2)`。所以屏幕出现 `$ ` 不是单独的内核启动步骤，而是 QEMU 交接、内核初始化、调度、文件系统恢复、ELF 装载、trap 返回、console fd 建立和 shell 用户代码全部成功后的首个用户可见结果。`init` 的重启与孤儿回收细节见[`init` 与 shell](../user/init-and-shell.md)。
 
 ## 12. 失败模式
 
 - 早期栈不足或 `CPUS > NCPU`：可能破坏静态数据，启动代码无恢复路径。
-- `kalloc()` 无法分配进程栈或 VirtIO 队列页：相应初始化代码 `panic`。更早的内核根页表分配和 `userinit()` 对 `allocproc()` 的返回值没有完整判空，内存极端不足时可能直接 fault，而不是得到整洁的失败返回。
+- `kalloc()` 无法分配固定进程栈或 VirtIO 的 descriptor/available/used 三个队列页：相应初始化代码显式 `panic`。`kvmmake()` 对内核根页表分配不判空，随后会在安装内核 trap 向量前以地址 0 调用 `memset()`，没有受控恢复路径。`userinit()` 也不检查 `allocproc()`；后者虽然会在 trapframe/用户页表分配失败时内部回滚进程槽，调用者随后仍解引用空 `p`，从 C 语义开始已是未定义行为，不能仅凭源码保证精确 trap。当前 GCC 生成的 `kernel/kernel` 在 `namei("/")` 后执行 `sd a0,336(s1)`，其中失败路径的 `s1==0`；这一步发生在 `trapinithart()` 之后，当前低地址未映射，故当前产物会以 supervisor fault 进入 `kerneltrap()` 并以通用 `panic("kerneltrap")` 停机，而不是给出明确的首进程 OOM 诊断。两条 unchecked 路径的 trap 初始化阶段不同，不能合并成同一种失败表现；更换编译器或优化配置后还须重新核对这一 UB 路径的产物。
 - VirtIO 标识、版本、队列容量或 feature negotiation 不符合预期：`virtio_disk_init()` `panic`。
 - 文件系统 magic 错误、首个 `/init` 不存在或 ELF 无效：首进程启动 `panic`，不会回退到救援 shell。
+- `/init` 自己的 `fork()` 或 `wait()` 失败会调用 `exit(1)`；由于内核禁止 `initproc` 退出，这条用户态错误处理最终升级为 `panic("init exiting")`。shell 的 `exec()` 失败则只终止该 child，父 `init` 会继续重启 shell。
 - 某个非零 hart 永远看不到 `started`：它会持续忙等；在此阶段没有 watchdog。
 
 ## 13. 调试与验证

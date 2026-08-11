@@ -50,6 +50,8 @@ facts           inode refs, block owners, directory edges, bitmap state
 
 先只打印当前镜像布局并与 `mkfs` 公式对照。用 golden fixture验证 superblock字段、dinode/dirent尺寸和当前 2000-block布局。所有 region采用半开区间。
 
+inode 解码只能枚举 `[0, sb.ninodes)`。最后一个物理 inode block 可能还有不可寻址的结构槽；当前 `ninodes=200`、`IPB=16`，槽 200..207 就属于这种 padding。它们不能进入 inode 或 block-owner 账本，严格 profile 可另行要求其字节为零。由 geometry 多预留的完整 inode block则是 reserved gap，同样不是新增 inode 号。
+
 ### B. inode与block checker
 
 实现只读 pointer展开。间接块本身和其指向的数据块都记录 owner；同 inode内部重复与跨 inode重复都报错。只读取已验证为 data-region的间接块。
@@ -60,7 +62,11 @@ facts           inode refs, block owners, directory edges, bitmap state
 
 ### D. 目录图
 
-从 ROOTINO做 DFS/BFS，验证 root `.`/`..`、每个非 root目录唯一 parent和 `..`，禁止目录硬链接/环。固定 `DIRSIZ=14` 名称不保证NUL终止，比较应按固定宽度。
+从 ROOTINO做 DFS/BFS。严格 parent 规则只施加于 root 可达图：验证 root `.`/`..` 自指、每个其他可达目录有唯一 parent 且 `..` 指向它，并禁止目录硬链接/环。固定 `DIRSIZ=14` 名称不保证 NUL 终止；解码最多读取 14 字节，名称比较要匹配内核 `strncmp(..., DIRSIZ)` 语义，即遇到 NUL 后名称结束，而不是把 NUL 后的填充字节算入名称。严格模式可以另报 NUL 后的非零尾部。
+
+不可达目录必须先与 ordinary refs 一起分类。若某目录 `nlink==0`、没有普通外部 dirent 指向，且非空记录只有一个自指 `.` 与一个 inum 在合法范围内、但不等于自身的 `..`，它可以是可回收 orphan；旧 parent 可能已 free 或复用为其他类型，所以该 `..` 不要求目标已分配，也不进入 dangling、parent 或 nlink 账本。inum 越界、自指 `..` 或非空 orphan 都不能套用这个例外。所有其他已分配目录仍要验证 `.` 自指、`..` 指向已分配目录，且除 root 外不得自指；只有 root 可达目录再要求后者等于唯一 parent。
+
+`dinode.nlink` 不能简单等于“指向该 inode 的全部 dirent 数”。对 root 可达的良构树，`.` 不计入；一个非根目录在 parent 中的普通名字给它基础 1；每条仍存在的普通 parent-to-child 目录边再给 parent 加 1，root 自身的基础值为 1。该边与 child 的 `..` 在良构树中一一对应，但 checker 不能反过来机械扫描所有物理 `..` 做加法：空目录 unlink 后若仍由 cwd 引用，它会成为 `nlink==0` 的 orphan，磁盘上还保留指向旧 parent 的 `..`，而 `sys_unlink()` 已经把旧 parent 的 `nlink` 减一。这个规则对应 `create()`/`unlink()` 对 `dp->nlink` 的显式加减，也解释了为什么目录创建时写入 `.` 不会再增加自身 `nlink`。checker 应先建立普通目录边和 orphan 分类，再按边重算计数。
 
 ### E. shadow log
 
@@ -95,10 +101,13 @@ facts           inode refs, block owners, directory edges, bitmap state
 | bitmap-missing | 清已引用块 bit | `E_BITMAP_UNMARKED` |
 | bitmap-leak | 置无owner data bit | `E_BITMAP_LEAK` |
 | bad-dirent | inum超范围 | `E_DIRENT_INUM` |
-| duplicate-name | 同目录两个相同14-byte name | `E_DIR_NAME_DUP` |
-| dir-cycle | 修改 `..`/child edge成环 | `E_DIR_CYCLE/PARENT` |
+| duplicate-name | 同目录两个相同 14-byte name；另做 `a\0x`/`a\0y` 尾部不同但按内核语义同名的 case | `E_DIR_NAME_DUP` |
+| bad-dotdot | 把 root 可达、非 root 目录的 `..` 改为非实际 parent | `E_DOTDOT/E_DIR_PARENT`，不能仅凭这项声称出现遍历环 |
+| dir-cycle | 插入或改写一个普通 child dirent，使其指向遍历路径上的祖先目录 | `E_DIR_CYCLE`，并允许伴随 multiple-parent 诊断 |
 | wrong-nlink | 改计数 | `E_NLINK` |
-| orphan | 清最后dirent并置nlink0，保留type/blocks | 分类为可回收orphan |
+| orphan | 对普通文件清最后一个 dirent 并置 nlink=0，保留 type/blocks；目录 variant 只能选空目录，且还要同步把原 parent 的 nlink 减 1 | 分类为可回收 orphan，不伴随额外 `E_NLINK` |
+| nested-dir-orphan | 在 xv6 中创建 `/a/b`；P 执行 `chdir("/a/b")`，Q 依次 unlink `/a/b` 和 `/a`，然后在 P 退出前取 snapshot | `b` 是可回收 orphan；即使 `b/..` 指向的 `a` 已 free 或复用，也不报 dangling/parent/nlink 错误；模拟 `ireclaim` 后 clean |
+| orphan-self-dotdot | 把上一 fixture 的 `b/..` 改为 `b` 自身 inum | `E_ORPHAN_DOTDOT` 等专用异常；不得分类为 normal orphan，可另注明 `ireclaim` 会忽略该项并截断 inode |
 | torn-metadata | 为已知 inode/bitmap/log 关系准备镜像，只替换目标 1024B block 的一个 512B sector | 触发该 fixture 预先指定的结构错误，不崩溃、不越界 |
 | torn-file-data | 普通文件数据块只替换一个 512B sector | 允许结构检查仍 clean；没有外部 checksum 时必须报告“内容完整性不可证明”，不能声称检测到任意 torn data |
 

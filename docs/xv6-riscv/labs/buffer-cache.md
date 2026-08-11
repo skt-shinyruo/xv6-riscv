@@ -21,6 +21,8 @@ LRU精确顺序不是 correctness；若换成近似时间戳/clock，必须明�
 
 采用固定数量、最好为质数的 buckets，每个有 spinlock和链表。`hash(dev,blockno)` 唯一决定 key所属 bucket。另设 `evict_lock` 只串行化 miss后的 victim选择/迁移；这是较简单的教学设计，仍允许不同 bucket的 cache hit并行。
 
+初始化时必须区分“未命名 free buffer”和真正的 key。当前 BSS 初值会让全部 30 个 buffer 看起来都是 `(dev=0,blockno=0,valid=0)`；不能把它们直接插入普通 hash 链后仍声称 key 唯一，也不能用 `valid==0` 代表未命名，因为一次 cache miss 刚认领 key、尚未完成磁盘读取时同样是 `valid==0`，此时其他 lookup 必须找到并等待同一个 identity。可增加显式 `named` 状态/独立 free 链，或在统一的 eviction 初始化步骤中逐个赋予 key，但状态转换和断言必须覆盖这一边界。
+
 `bget` 轮廓：
 
 1. 取目标 bucket lock并查 key；命中则 ref++、释放 bucket lock，再 acquiresleep；

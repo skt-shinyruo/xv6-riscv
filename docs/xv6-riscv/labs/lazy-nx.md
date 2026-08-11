@@ -21,17 +21,19 @@ failed allocation: no reachable partial leaf and no leaked data page
 
 ### A. 静态审计
 
-枚举所有调用 `mappages` 建用户 leaf 的位置，记录 permission来源：`uvmalloc`、`uvmfirst`、`exec` segment、trapframe/trampoline、`vmfault`、fork copy。确认没有 helper 在 fault 后无条件添加 `PTE_X`。
+枚举当前所有建立用户地址空间 leaf 的路径并记录 permission 来源：`uvmalloc()`（ELF segment、eager heap 和 exec stack）、`proc_pagetable()`（不带 `PTE_U` 的 trampoline/trapframe）、`uvmcopy()`（fork 复制已有 flags）以及 `vmfault()`（lazy data）。当前仓库没有传统 xv6 的 `uvmfirst()/initcode` 路径；首进程在 `forkret()` 中直接 `kexec("/init", ...)`。确认没有 helper 在 fault 后无条件添加 `PTE_X`。
 
 ### B. 建立行为测试
 
-child 调 `sbrklazy(PGSIZE)`，先读首/末字节并验证零，再写入 RISC-V `ret` 指令编码，在调用函数指针前执行 `fence.i`。预期 instruction page fault，child 以 -1 状态被回收。parent 必须存活。
+每个子例都在独立 child 中取得一整页新的 lazy 虚拟区间：先检查当前 break 是否页对齐；若不对齐，用检查过返回值的增长推进到下一页边界，再调用并检查 `sbrklazy(PGSIZE)` 的返回值恰为该对齐 break。选择页内 4 字节对齐且不跨页的执行地址，按该子例规定的首次访问物化页面，再按小端放入 RISC-V `ret` 编码 `0x00008067`；在调用函数指针前执行 `fence.i`。预期 instruction page fault，child 以 -1 状态被回收，parent 必须存活。不能先用通用的零值/边界预读准备所有子例，因为这会抢先物化本应验证 `copyin` 或 `copyout` fallback 的页面。
 
 测试需要分别覆盖：
 
-- 先由用户 store 物化，再执行；
-- 先由内核 `read`/`write` 的 `copyout/copyin` fallback 物化，再执行；
-- 页边界首/末地址；
+- load-first 子例先读首/末字节验证零，再做页内读写边界和执行检查；
+- store-first 子例先由用户 store 物化，再执行；
+- copyout-first 子例在 `read` 前不得由用户触碰该页；由内核 `read` 的 `copyout` fallback 首次物化并写入一条有效 `ret` 指令，再执行；
+- 先由 `write` 的 `copyin` fallback 物化零页，立即观察 `X=0`，随后再由用户 store 写入有效指令并执行；`copyin` 本身不产生指令字节，不能直接执行零页并把 illegal-instruction 误当成 NX 证据；
+- 页内边界子例中的执行指令仍必须完整、4 字节对齐且不跨页，不能把“最后一个字节”直接当作可执行指令地址；
 - 普通 ELF text 仍可执行，heap 普通 load/store仍成功。
 
 ### C. 收紧接口
@@ -48,7 +50,7 @@ child 调 `sbrklazy(PGSIZE)`，先读首/末字节并验证零，再写入 RISC-
 - 执行 lazy heap 在 `scause=12` 失败，不调用 `vmfault`、不新增物理页，普通 child 退出状态 -1；
 - 合法 ELF text、fork/exec、eager `sbrk` 和 lazy tests 无回归；
 - `walk` 观察到 lazy leaf 至少包含 `R|W|U|V` 且不含 X；访问后允许硬件设置 A/D 位。若要比较初始 flags，必须在首次 load/store 前停住；
-- bad address `>=p->sz`、`>=TRAPFRAME` 仍失败且不分配；
+- lazy 边界按入口分别验收：硬件 load/store fault 传原始 `stval`，所以未映射的 `addr >= p->sz` 必须失败；`copyin/copyout` 传页首 `PGROUNDDOWN(addr)`，因此 break 落在页中间时，越过 break 但仍处于最后一页的 copy 可以首次物化该页，只有页首也 `>=p->sz` 时才失败；页已映射后，用户访问和 copy helper 都不会再做字节级 `p->sz` 检查。`TRAPFRAME` 及以上仍不得分配。测试必须分别覆盖“硬件首次触碰越 break”“copy 首次触碰同一页内越 break”“已物化最后部分页的页尾”和“下一整页”，不能把它们合并成一个边界；
 - 每个失败 child 被 wait 后，数据页和中间页表页计数回到基线。
 
 ## 5. 故障注入
@@ -61,7 +63,7 @@ child 调 `sbrklazy(PGSIZE)`，先读首/末字节并验证零，再写入 RISC-
 | L1 page-table page | 已分配数据页被释放；可能创建的更高层结构按当前契约最终可回收 |
 | L0 page-table page | 同上，不得留下有效 leaf |
 
-另做 mutation：临时给 lazy PTE 加 `PTE_X`，NX 测试必须真的执行成功或以不同原因失败，从而证明测试能区分权限，而非总因坏指令/坏函数地址失败。mutation 后必须恢复源码。
+另做 mutation：临时给 lazy PTE 加 `PTE_X`。每条执行路径都必须先确认目标地址含有效 `ret` 编码；mutation 后函数调用应正常返回，而不能只要求“以不同原因失败”。这样才能证明测试区分的是取指权限，而非坏指令、错误函数地址或数据准备失败。mutation 后必须恢复源码。
 
 ## 6. 多 hart 与指令同步边界
 

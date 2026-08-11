@@ -123,8 +123,8 @@ superblock 没有直接存 `data_start`，但 `nblocks` 明确给出 data 区长
 | log header | `sizeof(logheader)<BSIZE` 是编译配置检查 | 磁盘 `n` 范围、target 范围/重复/指向 log |
 | dinode | `ilock()` 拒绝 `type==0` | 非法非零 type、size、nlink、块地址 |
 | bitmap | `bfree()` 检查目标 bit 已置位 | metadata 保留、引用完整、重复 owner |
-| block map | logical index 不超过 `MAXFILE` | 非零物理地址是否在 data 区 |
-| dirent | lookup 跳过 `inum==0` | inum 范围、目标已分配、特殊项、重复名 |
+| block map | logical index 满足 `0 <= index < MAXFILE` | 非零物理地址是否在 data 区 |
+| dirent | lookup 跳过 `inum==0` | inum 范围、普通引用/非 orphan 特殊项目标已分配、特殊项关系、重复名 |
 | unlink | 目标 `nlink>=1`，目录表面为空 | 全局 nlink 等式、目录环、多父目录 |
 
 尤其危险的是：`balloc()` 从 block 0 开始相信 bitmap；若 metadata bit 被错误清零，它可把 superblock、日志或 inode block 当作空闲块并 `bzero()`。`readi()` 又调用会分配的 `bmap()`；size 内的零地址不是稀疏洞，而可能使只读调用在事务外分配、触发 `log_write outside of trans` panic，或把分配混入另一个全局 outstanding group。
@@ -192,6 +192,8 @@ view(block) = redo[block]  if block 是 header 中某个 target
 
 inode 0 必须保持未分配。对 `[1,ninodes)` 中每个 dinode：
 
+inode 区最后一块可能包含超出 `[0, sb.ninodes)` 的填充槽。当前 `ninodes=200`、`IPB=16`，因此槽 200..207 虽占据磁盘空间，却没有可用 inode 号；内核既不会分配也不会按 inode 号访问它们。检查器不能把这些槽中的非零地址当成块 owner；严格的当前镜像 profile 可以另外要求尾部槽全零。若某种 geometry 因 `mkfs` 的整除时 `/IPB + 1` 计算多出整块，那是 reserved gap，也不能解释成额外 inode。
+
 - `type==0` 表示 free。正常删除后 `nlink/size/addrs` 应为零；device inode 被删除后 major/minor 可以保留旧值，因为 `iput()` 只清 type。free inode 中的非零块指针不是 owner，必须报错，不能据此占有或释放块。
 - `type` 非零时只能是 `T_DIR=1`、`T_FILE=2` 或 `T_DEVICE=3`。
 - `nlink` 按有符号 16-bit 解释且不得为负。
@@ -247,7 +249,7 @@ bitmap_allocated_within_size
 只有在目录 inode 的块映射已验证无空洞后才能读取 dirents。遍历 `[0,size)` 中每个 16-byte 记录：
 
 - `inum==0` 表示空槽；当前创建/删除路径会让其余 14 字节也为零，非零残留只记规范化告警。
-- `inum!=0` 时必须满足 `1<=inum<ninodes`，且目标 dinode 的 type 非零。
+- `inum!=0` 时必须无条件满足 `1<=inum<ninodes`。目标是否已分配要留到图与 orphan 分类阶段判断：所有普通（非 `.`/`..`）引用和所有非 orphan 目录中的特殊项最终都必须指向 type 非零的 inode；严格合法的 orphan 目录之 `..` 是唯一例外，它可以保留一个范围内但已经 free 或被复用的旧 parent inum。
 - name 是固定 14 字节，不保证 NUL 结束。若含 NUL，NUL 后字节应为零；若不含 NUL，全部 14 字节都是名字。
 - 名字不得为空或包含 `/`。普通名字不得等于 `.` 或 `..`。
 - 重名按内核 `strncmp(...,DIRSIZ)` 语义判断：比较遇到首个 NUL 停止，否则比较全部 14 字节。不能仅比较原始 14-byte 数组，否则 `"a\0x"` 与 `"a\0y"` 会被错误视为不同。
@@ -255,7 +257,11 @@ bitmap_allocated_within_size
 
 ### 8.2 `.`、`..` 与目录树
 
-每个已分配目录必须恰有一个 `.` 指向自己、一个 `..` 指向其父目录。只有根目录的 `..` 指向根自身；其他可达目录的目标必须等于后续图检查确定的唯一 parent。
+严格的 parent 关系只适用于 root 可达目录：root 必须恰有一个 `.` 和一个 `..`，两者都指向自己；每个其他可达目录也必须恰有一个 `.` 指向自己、一个 `..` 指向后续图检查确定的唯一 parent。
+
+不可达目录要先单独做 orphan 分类。一个 normal directory orphan 必须满足 `nlink==0`、没有任何普通外部 dirent 指向，且自己的非空记录只有恰好一个自指的 `.` 和一个 inum 仍在合法范围内、但不等于自身 inum 的 `..`。创建时 parent 与 child 是不同的已分配 inode，旧 parent 后续也不可能复用成仍存活的 child 自身，所以自指 `..` 不是受支持路径产生的 orphan。除此以外，不能再要求 `..` 的目标仍已分配、仍为目录或仍是它的 parent，也不能把这条 `..` 计入目录图或 nlink；父目录可能已经被删除并复用。
+
+所有非 orphan 的已分配目录仍必须恰有一个自指 `.` 和一个指向已分配 `T_DIR` 的 `..`，包括不可达/lost 目录；root 的 `..` 自指，其他目录的 `..` 还不得自指。这只能验证特殊项自身，不会把不可达目录变成合法对象。只有 root 可达目录还能进一步要求 `..` 等于由普通入边确定的唯一 parent。
 
 把所有非 `.`/`..` 且目标为 `T_DIR` 的 dirent 视为 parent-to-child edge。对根可达部分必须成立：
 
@@ -274,11 +280,11 @@ bitmap_allocated_within_size
 | 状态 | 判定 |
 |---|---|
 | reachable | 至少一个从 root 开始的合法名字路径可达 |
-| normal orphan | 不可达、`nlink==0`，且没有普通 dirent 指向；目录 orphan 还必须除 `.`/`..` 外为空 |
+| normal orphan | 不可达、`nlink==0`，且没有普通 dirent 指向；目录 orphan 还必须除 `.`/`..` 外为空、`.` 自指且 `..` 范围合法但不自指 |
 | lost allocated inode | 不可达但 `nlink>0`，或不可达目录仍有子项 |
-| dangling reference | dirent 指向 free/越界 inode |
+| dangling reference | 普通 dirent 指向 free/越界 inode，或非 orphan 目录的特殊项目标 free/越界/类型错误；严格 directory orphan 中范围合法、非自指但目标已 free/复用的 `..` 不属于此类 |
 
-最后两类不可能由受支持的完整日志事务产生，分别是 `ERROR_LOST_INODE` 和 `FATAL_DANGLING_DIRENT`。
+除上述 directory orphan 的陈旧 `..` 外，受支持的完整日志事务不会留下“不可达但仍有正 nlink/内容”的 allocated inode，也不会留下普通或非 orphan 特殊项指向无效目标；这两类分别是 `ERROR_LOST_INODE` 和 `FATAL_DANGLING_DIRENT`。normal orphan 本身则正是受支持的 unlink/crash 路径之一。
 
 ## 9. `nlink` 的精确等式
 
@@ -303,6 +309,8 @@ child_dirs(d)    = 所有普通目录边中，parent==d 的边数
 
 等价地，非根目录的基础 1 来自父目录中的名字；每个直接子目录再为自己的 `..` 让 parent 加 1。目录自己的 `.` 不增加自身 nlink。
 
+normal directory orphan 留在磁盘中的 `..` 不属于 `ordinary_refs`，也不再代表一条有效 parent-to-child edge；即使它的旧 target inode 已被释放或复用，也不能据此给该 target 增加期望 nlink。
+
 `nlink` 不匹配通常是 `ERROR_NLINK`；以下情况升级为 `FATAL_RECLAIM_HAZARD`：一个普通 dirent 仍指向 `nlink==0` 的 allocated inode。当前启动顺序在日志恢复后无条件运行 `ireclaim()`；对没有既存 cache 引用的非根 inode，`iget()+iput()` 满足最后引用条件，会截断并清 type，随后留下悬空目录项。root 是实现特例：`userinit()` 已在 `fsinit()` 前把它作为 cwd pin，reclaim 临时引用使 `ref==2`，所以该轮 `iput()` 不会删除 root。这个偶然 pin 不让错误 root nlink 变成合法镜像，危险分类仍保持 fatal。
 
 ## 10. Orphan 的边界
@@ -315,9 +323,15 @@ nlink == 0
 没有普通目录项指向
 块指针合法、唯一且 bitmap 已置位
 若为目录，只剩 "." 和 ".." 及空槽
+  "." 恰好一个且指向自己
+  ".." 恰好一个且 inum 在合法范围内并且不等于自身；目标可以已经 free 或被复用
 ```
 
 这应报告为 `RECOVERABLE_ORPHAN`，不是 bitmap leak。当前内核先重放日志，再由 `ireclaim()` 为每个候选建立新事务并走 `iput()`；正常未缓存 orphan 会执行 `itrunc()` 并清 type。预先由 init cwd pin 的 root 不满足最后引用条件，是上述明确例外。
+
+嵌套删除会实际产生这个 `..` 边界：进程 P 把 cwd 设为 `/a/b` 后只 pin 最终的 `b`；进程 Q 先 unlink `/a/b`，再 unlink 已空的 `/a`。`b` 因 P 的 cwd 引用保持 `type!=0,nlink==0`，而没有引用的 `a` 可以立刻被 `iput()` 截断、清 type，甚至随后复用为其他类型；`b/..` 的磁盘记录仍是旧 `a` 的 inum。启动 `ireclaim()` 只按 inode 的 type/nlink 回收 `b`，不会查验或跟随这些目录项，所以 fsck 必须把范围合法的陈旧 `..` 当作可回收 orphan 的组成部分，而不是 dangling edge。
+
+反过来，范围越界或自指的 orphan `..` 都不是这条受支持序列的结果。即使 `ireclaim()` 不读目录项、仍可能安全丢弃整个 inode，检查器也应以专用 orphan 特殊项错误保留这份异常证据，而不能把它静默归为 normal orphan。
 
 不要把所有不可达 inode 都叫 orphan：`nlink>0` 的不可达 inode、仍被 dirent 指向的 `nlink==0` inode、非空不可达目录或含非法块的 inode 都不是自动回收安全对象。特别是错误 nlink 不能用“内核本来也会回收”作为修复依据。
 
@@ -341,8 +355,8 @@ phase 2  validate log header and build replay overlay
 phase 3  decode every dinode; validate size/type/pointers
 phase 4  build block owner map; then cross-check bitmap
 phase 5  parse directory records from validated mappings
-phase 6  validate names, dot/dotdot, parents and cycles
-phase 7  compute reachability, nlink and orphan classes
+phase 6  validate raw inum/name fields; build ordinary refs and root reachability
+phase 7  classify orphan/lost; validate special entries, reachable parents/cycles and nlink
 phase 8  emit deterministic report; make no writes
 ```
 
@@ -385,14 +399,19 @@ check(path, profile):
 
   for each allocated T_DIR inode d:
     entries[d] = read_dirents_only_through_validated_map(view, d)
-    validate_entry_ranges_and_unique_names(entries[d], inode)
+    validate_raw_inum_ranges_names_and_uniqueness(entries[d])
 
-  graph = build_directory_graph(entries)
-  require_root_and_dot_rules(graph)
-  detect_multiple_parents_and_cycles(graph)
-  reachable = traverse_from_root(graph, all ordinary entries)
-  compare_nlink_counts(inode, entries, graph)
-  classify_orphans_and_lost_inodes(inode, reachable, entries)
+  ordinary = collect_all_non_dot_entries(entries)
+  validate_allocated_targets_or_fatal(ordinary, inode)
+  graph = build_allocated_directory_edges(ordinary, inode)
+  reachable = traverse_from_root(graph, ordinary)
+  orphan = classify_strict_orphans(inode, reachable, ordinary, entries)
+  require_non_orphan_dot_self_and_valid_nonroot_dotdot(inode, orphan, entries)
+  require_orphan_dot_self_and_in_range_nonself_dotdot(orphan, entries)
+  require_root_reachable_unique_parent_and_dotdot(graph, reachable, entries)
+  detect_reachable_multiple_parents_and_cycles(graph, reachable)
+  compare_nlink_counts_excluding_orphan_dotdot(inode, ordinary, graph, orphan)
+  classify_remaining_lost_inodes(inode, reachable, orphan, entries)
 
   emit_sorted_diagnostics()
   return severity_exit_code()
@@ -421,8 +440,8 @@ check(path, profile):
 
 1. 合法非零日志：先把 shadow view 物化到新镜像，再清 header。这不是“修复损坏”，而是完成已提交 recovery。
 2. 只有在块 owner 扫描完整时，才可重建 bitmap。先置上所有 referenced/reserved bits，再考虑清除证明为 unowned 的 bits。
-3. 严格 normal orphan 可释放其 direct/indirect/data blocks并清 dinode；任何目录引用存在时禁止这样做。
-4. 只有目录图完整、无环、无 dangling entry 时，才可从目录关系重算 nlink。
+3. 严格 normal orphan 可释放其 direct/indirect/data blocks并清 dinode；除该 directory orphan 自身允许的 `.`/`..` 外，只要仍有任何普通外部 dirent 指向它就禁止这样做。
+4. 只有所有普通 dirent 与 root 可达目录图都已完整扫描、没有环/多父/dangling、且每个不可达 allocated inode 都是严格 orphan 时，才可从目录关系重算 nlink；严格 orphan 目录中范围合法的陈旧 `..` 已从图中排除，不阻止这一步，未解决的 lost directory 则会阻止。
 5. EOF 后 surplus 可在复制镜像中解除 pointer 并释放对应块；必须同时处理 indirect block 是否变空。
 
 不得自动修复：重复块 owner、目录环、多父目录、重复名字、含内容的 lost directory、非法 log target，以及无法判断哪一半较新的 torn block。重复块不是简单“清一个 bit”：需要选择语义 owner，必要时复制数据并原子更新 inode 与 bitmap；检查器没有足够信息代替人工决策。
@@ -450,7 +469,7 @@ VirtIO 请求一次传输 1024-byte filesystem block，起始 sector 为 `blockn
 | metadata bitmap bit 清零 | `balloc+bzero` 清除元数据 | `FATAL_METADATA_FREE` |
 | inode 指向另一 inode 的 block | 一方写入破坏另一方内容 | `FATAL_DUP_BLOCK` |
 | size 内地址为 0 | 只读路径尝试分配并写日志 | `FATAL_HOLE` |
-| dirent inum 越界/free | `iget/ilock` 读错误位置或 panic | `FATAL_DANGLING_DIRENT` |
+| 普通 dirent 或非 orphan 特殊项的 inum 越界/free | `iget/ilock` 读错误位置或 panic | `FATAL_DANGLING_DIRENT`；不包含严格 orphan 中范围合法的陈旧 `..` |
 | reachable inode nlink 为 0 | 启动 `ireclaim` 通常删除仍有名字的非根 inode；root 因 cwd pin 暂时逃过但仍损坏 | `FATAL_RECLAIM_HAZARD` |
 | 目录环/多父 | 路径与父关系无简单树语义 | 禁止自动修复/启动 |
 | bitmap 置位但无 owner | 永久丢失空间 | repairable leak，仅在全扫描后判定 |
@@ -492,7 +511,9 @@ bitmap_bit(b)      = byte 46*BSIZE + b/8, mask 1<<(b%8)
 | duplicate name | 把两个 active root dirents 的 14-byte name 设为相同 | `FATAL_DUP_NAME` |
 | bad regular nlink | 给普通文件 nlink 加 1 | `ERROR_NLINK`，显示 observed/ordinary_refs |
 | false orphan | 保留 root dirent，却把目标 nlink 写成 0 | `FATAL_RECLAIM_HAZARD`；明确禁止用该镜像启动 |
-| valid orphan | 清除唯一普通 dirent、把目标 nlink 写成 0，保留合法 blocks/bits | 仅 `RECOVERABLE_ORPHAN`；模拟 reclaim 后应 clean |
+| valid orphan | 对 regular inode 清除唯一普通 dirent、把目标 nlink 写成 0，保留合法 blocks/bits；若另测空目录 orphan，还必须同步把原 parent 的 nlink 减 1 | 仅 `RECOVERABLE_ORPHAN`；模拟 reclaim 后应 clean，不应夹带 `ERROR_NLINK` |
+| nested directory orphan | 在 xv6 中创建 `/a/b`，让一个进程 `chdir("/a/b")`，另一个进程依次 unlink `/a/b` 和 `/a` 后取 crash snapshot；允许 `b/..` 指向已经 free 或复用的 `a` inode | `b` 仅报 `RECOVERABLE_ORPHAN`；旧 `..` 不报 dangling、不计入 parent/nlink，模拟 `ireclaim` 后应 clean |
+| orphan self-parent | 在上一 case 的副本中把 `b/..` 改为 `b` 自身 inum | 不是 normal orphan；报 `ERROR_ORPHAN_DOTDOT` 等专用异常，不能因目标 allocated 而静默接受；可另注明 `ireclaim` 会忽略该项并截断 inode |
 | bad root parent | 把 root 的 `..` inum 改为另一目录 | `FATAL_DOTDOT` |
 | directory cycle | 先创建 `/a/b/tmp` 再 unlink `tmp`，确认 `b` 的 size 内留下空槽；把该槽写成 `{inum=a,name="back"}` | `FATAL_DIR_CYCLE`，通常同时报告 multiple parent |
 

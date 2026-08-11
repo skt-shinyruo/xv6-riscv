@@ -128,7 +128,7 @@ ENTRY(_entry)
 
 这里必须区分三个彼此独立、当前数值恰好都为 `0x80000000` 的地址：
 
-- ELF `PT_LOAD` 给出的装载地址决定内核各字节被放到哪段 RAM；
+- ELF `PT_LOAD` 的 `p_paddr` 决定 QEMU ELF loader 把内核各字节放到哪段 RAM；当前链接结果的 `p_vaddr` 与 `p_paddr` 相等，不能因此把二者概念混为一谈；
 - ELF header 的 `e_entry` 由 `ENTRY(_entry)` 设置，是 ELF 的入口元数据；
 - 当前 QEMU `virt -bios none` 直接启动路径在 `0x1000` 生成 MROM reset stub，并把该 stub 的跳转目标设为 `virt` 的 DRAM/固件起始地址 `0x80000000`。
 
@@ -149,7 +149,7 @@ ASSERT(. - _trampoline == 0x1000,
        "error: trampoline larger than one page");
 ```
 
-断言要求 trampoline 的内容对齐后恰好占一个链接页区间。内核页表把这段物理页映射到高虚拟地址 `TRAMPOLINE`，每个用户页表也映射同一页；若汇编增长超过一页，映射和相邻 `TRAPFRAME` 布局会失效，因此构建应立即失败。
+断言要求非空 trampoline 的内容在末尾对齐后恰好占一个链接页区间。内核页表把这段物理页映射到高虚拟地址 `TRAMPOLINE`，每个用户页表也只映射同一页。若汇编增长超过一页，第二页代码不会因物理上连续就自动出现在 `TRAMPOLINE` 附近；当前页表映射仍只有一页，跨页取指会进入未映射的 `MAXVA` 之外或错误地址。`TRAPFRAME` 是另行映射在 `TRAMPOLINE - PGSIZE` 的数据页，并不会被链接器把 trampoline 物理内容加长而“推开”；构建断言阻止的是代码超出单页映射契约。
 
 ### 5.2 其他 section 和 `end`
 
@@ -178,7 +178,9 @@ objdump -t kernel/kernel -> kernel/kernel.sym
 . = 0x0;
 ```
 
-随后依次收集 `.text`、`.rodata`、`.eh_frame`，再把 `.data` 对齐到下一 4 KiB 边界，放置 `.data` 与 `.bss`，最后提供 `end`。`kexec()` 读取 `LOAD` program header 中的虚拟地址、大小和 flags 并映射到新用户页表，因此链接脚本形成的 segment 布局直接成为运行时地址空间布局。它会检查 segment 对齐、大小关系与地址加法溢出，却不会验证 ELF `entry` 是否真的落在某个可执行 segment 内；构建验证必须单独核对 entry。
+随后依次收集 `.text`、`.rodata`、`.eh_frame`，再把 `.data` 对齐到下一 4 KiB 边界，放置 `.data` 与 `.bss`，最后提供 `end`。`kexec()` 读取 `LOAD` program header 中的虚拟地址、大小和 flags 并映射到新用户页表，因此链接脚本形成的 segment 布局直接成为运行时地址空间布局。对正常构建产物，当前链接结果是一个只读/可执行 `LOAD` 加一个读写 `LOAD`；`flags2perm()` 只解释 ELF 的 `PF_X`、`PF_W`，而 `uvmalloc()` 总会再加 `PTE_R | PTE_U`。
+
+`kexec()` 对输入 ELF 的检查远少于链接器保证的条件。它只核对 magic；对每个 `LOAD` 检查 `memsz >= filesz`、`vaddr + memsz` 不回绕以及 `vaddr` 页对齐。它没有核对 ELF class、机器类型、版本、program-header 表整体范围或 `offset + filesz` 溢出，也不要求 segment 按虚拟地址递增、互不重叠、文件偏移满足页内同余或至少存在一个 `LOAD`。更具体地说，ELF64 的 `phoff` 先赋给 32 位 `int off`，`ph.off` 与 `ph.filesz` 又传给参数为 32 位 `uint` 的 `loadseg()`；三个值都在真正读文件前收窄，当前 GCC/RISC-V 产物只保留低 32 位。`uint64` 到 `uint` 的结果由无符号转换规则定义，而超出 `int` 范围的 `phoff` 转换是 C 的实现定义行为，不能把当前结果当成可移植 parser 契约。`uvmalloc()` 对 `newsz < oldsz` 直接返回旧大小，因此倒序/重叠 segment 可能复用先前映射，最终权限取决于先分配该页的 segment；同时 `PF_W | PF_X` 会形成用户 RWX 页，代码没有 W^X 检查。`elf.entry` 也不会被验证为小于 `MAXVA`、已映射且可执行。只要前面的读取没有失败，`kexec()` 就会提交新页表和该 entry；无效入口通常在返回用户态取指时变成 page fault 并杀死进程，而不是让 `exec` 返回 `-1`。因此用户链接脚本不仅是布局偏好，也是当前宽松 loader 的受信任输入契约；检查非标准 ELF 时必须单独核对这些条件。
 
 所有普通用户程序与 `ULIB` 一起链接：
 
@@ -206,7 +208,7 @@ $U/usys.S: $U/usys.pl
 
 每个 `entry("name")` 生成一个全局汇编函数：把 `SYS_name` 放入 `a7`，执行 `ecall`，再 `ret`。生成的 `user/usys.S` 随后编译为 `user/usys.o` 并链接进所有用户程序。
 
-修改系统调用时必须保持四处一致：用户声明、`user/usys.pl` entry、`kernel/syscall.h` 调用号、`kernel/syscall.c` 分派表。直接编辑 `user/usys.S` 会在重新生成或 `make clean` 后丢失。
+修改系统调用时至少要保持用户声明、`user/usys.pl` entry、`kernel/syscall.h` 调用号、`kernel/syscall.c` 分派表，以及内核 handler 的声明和实现一致。`sbrk` 还是一个命名特例：生成器导出 `sys_sbrk`，用户库再用 `sbrk()`/`sbrklazy()` 传入不同策略；不能照抄其他 stub 后同时导出同名 `sbrk`。直接编辑 `user/usys.S` 会在重新生成或 `make clean` 后丢失。
 
 ## 8. `_forktest` 的特殊链接规则
 
@@ -330,7 +332,9 @@ README    -> README
 off = ((size / BSIZE) + 1) * BSIZE
 ```
 
-把目录大小推进到下一个整块边界，目的是把当前已分配尾块里的零目录项留给后续创建。即使原大小恰好对齐也会再推进一块，但代码只改 inode `size`，不会为额外范围分配数据块；这会在目录内部制造未映射空洞，而运行时 `readi()` 并没有只查询、不分配的 `bmap()` 路径。当前初始目录远小于一个块，不会触发该边界。正常尾块未使用部分因镜像预先清零，其目录项 inode 号为 0，会被内核忽略。
+把目录大小推进到下一个整块边界，目的是把当前已分配尾块里的零目录项留给后续创建。当前清单形成 `.`、`..`、`README` 和 19 个用户程序，共 22 个目录项、352 字节；根目录已分配一个数据块，inode size 随后被改为 1024，因此剩余 42 个零目录项可由 `dirlink()` 复用。
+
+即使追加前的原大小恰好对齐，公式也会再推进一整块，但代码只改 inode `size`，不会为额外范围分配数据块。此时运行时扫描目录会进入一个 inode 声称存在、地址却为 0 的块；`readi()` 调用的 `bmap()` 不是纯查询，而会尝试分配并清零该块。分配成功时读路径已经产生磁盘 bitmap/log 副作用，且 `readi()` 本身不调用 `iupdate()` 持久化新块地址；分配失败则 `readi()` 短读，`dirlookup()`/`dirlink()` 会 panic。当前 352 字节的初始目录不会触发这个恰好对齐边界，但扩展清单时不能把该公式当成通用的 sparse-directory 支持。
 
 ## 15. `iappend()` 的直接和间接块分配
 
@@ -418,6 +422,8 @@ set riscv use-compressed-breakpoints yes
 ```
 
 `make qemu-gdb` 给 QEMU 增加 `-S`，让 CPU 在 MROM reset PC `0x1000` 暂停，并按 QEMU 支持的命令行形式开放 GDB stub。随后在另一终端运行合适的 RISC-V GDB；符号文件必须是当前构建的 `kernel/kernel`。
+
+这里还有一个不能由客户端地址掩盖的安全边界：当前生成的是 `-gdb tcp::PORT`，QEMU 8.2.2 实测同时监听 `0.0.0.0:PORT` 和 `[::]:PORT`，不是只监听 loopback。`.gdbinit` 或 VSCode 连接 `127.0.0.1` 只规定客户端去哪里连接，不会收窄服务端 bind。GDB remote stub 没有认证，能连接的客户端可以暂停、读写来宾寄存器/内存并结束虚拟机；在不可信网络或共享主机上应通过主机防火墙限制端口，或在当前 QEMU 上把参数显式改为 `-gdb tcp:127.0.0.1:PORT`。可用 `ss -ltnp 'sport = :PORT'` 核对实际监听地址，不能只检查调试器配置。
 
 生成规则只把模板列为 `.gdbinit` 的依赖，计算出的 `GDBPORT` 并不是文件依赖。若同一工作树换到不同 uid、或端口计算方式改变但模板时间戳没变，旧 `.gdbinit` 可能仍保留旧端口；此时用 `make -B .gdbinit` 重新生成，并用 `make print-gdbport` 核对。
 

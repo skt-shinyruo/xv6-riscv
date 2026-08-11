@@ -242,6 +242,8 @@ exec 构建的新 ELF/stack 使用 eager `uvmalloc()`；成功提交后旧 lazy 
 
 但 `sys_exec()` 在调用 `kexec()` 构建新页表前，先从当前旧地址空间导入参数。路径和各参数字符串经 `fetchstr()->copyinstr()` 读取而不补页；`argv[]` 指针元素则由 `fetchaddr()->copyin()` 逐槽读取，所以只有指针向量所在的合法 lazy 页可能在参数导入阶段被物化。该副作用发生在旧 `p->pagetable` 上：参数导入失败时会释放已经分配的内核参数页，后续 `kexec()` 失败时还会清理已经创建的临时新映像，但两者都不会撤销旧地址空间中已经补出的 lazy 页。这些页继续归旧地址空间所有，之后可由缩容、进程回收或下一次成功 exec 释放。
 
+“不补页”也不等于 `fetchstr()` 执行字节级 `p->sz` 检查。缩容若只移动到同一物理页内，该页仍有 `PTE_U`；新 break 之后的页尾字节可被 `copyinstr()` 读取并在找到 NUL 时成功。`fetchaddr()` 对 argv 指针槽明确检查 8 字节都不超过 `p->sz`，字符串内容没有对应检查。
+
 ## 17. 与 guard/text/高地址的边界
 
 | 场景 | `vmfault()`/helper 的判断 | 直接用户硬件访问 | `copyin()`/`copyout()` |

@@ -35,7 +35,7 @@ if final read < 0:
   report error
 ```
 
-无文件参数时读取 fd 0，适合作为管道右端；有多个路径时依次打开、复制、关闭，输出无分隔。任一 open/read/write 失败立即以状态 1 退出，不再处理后续文件。它把短写视为错误而不循环补写，这在当前普通文件、console 和小于 pipe buffer 的块上通常成立，但不是通用 POSIX 写法。
+无文件参数时读取 fd 0，适合作为管道右端；有多个路径时依次打开、复制、关闭，输出无分隔。任一 open/read/write 失败立即以状态 1 退出，不再处理后续文件。它把短写视为错误而不循环补写，这在当前普通文件、console 和不超过 pipe buffer 的块上通常成立，但不是通用 POSIX 写法；当前读块大小正好是 `PIPESIZE=512`。
 
 ## 4. `echo`
 
@@ -120,6 +120,8 @@ require one additional wait == -1
 
 最后一个断言失败时会打印源码中的 `wait got too many`。因此该测试不仅要求前 `n` 次 wait 成功，还要求第 `n+1` 次确实返回 -1；只观察“fork 终于失败”不足以判定通过。
 
+它在这些 wait 之后直接打印成功并退出，没有再执行一次 fork。因此它能证明已创建 child 都进入了回收路径，却没有用同一进程直接证明“刚释放的 proc 槽立刻可重新分配”；后续程序仍能 fork 只是间接覆盖。若把槽复用作为验收目标，应在回收一个 child 后立即 fork 并结合 proc/OOM 计数确认失败原因。
+
 Makefile 为 `_forktest` 使用更小的特殊链接规则，只链接 `forktest.o + ulib.o + usys.o`，避免程序映像过大让物理内存先于进程表成为限制。
 
 ## 10. `zombie`
@@ -191,6 +193,8 @@ pause forever
 
 `main()` 永久循环：fork 一个 `iter()` 子进程、等待、`pause(20)`，再改变 seed。`iter()` 清理 `a`/`b`，创建两个 worker 执行 `go(0/1)`；若先回收的 worker 非零退出，就 kill 两者，然后回收另一个并退出。
 
+这里的退出状态不是强 oracle：`iter()` 无论两个 worker 的状态如何最终都执行 `exit(0)`，第二次 `wait()` 得到的状态也不检查；外层 `main()` 又忽略 `iter()` 的 wait status。若先回收者失败，kill 只是尽快结束同轮，错误主要靠 worker 已打印的诊断暴露。因而自动运行 `grind` 必须同时监视错误文本、kernel panic 和进展停滞，不能把某轮 `iter` 的 0 状态当成该轮所有操作通过。
+
 `go()` 每轮取 `rand() % 23`。0 是空操作，1 到 22 混合：
 
 - 带 `.`、`..`、绝对/相对形式的 create/open/unlink/chdir；
@@ -261,7 +265,7 @@ ALL TESTS PASSED
 | `badarg` | 50000 次含坏 argv 指针的 exec 不泄漏内核页 |
 | `pgbug` | 极大 64 位地址传给 exec/pipe 不因截断触发内核页故障 |
 
-这些测试特别区分 `copyin`/`copyout` 可为合法 lazy 地址补页，而 `copyinstr` 不补页；“合法但尚未映射”和“超出 p->sz/接近 trampoline”的结果不同。
+这些测试特别区分 `copyin`/`copyout` 可为合法 lazy 地址补页，而 `copyinstr` 不补页；“合法但尚未映射”和“跨到下一整页/接近 trampoline”的结果不同。硬件 fault 把原始 `stval` 传给 `vmfault()`，原始地址 `>=p->sz` 时不能补页；`copyin`/`copyout` 却先传向下取整的页首，所以原始 copy 地址虽已越过 break，只要仍在页首 `<p->sz` 的最后一页，就可能首次物化该页。若 PTE 已经存在，helpers 又会直接使用映射而不检查 byte-granular `p->sz`。这些坏高地址用例没有覆盖“越 break 的 copy 首次物化最后一页”和“已映射页尾”两个例外。
 
 ## 18. quick tests：文件、inode 和目录
 
@@ -375,6 +379,8 @@ quick 模式跳过它们，因此 `-q` 通过不能替代完整磁盘/低内存�
 ```
 
 若正则没有匹配任何宿主 test 函数，就把原字符串作为 `usertests <name>` 的单项名字。因此宿主层选择是 regex，进入 xv6 后单项选择是精确名字。
+
+`-q` 在 `test_usertests()` 中优先于单项参数：例如 `./test-xv6.py -q lazy_sbrk` 实际发送的是 `usertests -q`，会运行整套 quick tests，而不是只运行 `lazy_sbrk`。要运行一个单项不能同时带 `-q`。
 
 一个宽正则可能匹配并顺序运行多个宿主函数。每个函数自己决定是否重置镜像，不能假设所有匹配项共享或隔离状态。
 

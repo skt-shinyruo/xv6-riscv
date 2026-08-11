@@ -173,7 +173,7 @@ handler 不接收 C 形参，而是调用 helper 从保存的 trapframe 读取�
 
 `fetchaddr(addr, &value)` 读取用户内存中的一个 64 位值，例如 exec 的 argv 指针。它先要求整个 8 字节区间位于 `p->sz` 且加法不溢出，再 `copyin()`。
 
-`fetchstr(addr, buf, max)` 交给 `copyinstr()` 查找 NUL。`copyinstr` 逐页 walk，只接受有效用户映射，遇到未映射页立即失败，不调用 `vmfault()`。
+`fetchstr(addr, buf, max)` 交给 `copyinstr()` 查找 NUL。`copyinstr` 逐页 walk，只接受有效用户映射，遇到未映射页立即失败，不调用 `vmfault()`。它没有 `fetchaddr()` 的 `p->sz` 区间检查：缩容后仍映射的最后部分页中，逻辑 break 之后的字节只要仍带 `PTE_U` 且能在 `max` 内找到 NUL，字符串提取就可成功。
 
 当参数是当前进程的 `p->pagetable` 时，普通 `copyin()`/`copyout()` 遇到没有有效用户映射的页会调用 `vmfault()`；后者以当前进程的 `p->sz` 为上界，分配一张零页并映射为 `R|W|U`。`walkaddr()` 本身检查 `PTE_V|PTE_U`，`copyout()` 还额外拒绝没有 `PTE_W` 的叶子；`copyin()` 没有单独检查 `PTE_R`，因为它经物理地址由内核读取。
 
@@ -257,7 +257,7 @@ sret
 
 `kexec()` 不会把整个 trapframe 清零：除 `epc/sp/a1` 和随后写入的 a0 外，`ra/gp/tp/a2..a7/s*/t*` 仍是旧程序执行 `ecall` 时的值，`userret` 会照常恢复它们。正常启动只把 pc、sp、a0、a1 当作有效入口契约；尤其旧 `ra` 的数值仍在寄存器中，但其原目标代码已经随旧页表消失，新的 `ulib.c:start()` 也不会靠它返回。
 
-失败 `exec` 不提交临时地址空间，原 `epc` 已在 `usertrap()` 中推进到旧 stub 的 `ecall` 后一条指令，最终以 a0=-1 回旧 caller。不过，读取旧地址空间中的 argv 指针使用 `fetchaddr()`/`copyin()`，可能物化合法范围内的 lazy 页；失败并不承诺完全无副作用。
+失败 `exec` 不提交临时地址空间，原 `epc` 已在 `usertrap()` 中推进到旧 stub 的 `ecall` 后一条指令，最终以 a0=-1 回旧 caller。不过，读取旧地址空间中的 argv 指针使用 `fetchaddr()`/`copyin()`，可能物化合法范围内的 lazy 页；若 executable inode 损坏并在 size 内含 hole，`kexec()` 的事务中还可能由 `readi()->bmap()` 分配并登记磁盘块。失败不承诺用户页表或异常文件系统输入完全无副作用。
 
 ### `exit`
 

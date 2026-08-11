@@ -241,14 +241,16 @@ pipe writer 在有空间时一直持锁。成功写入超过 `PIPESIZE` 的请�
 
 | 发布者 | 发布动作 | 观察者 | 保证的状态 |
 |---|---|---|---|
-| boot hart | 初始化共享对象，fence，`started=1` | 其他 hart 轮询后 fence | kernel page table、锁、设备全局状态已初始化 |
+| boot hart | 初始化共享对象，fence，普通 volatile store `started=1` | 其他 hart 普通 volatile load 观察非零后 fence | 当前 GCC/RISC-V 机器级消息传递意图：随后观察初始化状态；不是 ISO C happens-before |
 | fork parent | child 锁下 `state=RUNNABLE` | scheduler 取得 child 锁 | parent、trapframe、页表、fd/cwd 已完整 |
 | sleeper | `p->lock` 下 `chan/state=SLEEPING` | producer 的 `wakeup()` | 不丢失同一条件锁保护的谓词变化 |
 | device | used entry/status 后提高 used idx | IRQ handler fence 后读取 | 完成项和 status 对 CPU 可见 |
 | log writer | log data 完成后写 header | reboot recovery | 非零 header 指向可重做的完整 log data |
 | exiting child | `wait_lock -> p->lock` 下发布 ZOMBIE | parent 同锁序扫描 | xstate 和保留资源可安全回收 |
 
-`volatile` 不是跨 hart或 DMA 的完整同步原语。`sfence.vma` 只同步地址翻译；CPU 原子 fence 不等于磁盘 flush；三者不能互换。
+`started` 需要单独降格为环境前提：它是普通 `volatile int`，两侧 `__atomic_thread_fence(__ATOMIC_SEQ_CST)` 只约束 fence 前后的操作，并没有把对象本身变成原子 load/store；跨 hart 普通读写在 ISO C 抽象机中仍是 data race。当前构建依赖 GCC 生成实际 load/store、RISC-V fence 和 coherent RAM 实现预期的消息传递。若要得到语言层发布保证，应对 `started` 本身使用 release store/acquire load，而不是只保留相邻 fence。
+
+同理，`volatile` 不是跨 hart 或 DMA 的完整同步原语。`sfence.vma` 只同步地址翻译；CPU 原子 fence 不等于设备 DMA barrier 或磁盘 flush；这些机制不能互换。
 
 ## 10. 修改时的证明清单
 

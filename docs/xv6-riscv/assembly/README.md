@@ -22,7 +22,7 @@ uservec     保存完整用户 GPR 状态到每进程 trapframe
 
 ## 共用验证清单
 
-1. 用 `riscv64-unknown-elf-objdump -d kernel/kernel` 确认伪指令实际展开和重定位结果。
+1. 用 Makefile 实际选中的 `$(TOOLPREFIX)objdump -d kernel/kernel` 确认伪指令展开和重定位结果；前缀可能是 `riscv64-unknown-elf-`，也可能是当前环境中的其他候选值，不能把文档示例当成固定工具名。
 2. 用 `offsetof`/编译期断言核对 `struct context`、`struct trapframe` 与硬编码偏移。
 3. 在 GDB 中分别断在 `_entry`、`swtch`、`kernelvec`、`uservec`、`userret`，记录 `sp/tp/satp/stvec/sstatus/sepc/sscratch`。
 4. 分别在 `CPUS=1` 与多 hart 下观察；一次单核成功不能证明 hart 身份和迁移路径正确。

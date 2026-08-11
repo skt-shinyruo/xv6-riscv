@@ -66,6 +66,14 @@ GDBPORT = uid % 5000 + 25000
 
 uid 对 5000 取模等于 1000 时，结果才是当前 `launch.json` 固定的 `26000`；常见的 uid 1000 满足这个条件。先运行 `make print-gdbport` 核对；若结果不同，应同步修改 `launch.json` 的 `target` 及下文命令中的端口。`.gdbinit` 的依赖只有模板，uid 或计算结果变化不会自动触发重建，可用 `make -B .gdbinit` 刷新。
 
+`launch.json` 中的 `127.0.0.1` 是客户端目标，不是 QEMU 的监听限制。Makefile 当前传给 QEMU 的 `-gdb tcp::PORT` 在 QEMU 8.2.2 上实测绑定 IPv4/IPv6 通配地址；GDB remote protocol 没有认证，其他能访问该端口的进程或主机可以控制、修改或终止这台虚拟机。在共享主机或不可信网络中，应使用防火墙限制端口，或把 QEMU 参数收窄为当前版本支持的 `-gdb tcp:127.0.0.1:PORT`，并用下面的命令确认 `Local Address` 真的是 loopback：
+
+```bash
+ss -ltnp 'sport = :26000'
+```
+
+其中端口仍须替换为 `make print-gdbport` 的输出。
+
 VSCode 配置使用 `executable` 和 `target` 表达模板中的符号文件和远程目标。`debugger_args` 里的 `--nx` 会禁止 GDB 读取任何 init 文件，包括刚生成的项目 `.gdbinit`；这正是 `autorun` 再次列出架构、反汇编和压缩断点设置的原因。两条调试路径彼此独立，但端口、符号文件和架构必须一致。
 
 ## 启动调试

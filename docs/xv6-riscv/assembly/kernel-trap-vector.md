@@ -163,26 +163,26 @@ kernelvec frame stays on the process kernel stack
 
 ## 4. Trap 相关 CSR 的完整状态矩阵
 
-下表覆盖这条路径实际依赖的 S-mode trap CSR。记 `V=kernelvec` 的 Direct-mode `stvec` 值，`P=MAKE_SATP(kernel_pagetable)`，`C0/T0` 为本次 trap 写入的 `scause/stval`，`C*/T*` 为经历调度后恢复 hart 上最后留下的值，`X` 为 trap 前无关的旧值。
+下表覆盖这条路径实际依赖的 S-mode trap CSR。记 `V=kernelvec` 的 Direct-mode `stvec` 值，`P=MAKE_SATP(kernel_pagetable)`，`C0/T0` 为本次 trap 写入的 `scause/stval`，`C*/T*` 为经历调度后恢复 hart 上最后留下的值，`X0` 为入口 hart 的旧值，`X*` 为恢复 hart 当时的值。未发生迁移时 `X*=X0`；发生迁移时，只有软件显式保存并写回的 CSR 才能跨 hart 保持入口语义。
 
 | 状态 | trap 前 | 硬件入口后 | `kerneltrap()` 返回前 | `sret` 后 |
 |---|---|---|---|---|
 | PC | `K` | `V.BASE` | `kernelvec` 的恢复段 | `K` |
 | 特权级 | S | S | S | S，因为入口快照中 `SPP=1` |
-| `sepc` | `X` | `K` | 显式 `w_sepc(sepc)`，恢复为 `K` | 仍为 `K`；`sret` 读取但不清除它 |
-| `scause` | `X` | `C0` | `C*`，不恢复 | 仍为 `C*`，`sret` 不读取它 |
-| `stval` | `X` | `T0` | `T*`，不恢复 | 仍为 `T*`，`sret` 不读取它 |
+| `sepc` | `X0` | `K` | 显式 `w_sepc(sepc)`，在恢复 hart 写回 `K` | 仍为 `K`；`sret` 读取但不清除它 |
+| `scause` | `X0` | `C0` | `C*`，不恢复 | 仍为 `C*`，`sret` 不读取它 |
+| `stval` | `X0` | `T0` | `T*`，不恢复 | 仍为 `T*`，`sret` 不读取它 |
 | `sstatus.SIE` | `b` | 0 | 显式恢复入口后的快照，仍为 0 | `b`，由 `SPIE` 复制 |
 | `sstatus.SPIE` | 旧值 | `b` | 显式恢复为 `b` | 1 |
 | `sstatus.SPP` | 旧值 | 1 | 显式恢复为 1 | 0 |
 | `sstatus` 其他可写位 | 入口值 | 本实现依赖的基本位之外保持入口值 | `w_sstatus(sstatus)` 写回读取的整字；WARL/只读位仍按硬件规则 | 保持快照；扩展定义的 `xRET` 副作用除外 |
 | `stvec` | `V` | `V` | 期望仍为 `V`，但本函数不保存/恢复 | `V` |
 | `satp` | `P` | `P` | 当前 continuation 恢复时必须是 `P`；本向量不写它 | `P` |
-| `sscratch` | `X` | `X` | 不使用、不恢复 | 不变 |
-| `sie` | 入口值 | 不变 | 本路径不写；设备屏蔽策略另行维护 | 不变 |
+| `sscratch` | `X0` | `X0` | 不使用、不恢复；迁移后是 `X*` | 保留恢复 hart 的 `X*`，不是进程状态 |
+| `sie` | 入口 hart 的值 | 硬件入口不改 | 本路径不写；迁移后采用恢复 hart 的配置 | 保留恢复 hart 的值；当前启动虽同样初始化各 hart，汇编不提供逐位恢复 |
 | `sip`/设备 pending | pending 集 | 包含触发原因 | handler 可能通过 `stimecmp`、设备 ACK 或 PLIC claim/complete 改变 | handler 后状态 |
 
-`kerneltrap()` 保存的是硬件入口**之后**的整个 `sstatus` 快照，所以返回汇编时必须仍满足 `SIE=0, SPIE=b, SPP=1`。它显式恢复 `sepc/sstatus`，原因是 `yield()` 期间此 continuation 可以离开当前 hart，而其他 trap 会改写各 hart 的 CSR。它不恢复 `scause/stval`：C 代码在调度前已把需要的 `scause` 存入局部变量，`sret` 也不消费这两个 CSR。
+`kerneltrap()` 保存的是硬件入口**之后**的整个 `sstatus` 快照，所以返回汇编时必须仍满足 `SIE=0, SPIE=b, SPP=1`。它显式恢复 `sepc/sstatus`，原因是 `yield()` 期间此 continuation 可以离开当前 hart，而其他 trap 会改写各 hart 的 CSR。它不恢复 `scause/stval/sscratch/sie`：C 代码在调度前已把需要的 `scause` 存入局部变量，`sret` 也不消费这些 CSR。于是“物理上同 hart 执行、不经过调度时未被本路径修改”和“逻辑 continuation 恢复后仍等于入口值”是两个不同命题。
 
 `stvec/satp` 不是保存帧的一部分。一个挂起的进程等待期间，原 hart 可以短暂运行用户页表；但恢复 `kerneltrap` 的 hart 必须已经处于共享内核页表，且内核可接收中断时 `stvec` 必须再次是 `kernelvec`。这是用户/内核 trap 路径共同维护的全局契约，不是本汇编的恢复动作。
 
@@ -249,6 +249,7 @@ hardware records cause and clears SIE
 | timer | `clockintr()`；hart 0 增加 `ticks` | 写下一次 `stimecmp` deadline | hart 0 唤醒 `&ticks`；随后当前进程可 yield |
 | UART | PLIC claim 一个 source，driver 排空当前可处理事件 | 读写设备状态后 PLIC complete | console reader、UART writer |
 | VirtIO | PLIC claim，driver 消费 used entries | ACK device，再 PLIC complete | 等待对应 buffer 的进程 |
+| PLIC claim 返回 0 | `devintr()` 仍返回 1，把这次 external trap 视为已处理 | 没有 source，因而不 complete、也不诊断 | 无；若外部 pending 条件持续存在，可能再次进入 |
 | 未知 PLIC source | 打印后仍 complete | 若 level 原因未清，会再次 pending | 无，可能形成中断风暴 |
 
 一次 external trap 只做一次 PLIC claim；设备 handler 内部可以批量处理多个事件。“一次 trap”不能等同于“一个字节”或“一个磁盘请求”。

@@ -43,6 +43,8 @@ pipe.readopen/writeopen describe whether corresponding global file is still aliv
 
 表中还未计入进程原有 stdin/stdout/stderr 所指的 console file refs；关闭 0/1 会相应减少它们。`dup` 返回最低空 fd，所以先 close 标准 fd 是把 endpoint 精确安装到 0 或 1 的前提。当前 shell 未检查 `dup` 返回值，依赖该槽确实成为最低空位。
 
+在这条正常拓扑里，`NOFILE` 已满也不能让两次 dup 失败：child 刚关闭目标标准 fd，已经保证至少有一个空槽，源 pipe fd 又仍有效，`fdalloc()` 必然把最低空槽装回 0/1。故障注入若要覆盖未检查的返回值，必须破坏源 endpoint/标准 fd 前提或改变操作顺序，不能把它描述成普通 fd 数量耗尽路径。
+
 ## 4. 数据与阻塞
 
 L 的 `write(1,buf,n)` 进入 `pipewrite`，持 `pi->lock` 每次从用户复制 1 字节并增加 `nwrite`。容量为 512；满时唤醒 readers，再 `sleep(&pi->nwrite,&pi->lock)`。因为 writer 持锁时 reader 不能同步消费，任何成功写入超过 512 字节的单次 write 至少睡眠一次。
@@ -68,8 +70,9 @@ R 在已读尽缓冲且 `writeopen==0` 时返回 0，即 EOF。R 最后关闭读
 ## 6. 失败语义
 
 - `pipe()` 可能因两个全局 `NFILE` 槽、一个 pipe 物理页或当前进程不足两个 `NOFILE` fd 槽返回 -1；shell 的 `panic` 只终止命令管理进程。
-- `sys_pipe()` 向用户 fd 数组的任一次 `copyout` 也可失败。内核会清除已安装 fd 并关闭两端；若第一次 copyout 成功、第二次失败，用户数组的第一个元素会留下一个已经失效的 fd 数值，调用者只能依据返回 -1 丢弃整个数组。
+- `sys_pipe()` 向用户 fd 数组的任一次 `copyout` 也可失败。内核会清除已安装 fd 并关闭两端；若第一次 copyout 成功、第二次跨页失败，用户数组的第一个元素会留下一个已经失效的完整 fd 数值，第二个元素的有效页尾还可能有 1 至 3 个字节前缀，调用者只能依据返回 -1 丢弃整个数组。
 - 第二次 fork 失败会触发 shell `panic`。管理进程退出时关闭继承端点，但不会执行后面的两个 `wait`；已经创建的左孩子被 reparent 给 init，最终由 init 回收，并在端点关闭后看到 EOF/无 reader，而不是由局部代码回滚。
+- 任一叶命令 exec 失败时，`runcmd(EXEC)` 打印错误后执行函数末尾的 `exit(0)`；endpoint 仍由退出清理，因此 EOF 会推进，但失败状态被伪装成 0，管理进程也不检查两次 wait status。
 - 所有 readers 关闭后，writer 在下一次循环检查 `readopen==0` 返回 -1；没有 Unix `SIGPIPE`。
 - bad `copyin` 可留下已写前缀；bad `copyout` 可留下已消费前缀。pipe I/O 不是事务。
 - writer 被 kill 时可能先写入前缀；reader 被 kill 时已复制字节保留。
@@ -87,4 +90,4 @@ R 在已读尽缓冲且 `writeopen==0` 时返回 0，即 EOF。R 最后关闭读
 2. 写入 513 字节，checkpoint 在第 512 字节，证明 writer 睡眠后 reader 才推进。
 3. 三段 pipeline 传输带序号记录，核对顺序、总数和每个 pipe 最终释放一次。
 4. 故意保留 P 的 write fd 作为负例，验证 reader 卡在 EOF；测试 harness 打印拓扑后杀掉整棵临时进程，不能污染常规镜像。
-5. 在 `pipe` 的 `NFILE/NOFILE/page/copyout`、第二 fork、dup 和 exec 各故障点注入失败；成功建立两 child 时由管理进程 wait，第二 fork 失败时 trace 左 child 被 reparent 并由 init 最终回收。两种路径都要核对 file table、pipe page 和空闲页恢复基线。
+5. 在 `pipe` 的 `NFILE/NOFILE/page/copyout`、第二 fork 和 exec 故障点注入失败；对 dup 则用专门 hook 破坏源 endpoint 或顺序，因为正常 close-target 拓扑已保证一个空槽。成功建立两 child 时由管理进程 wait，第二 fork 失败时 trace 左 child 被 reparent 并由 init 最终回收。两种路径都要核对 file table、pipe page 和空闲页恢复基线。

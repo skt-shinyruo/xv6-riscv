@@ -57,7 +57,7 @@ int main(int argc, char **argv);
 
 ## 4. 系统调用 ABI
 
-RISC-V 函数调用已经把前六个参数放在 `a0..a5`。生成的 stub 只需：
+RISC-V psABI 为整数参数预留 `a0..a7` 八个寄存器；xv6 的系统调用接口只从 `a0..a5` 取六个参数。生成的 stub 只需把系统调用号放入 `a7`：
 
 ```asm
 li a7, SYS_name
@@ -65,13 +65,16 @@ ecall
 ret
 ```
 
-约定如下：
+对会返回原调用者的普通系统调用，约定如下：
 
 | 寄存器 | 进入 stub | `ecall` 进入内核 | 返回用户态 |
 |---|---|---|---|
-| `a0..a5` | C 参数 | trapframe 中的参数 | `a0` 被返回值覆盖，其余恢复 |
+| `a0..a5` | C 参数 | trapframe 中的六个参数 | `a0` 被返回值覆盖，其余恢复 |
+| `a6` | 普通 caller-saved 值 | 不由 xv6 系统调用层读取 | 不提供系统调用语义 |
 | `a7` | 普通 caller-saved 值 | 系统调用号 | trapframe 恢复 `ecall` 时的系统调用号；调用者不应依赖 |
 | `ra` | stub 返回地址 | 保存到 trapframe | `ret` 回 C 调用点 |
+
+成功的 `exec()` 不遵循表中最后一列的“回原调用点”流程。内核保留同一个进程和 trapframe，但用新映像入口改写 `epc`、用新用户栈改写 `sp`、把新 `argv` 地址写入 `a1`，随后 dispatcher 再把 `kexec()` 返回的 `argc` 写入 `a0`。`usertrap()` 的统一返回尾部经 `prepare_return()` 和 trampoline 中的 `userret` 直接进入新程序，旧 `exec` stub 的 `ret` 不会执行。其余通用寄存器没有被统一清零；新程序只能依赖明确建立的 `epc/sp/a0/a1`，不能把表中的“恢复”理解为 exec 后的初始化保证。
 
 `kernel/syscall.h` 是编号的单一共享定义。新增系统调用必须同时更新编号、`user/usys.pl`、`user/user.h`、内核 handler 声明和分派表。
 
@@ -102,7 +105,9 @@ xv6 不提供 `errno`。大部分整数系统调用失败返回 `-1`，成功返
 #define SBRK_ERROR ((char *)-1)
 ```
 
-调用者必须按具体 API 和请求判断返回值：正长度普通文件/pipe 读取的 0 通常表示 EOF，但零长度 `read(fd, buf, 0)` 也返回 0；console 路径若首个字符已经从输入缓冲取出、随后第一次 `copyout()` 失败，当前实现也返回 0 并消费该字符。`fork()` 的 0 表示子进程，`wait()` 返回 pid，`exec()` 成功永不返回。仅凭整数 0 脱离调用参数和 fd 类型解释结果是不准确的。
+调用者必须按具体 API、请求长度和 fd 后端判断返回值：正长度普通文件/pipe 读取的 0 通常表示 EOF；零长度 inode、device 读取最终也返回 0，但当前 `piperead()` 会先检查“缓冲为空且写端仍开”的等待谓词，所以同样的 `read(pipefd, buf, 0)` 可能先阻塞。console 路径若首个字符已经从输入缓冲取出、随后第一次 `copyout()` 失败，当前实现也返回 0 并消费该字符。`fork()` 的 0 表示子进程，`wait()` 返回 pid，`exec()` 成功永不返回。仅凭整数 0 脱离调用参数和 fd 类型解释结果是不准确的。
+
+`fstat()` 还有一个当前实现中的 ABI/信息泄漏边界。RV64 下 `struct stat` 的 `dev/ino/type/nlink` 共占前 12 字节，8 字节对齐的 `size` 位于 offset 16，因此中间有 4 字节 padding，整个结构为 24 字节。`filestat()` 在内核栈上声明未初始化的 `struct stat st`，`stati()` 只赋五个字段，随后却 `copyout(..., sizeof(st))`。C 源码本身不规定成员赋值是否顺带覆盖 padding；当前 `kernel/kernel` 中生成的 `stati` 分别存储 offset 0、4、8、10 和 16，没有写 offset 12..15，而 `filestat` 确实复制 24 字节，所以当前构建会把这 4 个旧栈字节带给用户。用户程序不能把结构的逐字节结果当作稳定序列；实现若要封闭该泄漏，应在填字段前清零整个结构或改用显式序列化，工具链变化后也不能把偶然的宽存储当成 ABI 保证。
 
 用户头文件只做类型声明，不提供权限、信号、线程或标准库抽象。
 
@@ -119,15 +124,21 @@ xv6 不提供 `errno`。大部分整数系统调用失败返回 `-1`，成功返
 | `atoi` | 只解析开头连续十进制数字，不处理符号和溢出 |
 | `stat` | `open -> fstat -> close` 的便利包装 |
 
-这些函数直接解引用用户地址，不会像内核 `copyin/copyout` 那样返回受控的坏地址错误。访问未映射或权限不允许的页会产生用户 trap，并使进程被杀死；但由于 VA 0 映射 text，不能把所有 C 层面的“非法指针”都等同于硬件不可访问地址。这些同名函数也不完全实现标准 libc 的所有边界：`strchr(s, '\0')` 返回 0 而不是指向结尾 NUL，`memcmp()` 以可能为 signed 的 `char` 做差，`gets()` 要求 `max > 0`，`memmove()` 要求长度非负。
+这些函数直接解引用用户地址，不会像内核 `copyin/copyout` 那样返回受控的坏地址错误。访问未映射或权限不允许的页会产生用户 trap，并使进程被杀死；但由于 VA 0 映射 text，不能把所有 C 层面的“非法指针”都等同于硬件不可访问地址。这些同名函数也不完全实现标准 libc 的所有边界：`strchr(s, '\0')` 返回 0 而不是指向结尾 NUL，`gets()` 要求 `max > 0`，`memmove()` 要求长度非负。`memcmp()` 源码用普通 `char` 做差；当前 RISC-V GCC 定义 plain char 为 unsigned，所以当前结果按无符号字节排序，但源码没有显式 `uchar` 转换，若换到 signed-char 目标语义会漂移。
 
 `gets()` 总在容量允许时写结尾 NUL，但不提供行被截断的单独标志；它把 `read()` 错误和 EOF 都视为同一种终止条件，调用者无法从返回值区分二者。
 
 ## 8. Eager 与 lazy `sbrk`
 
+这里的 break 就是进程字段 `p->sz`，不是由用户链接器 `end` 独立维护的传统 heap 下界。`kexec()` 装入 ELF 后又在映像上方分配 guard 和一页用户栈，并把最终栈顶写入 `p->sz`；因此新程序第一次 `sbrk(0)` 看到的是用户栈顶，后续 heap 从栈上方向更高地址增长。allocator 不读取 `end`。
+
 `sbrk(n)` 使用 eager 策略：正增长时 `uvmalloc()` 从 `PGROUNDUP(oldsz)` 起立刻分配、清零并映射所跨入的新页；`sbrklazy(n)` 只增长 `p->sz`，首次 load/store 或某些内核用户拷贝才分配页。两种接口混用时有一个边界例外：若旧 break 已由 lazy 增长推进到某个尚未映射页的中间，随后 eager 正增长仍未跨过下一页边界，`uvmalloc()` 的循环为空，这一页不会仅因本次 `sbrk()` 被物化，首次访问仍要走 fault。即使增长跨页，旧 break 所在的那段 lazy hole 也不在从 `PGROUNDUP(oldsz)` 开始的分配范围内。
 
-两者都返回变化前的 break；负增长都由内核立即解除现有映射，lazy 策略不会延迟释放。用户库不在本地缓存 break，每次都进入内核。
+两者都返回变化前的 break。负增长不区分策略：`sys_sbrk()` 对任何 `n<0` 都调用 `growproc()`，后者把跨过的完整页立即解除映射，再把 `p->sz` 设为新值；已有的最后部分页映射会保留到下一页边界。因此 `p->sz` 不是硬件的字节级访问界限，且新建 lazy 页还要区分入口。用户 load/store fault 把原始 `stval` 传给 `vmfault()`，所以尚未映射时，刚越过 break 的地址会因 `stval >= p->sz` 被拒绝；若该页已有 PTE，硬件则不会 fault，页尾仍可访问。`copyin()`/`copyout()` 不同：它们先把用户指针向下取整为页首 `va0`，再把 `va0` 传给 `vmfault()`；只要页首仍小于 `p->sz`，原始 copy 地址即使已经越过 break，也可能首次物化最后一页并完成复制。因而不能把硬件入口的原始地址检查推广成所有 lazy 补页入口的规则。
+
+缩容路径没有 heap 下界，也没有拒绝“缩过地址 0”：足够大的合法负值可以解除 text、stack 在内的整个用户映像，系统调用随后无法正常返回到用户指令。反过来，若负值的绝对值大于当前 `p->sz`，表达式 `sz+n` 按无符号算术回绕为大地址，`uvmdealloc()` 因 `newsz>=oldsz` 什么也不做，系统调用却仍返回旧 break 而不是 `SBRK_ERROR`。`user/usertests.c:lazy_copy` 当前只验证这一超量缩容返回旧 break，没有把它解释为成功缩容。
+
+用户库不在本地缓存 break，每次都进入内核。原始 `sys_sbrk(n,t)` 也没有验证未知策略值：对非负 `n`，只有 `t==SBRK_EAGER` 走 eager，其他值都落入 lazy 分支；正常程序应只调用两个包装器。
 
 lazy 空间的语义限制包括：
 
@@ -204,7 +215,7 @@ base -> free block -> free block -> ... -> base
 
 ## 13. `morecore()` 扩堆
 
-`morecore(nu)` 至少向 eager `sbrk()` 申请 4096 个 `Header` 单位，而不是 4096 字节。当前 64 位结构中一个 Header 通常为 16 字节，因此最小批次通常为 64 KiB。
+`morecore(nu)` 至少向 eager `sbrk()` 申请 4096 个 `Header` 单位，而不是 4096 字节。当前 RV64 ABI 下 `sizeof(Header) == 16`，因此最小批次是 64 KiB。
 
 成功后：
 
@@ -225,7 +236,11 @@ base -> free block -> free block -> ... -> base
 
 合并后循环链表仍按地址排序，能够降低长期分配后的外部碎片。
 
-allocator 不保存 allocated/free 标志、不验证 payload 是否来自 `malloc`，也不检测 double free、越界写或 header 损坏。`malloc()` 还不检查 `nbytes` 向 Header 单位换算时的无符号溢出，`morecore()` 也假定单位数乘 `sizeof(Header)` 可表示。这些行为会导致过小分配或破坏链表，属于调用者违反当前教学 allocator 的前提。
+allocator 不保存 allocated/free 标志、不验证 payload 是否来自 `malloc`，也不检测 double free、越界写或 header 损坏。
+
+大请求还有一条更具体的整数宽度断层。`malloc()` 接收 32 位 `uint nbytes`；在当前 RV64 上，表达式中的 `sizeof(Header)` 是 64 位 `size_t`，所以 `nbytes` 到 `nunits` 的向上取整计算本身足以容纳全部 32 位输入，结果也仍可装入 `uint`。真正未经检查的窄化发生在 `morecore()`：`nu * sizeof(Header)` 先得到 64 位无符号字节数，却传给只接收 32 位 `int` 的 `sbrk()`。超过 `INT_MAX` 后，该转换结果由 C 实现决定；源码既不拒绝这个请求，也不验证 `sbrk()` 实际采用的增量是否仍等于所需字节数。只要转换后的调用没有返回 `SBRK_ERROR`，`morecore()` 就仍把 header 的 size 记为原始 `nu`，于是 allocator 可能把未取得的地址范围当作空闲块；转换为负增长时还可能先解除已有堆映射。现有程序只提交远小于该边界的请求，不能把它们的正常运行当成超大请求已被防御。
+
+因此 double free、非法指针、header 覆盖和超大请求都可能造成过小分配、错误缩堆、用户 fault 或链表破坏，属于当前教学 allocator 明确不防御的调用者违约。
 
 ## 15. 并发和 `fork` 语义
 

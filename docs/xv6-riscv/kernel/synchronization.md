@@ -118,6 +118,8 @@ caller holds lk
 
 除 kill 这种明确的取消唤醒外，业务生产者应在保护谓词的条件锁内先更新状态、再调用 `wakeup()`。唤醒只发布调度资格，不保证 waiter 立即运行；waiter 恢复后必须在同一条件锁下用 `while` 重查谓词。可重复的正反例见[丢失唤醒实验](../labs/lost-wakeup.md)。
 
+kill 正是条件锁证明之外的例外，而不是自动安全的替代协议。`kkill()` 只取得目标 `p->lock`，不取得 console、pipe、ticks 或 `wait_lock`；若目标在持条件锁检查完 `killed==0`、但尚未由 `sleep()` 取得 `p->lock` 时被 kill，killer 看到的仍是 `RUNNING`，只会置位。目标随后仍可发布 `SLEEPING`，直到真实条件变化或第二次 kill 才醒来。要实现无此窗口的可取消等待，必须让取消方参与条件锁，或让 waiter 在已经封闭睡眠发布窗口后再次检查取消标志。
+
 等待通道只是内核指针的相等性标识，不被解引用。常见通道包括：
 
 | 通道 | 条件锁 | 条件 |
@@ -143,7 +145,7 @@ caller holds lk
 
 | 锁 | 保护内容 | 可在中断使用 | 持有期间可睡眠 |
 |---|---|---:|---:|
-| `kmem.lock` | 物理页 freelist | 否 | 否 |
+| `kmem.lock` | 物理页 freelist | 机制上可；当前设备 IRQ 不使用 | 否 |
 | `pid_lock` | `nextpid` | 否 | 否 |
 | `wait_lock` | `p->parent`、wait/reparent 顺序 | 否 | 仅通过 `sleep(...,&wait_lock)` |
 | `p->lock` | 进程状态、chan、killed、pid、xstate | 调度/trap 路径使用 | 作为 `sched` 交接锁 |

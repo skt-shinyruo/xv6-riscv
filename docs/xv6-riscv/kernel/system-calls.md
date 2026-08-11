@@ -181,7 +181,7 @@ addr + sizeof(uint64) <= p->sz
 
 ### 5.3 `kill` 与 `getpid`
 
-`sys_kill()` 把低 32 位 pid 交给 `kkill()`。后者逐个锁住进程槽，只比较 `p->pid == pid`；匹配后设置 `killed`，若目标正在 `SLEEPING` 则改为 `RUNNABLE`。找不到匹配值才返回 `-1`。`kill` 不在调用瞬间销毁目标，也不等待目标退出；目标通常在系统调用等待循环或 `usertrap()` 的检查点执行 `kexit(-1)`，而最后检查到 `sret` 的竞态窗口意味着这种终止不是严格即时的。
+`sys_kill()` 把低 32 位 pid 交给 `kkill()`。后者逐个锁住进程槽，只比较 `p->pid == pid`；匹配后设置 `killed`，若目标正在 `SLEEPING` 则改为 `RUNNABLE`。找不到匹配值才返回 `-1`。`kill` 不在调用瞬间销毁目标，也不等待目标退出；目标通常在系统调用等待循环或 `usertrap()` 的检查点执行 `kexit(-1)`。这里有两类不同竞态：最后检查到 `sret` 之间到达的 kill 可让目标短暂再执行用户指令；等待循环检查 killed 后、`sleep()` 取得 `p->lock` 前到达的 kill 又可能只给仍为 `RUNNING` 的目标置位，使其随后睡到真实条件变化或第二次 kill。终止和取消都不是严格即时的。
 
 目标若就是调用者自己，`sys_kill()` 内部会算出 0，但紧接着的 `usertrap()` killed 检查会退出当前进程，因此 `kill(getpid())` 的用户代码看不到成功返回。
 
@@ -197,7 +197,7 @@ addr + sizeof(uint64) <= p->sz
 
 ### 5.4 `pause` 与 `uptime`
 
-`sys_pause()` 读取有符号 tick 数：负数被规范化为 0；零值不进入等待循环，但仍会短暂获取并释放 `tickslock`。正数路径持有 `tickslock` 读取起点，然后循环检查无符号差值 `ticks - ticks0`。未到期时执行 `sleep(&ticks, &tickslock)`；`sleep` 在睡眠和释放 `tickslock` 之间完成锁交接，避免错过时钟中断的唤醒。被 kill 时必须先释放 `tickslock` 再返回 `-1`，但 `usertrap()` 随后的 killed 检查通常会让进程直接退出，用户态看不到这个 `-1`。
+`sys_pause()` 读取有符号 tick 数：负数被规范化为 0；零值不进入等待循环，但仍会短暂获取并释放 `tickslock`。正数路径持有 `tickslock` 读取起点，然后循环检查无符号差值 `ticks - ticks0`。未到期时执行 `sleep(&ticks, &tickslock)`；`sleep` 在睡眠和释放 `tickslock` 之间完成锁交接，避免错过时钟中断的唤醒。观察到 killed 时必须先释放 `tickslock` 再返回 `-1`，但 `usertrap()` 随后的 killed 检查通常会让进程直接退出，用户态看不到这个 `-1`。若 kill 命中检查后入睡窗口，目标仍可先睡眠；这里 hart 0 的下一次 tick 会提供真实唤醒，使循环再检查标志，所以延迟通常到下一 tick，而不是依靠第一次 kill 已经唤醒它。
 
 循环而不是单次睡眠很重要，因为唤醒不等于目标 tick 数已经满足。无符号减法可自然跨越 `uint` 的 tick 回绕，但接口的 `int n` 仍把单次请求限制在有符号 32 位范围。
 
@@ -315,7 +315,7 @@ pipealloc() 创建 rf/wf 和 pipe 页
 
 实现不做完整的模式枚举校验。未知位通常被忽略；同时设置 `O_WRONLY | O_RDWR` 时按位表达式计算，不提供 POSIX 式错误。尤其是 `O_RDONLY | O_TRUNC` 仍会截断普通文件，随后返回只读 fd。目录只有在 `omode == O_RDONLY` 完全相等时才允许打开，所以给目录附加 `O_CREATE`、`O_TRUNC` 或未知位会失败。这里没有权限、用户身份、`O_APPEND`、`O_EXCL` 或 close-on-exec 语义。
 
-路径还有两类容易被 POSIX 直觉掩盖的边界。目录分量恰好 14 字节时可以没有 NUL；超过 `DIRSIZ == 14` 不会报错，而会静默只取前 14 字节，因此不同长名字可能别名。空相对路径的 `namei("")` 直接返回 cwd，所以 `open("", O_RDONLY)` 会打开当前目录，`chdir("")` 也成功但保持同一 cwd；`nameiparent("")` 则失败，所以空路径不能用于创建、unlink 或新硬链接名。
+路径还有几类容易被 POSIX 直觉掩盖的边界。目录分量恰好 14 字节时可以没有 NUL；超过 `DIRSIZ == 14` 不会报错，而会静默只取前 14 字节，因此不同长名字可能别名。空相对路径的 `namei("")` 直接返回 cwd，所以 `open("", O_RDONLY)` 会打开当前目录，`chdir("")` 也成功但保持同一 cwd；`nameiparent("")` 则失败，所以空路径不能用于创建、unlink 或新硬链接名。全斜杠路径的 `namei("////")` 返回 root，parent 查询同样失败。尾随斜杠被彻底忽略，不要求末项为目录：`open("file/", O_RDONLY)` 可打开普通文件，`unlink("file/")` 也删除同一个末级名字。
 
 ### 8.2 `create()` 的契约
 
@@ -402,7 +402,7 @@ pipealloc() 创建 rf/wf 和 pipe 页
 
 路径的 `argstr()` 失败时尚未分配参数页，处理函数直接返回 `-1`。之后读取 `argv[]` 槽失败、参数过多、`kalloc()` 失败或参数 `fetchstr()` 失败才进入 `bad`，释放此前为每个参数分配的页。调用 `kexec()` 返回后，无论成功还是失败，`sys_exec()` 也释放全部参数页；`kexec()` 在调用期间只借用这些字符串，不取得所有权。
 
-这些临时参数页能完整回收，但读取用户 `argv[]` 的 `fetchaddr()` 内部使用 `copyin()`，可能已经为旧地址空间物化 lazy 页；指针槽跨页失败还可能只把一个 64 位指针的前缀写入内核临时变量。后续编组或装载失败不会撤销旧地址空间中新分配的页。每个参数字符串走不补页的 `copyinstr()`，与指针数组并不对称。
+这些临时参数页能完整回收，但读取用户 `argv[]` 的 `fetchaddr()` 内部使用 `copyin()`，可能已经为旧地址空间物化 lazy 页；指针槽跨页失败还可能只把一个 64 位指针的前缀写入内核临时变量。后续编组或装载失败不会撤销旧地址空间中新分配的页。每个参数字符串走不补页的 `copyinstr()`，与指针数组并不对称。`fetchstr()` 又不执行 `fetchaddr()` 的 `p->sz` 字节范围检查，所以缩容后仍映射的最后部分页中，位于逻辑 break 之外的 NUL 字符串仍可能作为 path/argument 被接受。
 
 ### 9.2 新映像提交点
 
@@ -415,6 +415,8 @@ pipealloc() 创建 rf/wf 和 pipe 页
 - `kexec()` 返回的 `argc` 经分派器写入新 trapframe 的 `a0`，而新 `argv` 地址已放入 `a1`，恰好成为新程序 `main(argc, argv)` 的参数。
 
 参数页回滚和新页表回滚是两层不同的所有权协议，不能只检查其中一层。更完整的 ELF 和栈布局见 `docs/xv6-riscv/kernel/exec.md`。
+
+这两层都不负责回滚损坏 executable 的文件系统副作用。`kexec()` 的外围事务让 `readi()->bmap()` 在遇到 inode hole 时可以真正分配并 `log_write()`；loader 后续失败只释放临时页表，不撤销 bitmap、新零块或间接项，直接块地址还可能因缺少 `iupdate()` 而成为泄漏。hole 足够多时还可突破该区间的 10-block 预留并 panic。正常 dense 可执行文件仍只读，这一边界属于未验证磁盘结构，不是普通 ELF 字节错误的预期语义。
 
 ## 10. 文件系统事务、锁与可睡眠性
 
@@ -456,12 +458,12 @@ pipealloc() 创建 rf/wf 和 pipe 页
 | `open` | inode 引用、可能的 file/fd、可能的新目录项 | 归还引用和槽；后续 file/fd 耗尽不撤销已完成的 `O_CREATE` |
 | `pipe` | 两个 file 引用、pipe 页、零到两个 fd | 清 fd 槽并关闭两端；已写用户数组的整数不保证撤销 |
 | inode `read`/`write` | 用户缓冲区、offset、cache、块映射或日志项 | `-1` 允许前缀和分配副作用；写失败可已推进 offset，读失败通常不推进 |
-| `create` | 新 inode、可能的目录/间接块 | 回收新 inode；父目录已分配的空间接块可能保留 |
+| `create` | 新 inode、可能的目录/间接块 | 回收新 inode；父目录已分配的空的间接块可能保留 |
 | `link` | 已修改缓存并登记日志的 `nlink++` | `bad` 分支在同一操作范围执行 `nlink--`；父目录块分配可能保留 |
 | `unlink` | 父和目标引用 | 正常文件系统上的普通校验错误在修改前；修改后短写是 `panic` |
 | `chdir` | 新目录 inode 引用 | 失败释放新引用，成功才替换 cwd |
 | `exec` 编组 | 每个参数一页，可能物化旧地址空间 lazy 页 | 临时参数页逐页 `kfree()`；旧地址空间补页不撤销 |
-| `exec` 装载 | 新页表和若干新页 | 普通错误在提交前释放新页表；旧映像保持有效 |
+| `exec` 装载 | 新页表和若干新页；损坏 sparse inode 还可能触发磁盘块分配 | 普通错误在提交前释放新页表、旧映像保持有效；异常 inode 的 bitmap/块/间接项不回滚 |
 
 审查 `goto bad` 时，应按这张表逐项核对“谁拥有资源”和“所有权何时转移”，而不能只看最终是否返回 `-1`。
 

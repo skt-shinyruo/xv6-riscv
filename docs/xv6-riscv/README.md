@@ -134,8 +134,8 @@ make qemu-gdb
 - 内核实现使用 `kfork()`、`kexec()`、`kexit()`、`kwait()`、`kkill()` 等名称与用户 API 区分。
 - `userinit()` 只建立空的首进程；第一次进入 `forkret()` 时才初始化文件系统并执行 `/init`。
 - `sbrk` 带第二个策略参数，用户库分别暴露 eager 的 `sbrk()` 和 lazy 的 `sbrklazy()`。
-- 用户缺页以及部分 `copyin()`/`copyout()` 路径可调用 `vmfault()` 补页；`copyinstr()` 不会自动补页。
+- `usertrap()` 对用户 load/store page fault 调用 `vmfault()`；`copyin()`/`copyout()` 在 `walkaddr()` 找不到映射时也会尝试同一补页路径，而 `copyinstr()` 只返回失败，不会自动物化 lazy 页。
 - `fsinit()` 在日志恢复后调用 `ireclaim()`，回收崩溃前已经失去目录链接但仍有内存引用的 inode。
-- UART 发送采用“每字节写入后等待 THRE（发送保持寄存器可再接收字节）中断”的阻塞协议，而不是上游一些版本中的软件发送环形队列；该中断不代表字节已在串行线路上发送完毕。
+- UART 发送采用单字节 `tx_busy` 协议，而不是上游一些版本中的软件发送环形队列：写入 THR 后设置 busy；当前调用若还有下一字节，或后来的 writer 进入时仍 busy，才睡到中断处理器观察到 LSR 的 THRE 位。最后一个字节写入后函数可以立即返回。handler 读取 IIR 后丢弃 cause，并不按中断原因分派；这次读取可清除 THRE indication，却不能代替读取 RHR 来消除 RX 条件。接收中断到来时若 THRE 已置位也能唤醒发送者。THRE 只表示发送保持寄存器可再接收字节，不代表该字节已在串行线路上发送完毕。
 
 这些是阅读外部资料时必须注意的仓库特征，不一定都产生于 `xv6-riscv-rev5..13a33b7` 这一审计区间。逐提交归属、当前代码基线与可重复比较方法见[仓库差异台账](architecture/repository-delta.md)。各子系统文档会在相关位置再次说明其后果。

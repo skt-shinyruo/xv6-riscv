@@ -39,7 +39,7 @@ xv6 的目标是展示机制，而不是随 CPU、进程、内存和设备队列
 |---|---|---:|---|
 | `filealloc` | 扫 `ftable.file[NFILE]` | `O(F)=100` | 返回 0 |
 | `fdalloc` | 扫当前 `ofile[NOFILE]` | `O(NOFILE)=16` | 返回 -1 |
-| `iget` | 一遍找已有、一遍记空槽 | `O(I)=50` | panic |
+| `iget` | 一次扫描中同时找已有对象并记住首个空槽 | `O(I)=50` | panic |
 | `bget` | 找 cache hit，否则从 LRU 尾找 `refcnt==0` | `O(B)=30` | panic |
 | `allocproc` | 扫 proc slots | `O(P)=64` | 返回 0 |
 | `kalloc/kfree` | freelist 头操作 | `O(1)` | `kalloc` 返回 0 |
@@ -60,7 +60,7 @@ consoleintr holds cons.lock
 
 一次 pipe read/write 每个字节在持 `pipe.lock` 时调用 `copyin/out`；helper 至少 walk 用户页表。对 `n` 字节，成本近似 `O(n * page-walk)`，而不是按页批量复制。锁持有时间也随 n 增长，直到满/空睡眠发生交接。
 
-console write 虽先按最多 32 字节从用户区批量 copyin，`uartwrite` 仍按字节取得 TX 协议锁、写 THR、等待 THRE 中断。长输出的调度/中断次数和锁交接近似随字节数线性增长。
+console write 虽先按最多 32 字节从用户区批量 copyin，`uartwrite` 仍按字节写 THR，并在 `tx_busy` 时通过 `sleep(&tx_chan, &tx_lock)` 等待 handler 观察到 THRE。handler 的每次 `wakeup(&tx_chan)` 都在持 `tx_lock` 时扫描 `P` 个进程槽；因此连续输出 `n` 字节除了近似 `O(n)` 次设备中断和睡眠交接，还会引入 `O(nP)` 次候选进程检查。函数入口只显式 `acquire(tx_lock)` 一次，但每次 `sleep()` 都释放它、恢复后重新取得，所以不能把源码外层的一对 acquire/release 误算成整个长输出只有一次锁交接。
 
 ## 5. 稀疏地址空间
 
@@ -116,7 +116,7 @@ K writes: install log blocks to home locations
 
 普通缓存命中不产生设备 read；cache miss 和 log 安装中的 `bread` 是否真正读盘取决于 buffer 是否仍驻留/pin。不能仅从函数调用次数等同设备请求次数。
 
-单次大 `filewrite` 被切成受 `MAXOPBLOCKS` 限制的多个事务，每一块分段都会重复 header 固定成本。增大 chunk 可降低固定放大，却必须重新证明日志 unique-block上界和 buffer活性。
+单次大 `filewrite` 被切成多个 `begin_op()/end_op()` 区间。在没有其他 outstanding operation 时，每个区间都会成为独立提交并重复 header 固定成本；若并发 operation 让 `outstanding` 在相邻分段之间始终不归零，多个分段也可能进入同一个提交组，固定成本由该组共同分摊。增大 chunk 可能降低无并发路径的固定放大，却必须重新证明日志 unique-block 上界和 buffer 活性。
 
 ## 8. VirtIO 并发上界
 

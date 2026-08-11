@@ -193,7 +193,7 @@ CPU 0 在发布全局启动完成标志之前执行它。其他 hart 进入 sche
 
 ### 4.3 PID 分配
 
-`nextpid` 初始为 1。`allocpid()` 在 `pid_lock` 下取当前值并递增，因此正常系统寿命内并发创建不会得到相同 pid。当前代码没有处理 `int` 溢出或 pid 回绕；唯一性保证依赖教学系统不会运行到回绕点。
+`nextpid` 初始为 1。`allocpid()` 在 `pid_lock` 下取当前值并递增，因此正常系统寿命内并发创建不会得到相同 pid。当前代码没有上界、复用或溢出处理；唯一性保证依赖教学系统不会在 `nextpid == INT_MAX` 时再次调用这条分配路径。把 `INT_MAX-1` 加一并存成 `INT_MAX` 仍可表示，下一次 `nextpid + 1` 才越过范围并在 C 语义中产生未定义行为。这里不能把后续行为简单写成“按二进制回绕”：锁只能串行化更新，不能使溢出成为已定义的 PID 回收协议。
 
 ## 5. 完整进程状态机
 
@@ -319,7 +319,7 @@ CPU 0 完成设备、buffer、inode 和 file 表初始化后调用 `userinit()`�
 
 此时 `fsinit()` 尚未读取 superblock，但 `namei("/")` 仍然可用：绝对路径 `/` 没有需要遍历的路径分量，`namex()` 只通过 `iget(ROOTDEV, ROOTINO)` 在已由 `iinit()` 初始化的 inode cache 中取得引用，不会调用 `ilock()` 读盘。真正读取根 inode 内容和解析 `/init` 发生在 `fsinit()` 完成之后。
 
-`userinit()` 没有检查 `allocproc()` 的空返回；启动期若连首进程槽、trapframe 或页表都无法取得，后续会解引用空指针，而不是走可恢复路径。`namei("/")` 的这一特殊路径则没有“返回 0”的查找失败：它只调用 `iget()`，有空 inode-cache 槽时返回引用，槽耗尽时直接 `panic("iget: no inodes")`。根 dinode 的磁盘类型直到后续首次 `ilock()` 才验证。
+`userinit()` 没有检查 `allocproc()` 的空返回；启动期若连首进程槽、trapframe 或页表都无法取得，后续会解引用空指针，而不是走可恢复路径。空指针解引用在 C 层已经是未定义行为，精确异常位置不能只从源码推出。当前 GCC 生成的 `kernel/kernel` 保留空返回于 `s1`，在 `namei("/")` 后用 `sd a0,336(s1)` 写 `p->cwd`；这里已经执行过 `trapinithart()`，且低地址未映射，所以当前产物会以 supervisor fault 进入 `kerneltrap()`，最终得到通用的 `panic("kerneltrap")`，而不是明确的首进程 OOM 诊断。这个当前产物结果不同于更早的 `kvmmake()` 根页表分配失败：后者在 trap 向量安装前就以地址 0 调用 `memset()`，源码没有同样的受控 panic 路径；工具链变化后必须重新核对 `userinit()` 的 UB 产物。`namei("/")` 的这一特殊路径则没有“返回 0”的查找失败：它只调用 `iget()`，有空 inode-cache 槽时返回引用，槽耗尽时直接 `panic("iget: no inodes")`。根 dinode 的磁盘类型直到后续首次 `ilock()` 才验证。
 
 ### 7.2 首次 `forkret()`
 
@@ -453,7 +453,7 @@ wakeup(initproc)
 
 扫描时先用 `wait_lock` 稳定 `parent`，再获取候选子进程的 `pp->lock` 稳定其 `state/xstate`，严格遵守 `wait_lock -> p->lock`。
 
-若 `addr!=0` 且 `copyout()` 失败，`kwait()` 返回 -1，但不会调用 `freeproc()`。子进程继续保持 `ZOMBIE`，父进程可以用有效地址重试。这避免了“状态未交付却已回收”的部分成功。
+若 `addr!=0` 且 `copyout()` 失败，`kwait()` 返回 -1，但不会调用 `freeproc()`。子进程继续保持 `ZOMBIE`，父进程可以用有效地址重试。这避免了“状态未交付却已回收”的部分成功，但不表示用户内存完全没变：退出状态固定复制 4 字节，地址若跨页，前 1 至 3 字节可能已经写入；目标是合法 lazy hole 时还可能先物化页。失败重试只保留 zombie，已经发生的用户缓冲区和页表副作用不会回滚。
 
 `kwait()` 一次只回收一个 zombie；有多个退出子进程时由用户态重复调用。没有子进程时不会睡眠，而是立即返回 -1。
 
@@ -661,6 +661,8 @@ p->state == SLEEPING && p->chan == chan
 ### 12.5 wait 的特例
 
 `kwait()` 持有 `wait_lock` 检查“是否有 zombie 子进程”，然后调用 `sleep(p, &wait_lock)`。子进程 `kexit()` 也在 `wait_lock` 下调用 `wakeup(p->parent)`。因此普通条件锁证明直接适用：父进程不会错过子进程退出，也不会在没有孩子时无条件睡眠。
+
+这项证明只覆盖 child 状态变化，不覆盖 kill 取消。完整扫描后 `kwait()` 在持 `wait_lock` 时调用 `killed(p)`，但 `kkill()` 不取得 `wait_lock`；从这次检查返回到 `sleep()` 取得 `p->lock` 之间仍有取消窗口。此时 kill 只置标志而看不到 `SLEEPING`，父进程随后可一直睡到某个 child 退出或第二次 kill 到来。它醒来后会重扫并返回 `-1`，但第一次 kill 本身不保证立即解除这次尚未发布的 wait；父进程自己被 reparent 并不是这里的唤醒来源，因为单线程进程不可能同时在 `kwait()` 睡眠又执行自己的退出路径。
 
 ## 13. Kill 是延迟终止请求
 

@@ -82,6 +82,8 @@ Sv39 来自 privileged v1.12 的 address-translation 章节。当前实现选择
 
 叶 PTE 的 R/W/X 合法组合和 `PTE_U` 权限由硬件执行。当前代码创建映射时不预置 Accessed/Dirty，且没有 A/D software-fault handler，因此依赖平台硬件更新 A/D；完整后果见[虚拟内存](../kernel/memory.md)。
 
+当前代码之所以能在没有 shootdown 的情况下工作，依赖进程层缩小了并发面：同一 `struct proc` 不会同时在两个 hart 上 `RUNNING`；`sbrk()`、lazy fault 和 `exec()` 修改的是当前进程页表，`fork()`/`wait()` 操作的新建或已停止地址空间也尚未在别的 hart 执行；每次 trampoline 切换 `satp` 又做全量本地 flush。若以后允许同一地址空间多线程并行，或由一个 hart 撤销另一个 hart 正在使用的映射，这些既有时序不再足够，必须先阻止远端访问并完成远端 TLB 同步，才能释放物理页。
+
 `sfence.vma` 是地址翻译同步，不是普通数据 cache flush，也不保证 VirtIO DMA 可见性。反过来，virtqueue 的 `__atomic_thread_fence(__ATOMIC_SEQ_CST)` 不能替代修改 PTE 后的 TLB 同步。内核把 UART、VirtIO 和 PLIC 以普通 `PTE_R|PTE_W` 恒等映射建立，未显式设置 PBMT/cache 属性；这依赖 QEMU/目标平台的 PMA 将这些物理区识别为设备内存，并不构成可移植的 cacheability 或 I/O-ordering 声明。
 
 `sfence.vma` 也不等价于 `fence.i`。当前 `kexec()` 先由数据 store 填充新代码页，`uvmcopy()` 还会复制可能可执行的页，但仓库没有任何 `fence.i` 或跨 hart instruction-cache 同步协议；进程又可能迁移到另一个 hart 执行。当前 QEMU 行为使这些路径可用，不能据此宣称适用于一般的非一致 I-cache 实现。移植到真实硬件时，必须在新指令对本 hart可取指前执行适当 `FENCE.I`，并为可能执行该地址空间的其他 hart 定义远端同步/调度协议。
@@ -108,7 +110,7 @@ QEMU `-kernel` 和 xv6 `kexec()` 都使用 ELF program header，但信任范围�
 - `kexec()` 读取用户 ELF header/program headers，把 `PT_LOAD` 复制到新页表，物理页初始清零自然形成用户 BSS。
 - `ENTRY(_entry)` 只设置 ELF `e_entry`。当前 QEMU `virt -bios none` MROM stub 的直接交接目标是固定 DRAM 基址 `0x80000000`；因此链接还必须让 `_entry` 实际位于该地址。三者（MROM 目标、实际 `_entry`、ELF `e_entry`）数值相同是当前构建的协调结果，不是 `ENTRY` 单独造成的。
 
-用户 loader 只校验 magic、`memsz >= filesz`、地址加法不溢出、页对齐以及装载/复制是否成功；它不验证 `elf` 的 class、endianness、type、machine、ABI/version、`phentsize/phoff/phnum` 范围，`ph.off + filesz` 溢出、segment overlap、`paddr` 或 entry 是否落在可执行段。它还按本地 `struct proghdr` 大小步进，而不是先确认输入声明的 `phentsize`。这适用于本构建产生的 ELF，不是敌对二进制解析边界；详见[`exec`](../kernel/exec.md)。
+用户 loader 只校验 magic、`memsz >= filesz`、`vaddr + memsz` 不回绕、页对齐以及装载/复制是否成功；它不验证 `elf` 的 class、endianness、type、machine、ABI/version、`phentsize/phoff/phnum` 范围，`ph.off + filesz` 溢出、segment overlap、`paddr` 或 entry 是否落在可执行段。它还按本地 `struct proghdr` 大小步进，而不是先确认输入声明的 `phentsize`；循环的 `off` 是 32 位 `int`，`loadseg()` 的 file offset 和 byte count 是 32 位 `uint`，会截窄 ELF64 的 `phoff/off/filesz`。`uvmalloc()` 总从先前的最大 `sz` 连续扩展到本段末端，所以 segment gap 被映射，逆序/重叠 segment 又会复用已有页；PTE 总带 R，只有 ELF W/X 位被翻译。这个 loader 适用于本构建产生的递增、非重叠小型 ELF，不是敌对二进制解析边界；详见[`exec`](../kernel/exec.md)。
 
 ## 7. QEMU `virt` 机器契约
 
@@ -148,7 +150,7 @@ enable bitmap 只覆盖第一个 32-bit word，因此 IRQ 号大于等于 32 的
 
 `kernel/uart.c` 使用 16550 compatible 的 byte-wide register model。DLAB 改变 offset 0/1 的含义；初始化写入 divisor 3，再恢复 8-bit word mode，并打开 FIFO 与 RX/TX interrupt。源码注释把 divisor 3 称为 38.4K，但驱动不读取输入时钟，实际 baud 由平台时钟和 UART 模型决定，不能从常数 3 单独推出。源码把 offset 2 的读寄存器宏命名为 `ISR`，但 16550A 读语义是 Interrupt Identification Register（IIR）；不能按传统“status register”解读。LSR bit 0 表示 RHR 可读，bit 5 表示 THR 能接受下一字节（THRE），不表示整个字符已经离开发送 shift register。
 
-发送协议因此是：进程写一字节到 THR 后置 `tx_busy=1`，UART handler 观察到 THRE 时清 busy 并唤醒等待者（不要求该次中断只由 THRE 原因触发）。它没有软件 TX ring、timeout、flow control 或 termios。`uartputc_sync()` 轮询 THRE，可在中断/早期启动/panic 输出使用，但同步输出和普通发送没有统一跨 CPU 队列，消息顺序不受设备规范额外保证。
+发送协议因此是：进程写一字节到 THR 后置 `tx_busy=1`，UART handler 观察到 THRE 时清 busy 并唤醒等待者（不要求该次中断只由 THRE 原因触发）。handler 开头读取一次 IIR，但 IIR read 不是“确认所有 UART 中断”的通用操作：它可清除被识别的 THRE indication，RX 条件仍靠随后读取 RHR 消除；代码忽略 cause，再用 LSR 重建自己关心的可发送/可接收状态。它没有软件 TX ring、timeout、flow control 或 termios。`uartputc_sync()` 轮询 THRE，可在中断/早期启动/panic 输出使用，但同步输出和普通发送没有统一跨 CPU 队列，消息顺序不受设备规范额外保证。
 
 QEMU 提供的是兼容模型；代码没有读取 IIR FIFO capability bits、scratch register 或设备 ID 做 probe，也不处理 line-status/modem-status 错误。连接真实 UART 前必须确认 register stride、clock/divisor、endianness、IRQ polarity、MMIO I/O ordering 和 PLIC route。
 
@@ -161,11 +163,11 @@ QEMU 提供的是兼容模型；代码没有读取 IIR FIFO capability bits、sc
 - `kernel/virtio.h` 没有定义 `DeviceFeaturesSel`/`DriverFeaturesSel`，驱动在读写 feature word 前也从不写 selector；这已经遗漏 VirtIO MMIO 4.2.2.2 对 selector 写入的 MUST 要求。当前 QEMU 的 reset selector 为 0，所以这组运行环境落在低 32 位；规范没有提供可移植的默认 selector，不能把同一结果推广到一般设备。代码也没有显式选择高 32 位并协商 `VIRTIO_F_VERSION_1`（bit 32），同时违反“设备必须 offer、驱动若看到必须 accept”这一保留特性规则；合规设备可以因此拒绝继续工作；
 - probe 还硬性要求 QEMU vendor ID `0x554d4551`，所以即使另一厂商的 MMIO v2 block device 满足 VirtIO 1.1，也会被当前代码直接 panic；
 - 在当前 QEMU selector 0 前提下取得的低 32 位中，代码只清除了 indirect descriptor、event index、multiqueue、read-only、SCSI 和 writeback-config 等明确列出的位；它没有清除 `VIRTIO_BLK_F_FLUSH`，也没有对其余设备特性做白名单交集。因此“驱动不发 FLUSH”不等于“驱动拒绝了 FLUSH 特性”，更不能把未知低位当作已实现；
-- reset 后立即写 `ACKNOWLEDGE`，没有等待 `DeviceStatus` 读回 0。VirtIO 1.1 初始化序列要求驱动写 0 后等待读值归零，再设置 `ACKNOWLEDGE`；因此当前代码是协议违规，不只是缺少诊断。当前 QEMU 同步完成 reset 的行为掩盖了这一差距，不能推广到允许异步 reset completion 的设备；
+- reset 后立即写 `ACKNOWLEDGE`，没有读回观察 `DeviceStatus` 是否已经归零。VirtIO 1.1 的通用初始化顺序要求先 reset、再设置 `ACKNOWLEDGE`，MMIO 4.2 规定写 0 触发 reset；但“写 0 后必须等到读回 0”这一明确 MUST 位于 PCI 4.1.4.3.2，并不是 1.1 对 MMIO transport 的通用条款。因此不能据此判定当前 MMIO 驱动违反该 MUST。不过，这段代码仍没有 reset-completion 的可观测步骤：它假定 reset 的效果在紧随其后的状态写之前已经生效。当前 QEMU 同步满足这一假定，换成异步完成 reset 的实现时则缺少可移植的等待/确认路径；
 - queue size 固定 8，一次请求占 3 个 descriptor，所以最多两笔同时 in flight；
-- 驱动假定内核虚拟地址恒等于 DMA 物理地址，没有 IOMMU/cache-coherency API；
+- 驱动把 `kalloc()` 返回的三个队列页以及 direct-map 中的 request/buffer 地址直接写进 descriptor，假定这些内核指针数值就是 DMA 物理地址；高地址 `KSTACK()` 一类别名不能按同一方式交给设备。代码没有 IOMMU/cache-coherency API；
 - 请求 status 任意非零都 panic，没有重试、设备 reset、FAILED status 或 I/O error 上送；used-ring 的 `id`、`len`、descriptor chain 和 interrupt status 也没有做范围/一致性校验，因而把设备视为可信；
-- 不读取 block capacity/config generation，不处理 config-change interrupt，也不使用 discard/write-zeroes 等可选操作；日志不发送 `VIRTIO_BLK_T_FLUSH`。写请求完成只表示当前 backend 接受了请求，不提供真实掉电持久化保证；现有 crash 结论只适用于当前 QEMU process-kill/教学镜像模型。
+- 不读取 block capacity/config generation，不处理 config-change interrupt，也不使用 discard/write-zeroes 等可选操作；文件系统 block number 在驱动中先以 32 位 `uint` 乘以 2，再扩为 64 位 sector，损坏元数据给出的超大 block number还可能先发生 32 位回绕。回绕后的 sector 若落回设备范围，会静默访问错误位置；未回绕但越过 capacity 的请求则只能依赖设备报错，而任意非零 status 都导致 panic。日志也不发送 `VIRTIO_BLK_T_FLUSH`。写请求完成只表示当前 backend 接受了请求，不提供真实掉电持久化保证；现有 crash 结论只适用于当前 QEMU process-kill/教学镜像模型。
 
 精确 offset、对齐、producer/consumer 和回绕规则见[存储栈](../kernel/storage-stack.md)。
 

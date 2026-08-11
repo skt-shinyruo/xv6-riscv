@@ -22,7 +22,7 @@ xv6 使用固定数组、固定页池和固定磁盘布局。不同层的“没�
 | 资源 | 当前容量 | 分配/认领入口 | 耗尽行为 | 主要归还点 |
 |---|---:|---|---|---|
 | hart/CPU 槽 | `NCPU=8` | `_entry` 以 hart id 索引 | 无检查；越界栈/CPU 状态访问 | 不归还 |
-| 进程槽 | `NPROC=64` | `allocproc()` 线性扫描 | `kfork()` 返回 `-1`；首进程失败会 panic | `kwait()->freeproc()` 或未发布构造回滚 |
+| 进程槽 | `NPROC=64` | `allocproc()` 线性扫描 | `kfork()` 返回 `-1`；`userinit()` 未检查首个 `allocproc()` 的返回值，失败后解引用空 `p`，C 语义已是 UB。当前 GCC 的 `kernel/kernel` 仍生成对低地址 336 的 store；因 trap 已安装且低地址未映射，当前产物进入通用 `panic("kerneltrap")`，不报告明确的首进程 OOM；其他工具链不保证同一精确结果 | `kwait()->freeproc()` 或未发布构造回滚 |
 | 每进程 fd | `NOFILE=16` | `fdalloc()` 线性扫描 | `dup/open/pipe` 返回 `-1`，可能已有副作用 | `close()`、`kexit()` |
 | 全局 file | `NFILE=100` | `filealloc()` 线性扫描 | 返回空，外层通常 `-1` | 最后 `fileclose()` 把 ref 降到 0 |
 | 活跃 inode cache | `NINODE=50` | `iget()` | `panic("iget: no inodes")` | `iput()` 把 ref 降到 0；槽可复用 |
@@ -34,13 +34,13 @@ xv6 使用固定数组、固定页池和固定磁盘布局。不同层的“没�
 | 单 operation 日志预算 | `MAXOPBLOCKS=10` | `begin_op()` 名义预留 | 实际超预算可使 `log_write()` panic | `end_op()` 后 group commit |
 | 内存/磁盘日志项 | `LOGBLOCKS=30` | `log_write()` | admission 睡眠；满后调用甚至 absorption 前 panic | commit 后清 `lh.n`、unpin |
 | 文件系统块 | `FSSIZE=2000` | `balloc()` | 扫完 bitmap 返回 0；上层可能短写或 `-1` | `bfree()`/`itrunc()` |
-| 单文件数据块 | `MAXFILE=268` | `bmap()/writei()` | 越界检查返回失败；部分旧分片可已提交 | truncate/unlink 最后引用 |
+| 单文件数据块 | `MAXFILE=268` | `bmap()/writei()` | `writei()` 的结束位置检查返回 `-1`；直接 `bmap()` 对 `bn >= MAXFILE` panic；部分旧分片可已提交 | truncate/unlink 最后引用 |
 | 磁盘 dinode | `NINODES=200` 个表项；可分配 inum 为 `[1,200)`，最多 199 个 | `ialloc()` | 无空 dinode 返回 0，外层通常 `-1` | 最后 `iput()` 或启动 orphan reclaim |
 | pipe 数据 | `PIPESIZE=512` 字节 | `pipewrite()` | 满时睡眠；读端关闭/killed 返回 `-1` | reader 消费；两端关闭后释放页 |
 | console 输入 | 128 字节 | UART RX/console buffer | 满时发布；reader 未释放空间前新输入被丢弃 | `consoleread()` 推进 `r` |
 | VirtIO descriptor | `NUM=8` | `alloc3_desc()` | 少于 3 个时睡眠 | 请求者在完成后 `free_chain()` |
 | VirtIO in-flight 请求 | 最多 2 | 每请求 3 descriptors | 第三笔等待 descriptor | 完成 IRQ 唤醒请求者后释放 |
-| shell argv | `MAXARGS=10` | parser | 第 10 个非空项触发 shell panic | 命令进程退出 |
+| shell argv | `MAXARGS=10` | parser | 第 10 个非空项调用 `user/sh.c:panic()`，它打印 `too many args` 后执行用户态 `exit(1)`；这不是内核 panic | 当前 line runner 退出，交互 shell 等待后继续 |
 
 容量相同不代表资源相同。`ROOTDEV=1`、console major 1、VirtIO IRQ 1 和 queue 0 分别属于设备号、文件 major、PLIC source 和 VirtIO queue 编号空间，数值相同没有共享身份。
 
@@ -62,9 +62,9 @@ xv6 使用固定数组、固定页池和固定磁盘布局。不同层的“没�
 
 ### 4.1 `NPROC`
 
-`allocproc()` 逐槽取锁查找 `UNUSED`。找到槽后还可能在 pid、trapframe 或页表分配阶段失败；这些失败清理未发布槽并返回 0。`kfork()` 最终返回 `-1`，但已经递增的全局 pid 不回退，所以资源耗尽允许 pid 跳号。
+`allocproc()` 逐槽取锁查找 `UNUSED`。找到槽后先无条件调用 `allocpid()` 递增并取得 pid；这个步骤没有失败返回。随后 trapframe 或进程页表分配才可能失败，这些路径清理未发布槽并返回 0，`kfork()` 最终返回 `-1`。已经递增的全局 pid 不回退，所以一次这样的 OOM 会留下 pid 跳号。
 
-`forktest` 验证进程表耗尽后已创建 child 能被回收，并能再次 fork。它不精确区分“进程槽耗尽”和“物理页不足”，因为每个 child 还需要 trapframe、页表和用户页副本。
+独立 `forktest` 与 `usertests` 中的同名用例都验证：fork 最终能受控失败、此前创建的 child 可全部 wait 回收，且额外一次 wait 返回 `-1`。它们在回收后都没有再调用一次 fork，所以不能由该测试本身声称“释放一个槽后立即恢复分配”；后续测试还能创建进程只提供间接证据。它们也不从内核读取失败原因；虽然精简的独立程序旨在先撞 `NPROC`，每个 child 仍需要 trapframe、页表和用户页，严格区分槽耗尽与 OOM 还需内部计数或定点故障。
 
 ### 4.2 物理页
 
@@ -87,7 +87,8 @@ xv6 使用固定数组、固定页池和固定磁盘布局。不同层的“没�
 | `copyin/copyout` lazy fallback | helper 返回失败；调用者决定 `-1`、短计数或其他语义 |
 | `pipealloc` | 关闭已取得 file 并返回失败 |
 | VirtIO queue 初始化 | 启动期 panic |
-| kernel page table/stack 初始化 | 启动期 panic |
+| kernel 根页表分配 | `kvmmake()` 未检查根页表 `kalloc()` 结果，随后以地址 0 调用 `memset`；此时尚未安装内核 trap 向量，源码没有受控恢复或显式 `panic`，具体可表现为早期 fault、停滞或低地址破坏 |
+| kernel 页表中间页或进程内核栈初始化 | `kvmmap()` / `proc_mapstacks()` 显式 panic |
 
 页表中间层可能在叶映射失败或缩容后保留空页，直到整个地址空间销毁。因而 `p->sz` 很小不等于该进程页表只占很少物理页。
 
@@ -96,6 +97,10 @@ xv6 使用固定数组、固定页池和固定磁盘布局。不同层的“没�
 ### 5.1 每进程 fd 与全局 file
 
 `fdalloc()` 只把调用者已经拥有的 file 指针装入最低空槽，不增加引用。`sys_pipe()` 同时需要两个 fd 和两个 file；任何阶段失败都必须清除已安装槽并关闭相应引用。
+
+内核资源回滚不等于用户输出缓冲区回滚。`sys_pipe()` 对 `fdarray[0]` 和 `fdarray[1]` 分两次调用 `copyout()`；若首项完整落在有效页、第二项跨入无效页，第一次写入会保留，第二次也可能先覆盖有效页尾的 1 至 3 个字节，随后系统调用返回 `-1` 并撤销两个内核 fd/file/pipe owner。首项整数不再指向已发布 fd，第二项没有形成完整 fd；失败后调用者必须忽略整个输出数组。
+
+`kwait()` 的 4 字节退出状态也由逐页 `copyout()` 写入。status 地址若只剩 1 到 3 个有效页尾字节，前缀可以先写入，下一页失败后 `kwait()` 返回 `-1`；但它在 copy 成功后才调用 `freeproc()`，所以 child 仍保持 ZOMBIE，换成合法地址再次 wait 仍应得到同一 pid 和完整状态。不能因用户缓冲区被部分改写就误判 zombie 已被部分回收。
 
 `sys_open(O_CREATE)` 的名字创建发生在 file/fd 分配之前。如果 `create()` 已把新空文件链接进目录，随后 `filealloc()` 或 `fdalloc()` 失败，open 返回 `-1`，但文件名可保留并随事务持久化。该路径是资源失败伴随用户可见副作用的典型反例。
 
@@ -120,7 +125,7 @@ exec 有三层容量：
 2. 每个字符串复制到单独一页的内核临时 buffer，必须在页内找到 NUL。
 3. 全部字符串和 argv 指针必须装入 `USERSTACK=1` 页，并保持 16 字节对齐、避开 guard。
 
-任一提交前失败都保留旧映像，但从旧 lazy 地址空间读取参数时已物化的页不会回滚。
+任一提交前失败都保留旧映像。`sys_exec()` 用 `fetchaddr()->copyin()` 读取旧地址空间中的 `argv[]` 指针，所以尚未物化的合法 argv 向量页可能在失败前变成实际映射，并且不会回滚；路径和各参数字符串走 `copyinstr()`，当前实现不会为它们补 lazy 页。这里保留的是旧映像内部允许发生的读取副作用，不是新 exec 页表泄漏。
 
 ## 7. buffer cache、日志与磁盘
 
@@ -172,8 +177,8 @@ queue `NUM=8`，每个 block 请求固定占三个 descriptor，所以最多两�
 | exec 提交前失败 | 新页表和参数页；旧映像、fd、cwd 保留；旧 lazy 参数页可已物化 |
 | exec 成功 | 旧用户页和页表释放；fd/cwd 保留 |
 | exit | 关闭 fd/cwd、reparent；保留 proc 槽、trapframe、页表到 wait |
-| wait 坏 status 地址 | 返回 `-1`，zombie 必须仍可再次 wait 回收 |
-| pipe 构造失败 | 两个 file、pipe 页、已安装 fd 槽全部回滚 |
+| wait 坏 status 地址 | 返回 `-1`，zombie 必须仍可再次 wait 回收；跨页地址的有效页尾可已写入状态前缀 |
+| pipe 构造失败 | 两个 file、pipe 页、已安装 fd 槽全部回滚；若第二次 fd `copyout` 失败，用户数组首项可保留完整但无效的 fd，第二项的页尾还可能保留 1 至 3 字节前缀；整个数组不可用 |
 | open 创建后 fd/file 失败 | inode ref 回收；新目录项可能保留 |
 | write 短写 | 完成前缀、offset 和日志登记按实际路径保留 |
 | log commit | 清 outstanding/group、unpin home buffer；磁盘 header 清零 |

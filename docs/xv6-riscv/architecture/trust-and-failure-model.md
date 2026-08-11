@@ -64,19 +64,32 @@ QEMU virt、PLIC、UART、VirtIO DMA     可信设备/模拟器
 
 | helper | 页要求 | lazy fallback | 失败副作用 |
 |---|---|---|---|
-| `copyin` | `V|U`，构造规则隐含 R | 可以 | 内核目标可已有前缀，页可已物化 |
+| `copyin` | 实际只查 `V|U`，不查 R/X 或叶项类型 | 可以 | 内核目标可已有前缀，页可已物化 |
 | `copyout` | `V|U|W` | 可以 | 用户目标可已有前缀，页可已物化 |
-| `copyinstr` | `V|U`，窗口内找到 NUL | 不可以 | 目标可有未终止前缀 |
+| `copyinstr` | 实际只查 `V|U`，并要求窗口内找到 NUL | 不可以 | 目标可有未终止前缀 |
 
-三个 helper 都逐页推进，不是事务。`copyin/out(len==0)` 不访问地址，因而坏地址也可能返回成功；调用者不能把它当成独立的地址验证 API。
+三个 helper 都逐页推进，不是事务。当前页表构造器给普通用户 leaf 至少加 R，因此 `copyin/copyinstr` 的弱检查在正常页表上不暴露差异；一旦加入 execute-only 页、手工 PTE 或敌对页表输入，就必须在 helper 内补足 leaf/R 校验。`copyin/out(len==0)` 不访问地址，因而坏地址也可能返回成功；调用者不能把它当成独立的地址验证 API。
 
 lazy fallback 还隐含 `pagetable == myproc()->pagetable`。`vmfault()` 虽接收页表形参，范围检查和最终映射却依赖当前进程。临时 exec 页表只有在目标页已 eager 映射、绝不会进入 fallback 时才能传给 copy helper。
+
+即使 helper 返回规则相同，各 backend 的提交点也不同：
+
+| 路径 | copy 失败前后的状态 |
+|---|---|
+| inode read | 用户缓冲区可能已有前缀，但 `readi()` 把结果改为 `-1`，open-file offset 不前进；重试会从原 offset 再复制 |
+| pipe read | 只在每个字节 `copyout()` 成功后增加 `nread`；首字节失败为 `-1`，部分失败返回前缀长度，失败字节保留 |
+| console read | 先增加 `cons.r` 再 `copyout()`；失败字节已经丢失，首字节失败返回 0，因而会伪装成 EOF |
+| pipe write | 每字节先 `copyin()` 再增加 `nwrite`；失败返回已写前缀，首字节失败返回 0 |
+| inode write | 已完成的 chunk 和当前 `writei()` 前缀可修改块、inode size 与 file offset，但 `filewrite()` 只要没有完成全部请求就最终返回 `-1` |
+| `sys_pipe` 返回 fd 数组 | 第一个 int 可完整保留，第二个跨页失败时还可写出 1 至 3 字节前缀；内核关闭两端，整个用户数组均无效 |
+
+所以“用户指针非法”不对应统一的 all-or-nothing 语义；必须沿具体调用者同时核对返回值、资源状态、offset/环形计数和已复制前缀。
 
 ### 4.3 用户异常
 
 可恢复异常只有当前实现识别的 load/store lazy page fault。权限 fault、instruction fault、非法指令或越界 fault 设置 killed，随后让普通进程退出。`initproc` 是明确例外：同一条路径最终调用 `kexit()` 时会触发 `panic("init exiting")`，不会发布 init zombie。内核态异常也通常 panic；内核没有通用 exception table 或 fault recovery。
 
-kill 是协作式请求，不是同步撤销。置位和最后一次返回用户态检查之间存在窗口，进程可能再执行少量用户指令；设备、sleeplock 和部分日志等待也不检查 killed，可能继续阻塞到真实条件完成。
+kill 是协作式请求，不是同步撤销。`kkill()` 只置位并把 `SLEEPING` 改成 `RUNNABLE`，不会向正在另一个 hart 用户态执行的目标发送专用 IPI；目标通常到下一次 timer/device trap 或系统调用边界才观察 killed，因此延迟依赖时钟中断持续到达，不能承诺固定“几条指令”。被强行唤醒的路径若自身不检查 killed，还可能重新睡下；VirtIO、sleeplock 和日志等待通常要等真实条件完成，console、pipe、`pause` 和 `kwait()` 的等待循环则有显式 killed 检查。即使有检查，检查结束到 `sleep()` 取得 `p->lock` 之间仍有取消窗口；恰好落入该窗口的 kill 可能要等下一次条件唤醒才被观察。
 
 ## 5. ELF 与 exec
 
@@ -93,7 +106,9 @@ loader 检查 ELF magic，并对每个 `PT_LOAD` 检查：
 
 ### 5.2 未验证或只隐含验证
 
-当前 loader 不完整验证 class、endianness、machine、ABI/version、ELF type、`phentsize`、header table 范围、`off+filesz`、segment overlap、`paddr`、entry 是否位于可执行页，以及 segment 是否避开所有内部高地址边界。它按本地结构大小读取 program header，适合当前 linker 产物，不适合敌对二进制。
+当前 loader 不完整验证 class、endianness、machine、ABI/version、ELF type、`phentsize`、header table 范围、`off+filesz`、segment overlap、`paddr`、entry 是否位于可执行页，以及 segment 是否避开所有内部高地址边界。它按本地结构大小读取 program header；局部 `off` 是 32 位 `int`，`loadseg()` 又把 ELF64 的 `ph.off/ph.filesz` 传入 32 位 `uint`。超大字段会在真正读 inode 前截窄，而不是得到完整 64 位范围检查。
+
+段布局也不是逐段精确映射。`uvmalloc()` 从当前最大 `sz` 连续分配到本段末端，给 gap 也建立用户映射；它总加 R，只从 ELF flags 提取 W/X。逆序或重叠段复用已有页且不重算权限，`loadseg()` 仍可从内核覆盖已有页内容。因而 loader 适合本仓库产生的递增、非重叠小型 ELF，不适合敌对二进制。
 
 异常布局可能得到三类结果：干净返回 `-1`、在内部 trusted helper 触发 panic、exec 成功后第一次取指被 kill。不能笼统写成“非法 ELF 会被拒绝”。
 
@@ -115,7 +130,7 @@ exec 初始寄存器 ABI只承诺新 PC、SP、`a0=argc`、`a1=argv`。其余 GP
 
 ### 6.2 log header
 
-启动 recovery 在把 header 复制到内存前没有先验证 `0<=n<=LOGBLOCKS`，也不验证 home block 范围、重复项或与 log 区重叠。损坏 header 可越界覆盖内存，或把 log data 安装到任意受信 block。
+启动 recovery 在把 header 复制到内存前没有先验证 `0<=n<=LOGBLOCKS`，也不验证 home block 范围、重复项或与 log 区重叠。正的 `n>LOGBLOCKS` 会在 `read_head()` 中越界写 `log.lh.block[]`；负 `n` 则使复制和安装循环都为空，随后被静默清成 0。范围内的恶意 target 可把 log data 安装到任意受信 block；若 target 与当前 log source 是同一 buffer，`install_trans()` 还可能在已持有该 buffer sleeplock 时再次 `bread()` 同一 identity 而自锁。
 
 ### 6.3 dinode、bitmap 与目录
 
@@ -167,7 +182,7 @@ UART 不 probe 设备能力、时钟、FIFO 或错误状态。输入 overrun、p
 - interrupt status 和完成顺序符合 split ring；
 - completion status 0 表示完整 block transfer。
 
-代码没有 IOMMU、DMA mapping API 或 hostile-device 隔离。错误 id/len/chain 可能越界访问或错误唤醒；非零 status 直接 panic。驱动还省略完整 feature selector/`VERSION_1` 协商、reset 等待、capacity/config generation 和设备重置恢复，只针对当前 QEMU 组合。
+代码没有 IOMMU、DMA mapping API 或 hostile-device 隔离。错误 id/len/chain 可能越界访问或错误唤醒；非零 status 直接 panic。驱动还省略完整 feature selector/`VERSION_1` 协商、reset 完成确认、capacity/config generation 和设备重置恢复，只针对当前 QEMU 组合。它不在发请求前检查 block capacity；`b->blockno * 2` 还先按 32 位 `uint` 计算再扩成 64 位 sector，所以损坏元数据给出的超大块号可能回绕并静默访问错误位置，未回绕的越界请求也只能依赖设备 status，最终是 panic 而不是 `EIO`。
 
 CPU fence、MMIO 顺序、DMA coherence 和磁盘持久化是四个不同层次。当前 QEMU coherent RAM 掩盖了真实非一致 DMA 需要的 cache maintenance；普通 C 原子 fence 不能自动提供平台 I/O barrier。
 
@@ -213,6 +228,7 @@ CPU fence、MMIO 顺序、DMA coherence 和磁盘持久化是四个不同层次�
 | `log_write()` | 本调用链有 reservation，仍持修改 buffer | 消耗别人预算、panic 或错误版本 |
 | `sched()` | 当前 `p->lock` 唯一 spinlock，状态非 RUNNING | panic 或状态破坏 |
 | `kexec()` | 内核 argv 最多 `MAXARG-1` 个非空项 | 内部直接调用可越界 `ustack` |
+| `vmfault()` | 页表就是当前进程页表，地址低于 `p->sz` 且尚未映射 | 可能检查一个页表却把新页映射进另一个页表；`read` 形参当前被忽略 |
 
 新增调用者必须按[调用上下文契约](../kernel/call-context-contracts.md)审阅完整可达路径，不能因为函数在 `defs.h` 中可见就视为通用安全 API。
 
@@ -220,7 +236,7 @@ CPU fence、MMIO 顺序、DMA coherence 和磁盘持久化是四个不同层次�
 
 | 输入/事件 | 当前结果 | 保证边界 |
 |---|---|---|
-| 非法普通用户指针 | 通常 `-1`/短计数 | 已复制前缀和 lazy 页不回滚 |
+| 非法普通用户指针 | 依 backend 为 `-1`、0 或短计数 | 已复制前缀和 lazy 页不回滚；console 首字节失败还会丢输入并伪装成 EOF |
 | 普通进程的用户权限/越界 fault | kill 当前进程 | 内核继续运行；若目标是 init 则升级为 panic |
 | 恶意 ELF | `-1`、panic 或稍后 kill | 不保证统一拒绝 |
 | 损坏 superblock/log | panic、越界 I/O、静默破坏 | 只信任正常 mkfs 镜像 |

@@ -80,13 +80,14 @@ FI_VIRTIO_COMPLETE        used entry 已观察但尚未唤醒请求者
 
 | `FI_KALLOC` site | 代表调用点 | 当前失败语义 |
 |---|---|---|
-| `KALLOC_PROC_TRAPFRAME` | `allocproc()` 的 trapframe | `fork()` 返回 `-1`；未发布 child 回滚 |
-| `KALLOC_PGTABLE_ROOT` | `uvmcreate()` | fork/exec/lazy 的上层语义各自决定 |
+| `KALLOC_PROC_TRAPFRAME` | `allocproc()` 的 trapframe | `allocproc()` 回滚未发布槽并返回 0；`fork()` 返回 `-1`。启动期 `userinit()` 不检查该返回值，随后解引用空 `p`，C 语义已是 UB；当前 GCC 的 `kernel/kernel` 生成低地址 store，并在已安装的 trap 路径进入通用 `panic("kerneltrap")`，但精确 panic 不是跨工具链保证 |
+| `KALLOC_PGTABLE_ROOT` | `uvmcreate()` 的用户根页表 | `allocproc()` 回滚并返回 0，`kfork()` 据此返回 `-1`；启动期 `userinit()` 同样进入空指针 UB，当前产物表现为通用 `panic("kerneltrap")`；`kexec()` 返回 `-1`；lazy fault 在既有页表中工作，不申请根页表。不要与 trap 安装前失败的 `KALLOC_KPGTABLE_ROOT` 合并 |
 | `KALLOC_PGTABLE_WALK` | `walk(..., alloc=1)` 中间层 | 上层失败；已建空中间层可保留到整个页表释放 |
 | `KALLOC_UVM_LEAF` | eager 用户页/`uvmcopy()` | grow/fork/exec 返回失败并按各自范围回滚 |
 | `KALLOC_LAZY_LEAF` | `vmfault()` 数据页 | 用户 fault 被 kill；copy helper 返回失败给调用者 |
 | `KALLOC_PIPE_PAGE` | `pipealloc()` | 关闭已取得的两个 file，`pipe()` 返回 `-1` |
 | `KALLOC_EXEC_ARG` | `sys_exec()` 临时参数页 | 释放此前参数页，旧映像保留，返回 `-1` |
+| `KALLOC_KPGTABLE_ROOT` | `kvmmake()` 根页表 | 未检查 `kalloc()` 返回值，随后以地址 0 调用 `memset`；发生在 trap 向量建立前，没有受控恢复或显式 `panic` 路径 |
 | `KALLOC_KSTACK_BOOT` | `proc_mapstacks()` | 启动期 `panic("kalloc")` |
 | `KALLOC_VIRTQ_BOOT` | VirtIO queue 三页 | 启动期 `panic("virtio disk kalloc")` |
 
@@ -122,10 +123,15 @@ SNAPSHOT：断言 eligible=N、fired=1
 | eager `sbrk` | 用户 wrapper `sbrk(bytes)`（内部调用 `sys_sbrk(bytes,SBRK_EAGER)`）在叶页或 walk 失败 | 返回 `SBRK_ERROR`/`-1`，本轮扩展不发布 | `p->sz` 保持旧值；本轮叶页回滚；中间页最终随地址空间释放；下一次较小扩展成功 |
 | lazy hardware fault | 先 lazy 增长，再在目标页执行 load/store | `vmfault()` 失败，目标进程被 kill 并以 `-1` 被 wait | 无目标叶映射；刚取得页未泄漏；内核和其他进程继续运行 |
 | lazy `copyin/copyout` | syscall buffer 指向未物化 lazy 页 | helper 返回失败；上层可以是 `-1`、0 或部分长度 | 记录实际 caller 语义和前缀；失败页未映射；已物化的前置页属于允许副作用并在进程退出时回收 |
-| exec 参数编组 | 在第 N 个 `KALLOC_EXEC_ARG` 失败 | `exec()` 返回 `-1`，旧映像继续执行 | 先前参数页全归还；旧 PC/SP/页表/fd/cwd 不变；随后合法 exec 成功 |
-| exec 新映像 | ELF 段、stack、walk 的不同 N 失败 | `exec()` 返回 `-1`，尚未提交的新页表销毁 | 旧映像仍能校验其数据；新页表无可达页；参数临时页归还 |
-| pipe | 在 pipe 页面失败，或分别耗尽第一个/第二个 file | `pipe()` 返回 `-1` | 两个用户 fd 均未发布；已取得 file ref 回到 0；无 pipe page；下一次 pipe 成功 |
-| boot kstack/VirtIO | boot plan 在固定序号失败 | 精确 panic 字符串，系统不进入 shell | panic 前的 fault 记录通过同步 UART 输出；该用例独立 QEMU 运行，不做“恢复继续”断言 |
+| exec 参数编组 | 在第 N 个 `KALLOC_EXEC_ARG` 失败 | `exec()` 返回 `-1`，旧映像继续执行 | 先前参数页全归还；旧页表 identity、SP、fd、cwd 未被替换，既有用户数据不变；但 `fetchaddr()->copyin()` 可能已经物化合法 lazy `argv[]` 页，这一映射副作用允许保留；`epc` 按普通失败 syscall 指向 `ecall` 后一条指令且 `a0=-1`；随后合法 exec 成功 |
+| exec 新映像 | ELF 段、stack、walk 的不同 N 失败 | `exec()` 返回 `-1`，尚未提交的新页表销毁 | 旧映像仍能校验既有数据，SP/页表 identity/fd/cwd 未被新映像替换；参数读取阶段物化的旧 lazy `argv[]` 页允许保留；新页表无可达页；参数临时页归还 |
+| pipe 分配 | 在 pipe 页面失败，或分别耗尽第一个/第二个 file | `pipe()` 返回 `-1` | 两个内核 fd 均未发布；已取得 file ref 回到 0；无 pipe page；这些失败发生在输出前，fdarray 不变；下一次 pipe 成功 |
+| pipe 结果复制 | 让 `fdarray[0]` 的 4 字节有效、`fdarray[1]` 的 4 字节跨入无效页 | `pipe()` 返回 `-1` | 两个已安装 fd、file ref 和 pipe 页全部回滚；首项的完整 fd 数字会保留，第二项的有效页尾也可能已写入 1 至 3 个字节，但没有形成可用的完整 fd；失败后整个数组都必须丢弃；随后正常 pipe 成功 |
+| wait 状态复制 | 先制造一个 zombie，再令 4 字节 status 跨越有效页尾和无效下一页 | `wait()` 返回 `-1` | 有效页中的状态前缀允许已写入；目标 child 仍为 ZOMBIE，proc 槽、trapframe 和页表均未释放；换用合法 status 地址后再次 wait 返回同一 pid/status 并完成回收 |
+| boot kernel page-table walk/kstack/VirtIO | boot plan 在固定序号失败 | 精确 panic 字符串，系统不进入 shell | panic 前的 fault 记录通过同步 UART 输出；该用例独立 QEMU 运行，不做“恢复继续”断言 |
+| boot kernel root page table | `kvmmake()` 的首次根页分配失败 | 随后以地址 0 调用 `memset`，系统不进入 shell；平台可表现为早期 fault、停滞或低地址破坏，当前路径没有显式 panic | 以 fault-site 命中和未进入后续初始化为 oracle；不要把缺少 panic 文本误判成注入未触发 |
+
+对 `userinit()` 的两种 `allocproc()` 子分配失败，稳定 oracle 同样应是 fault-site 已命中、未发布首进程且没有继续到 scheduler/shell；通用 `panic("kerneltrap")` 只是当前 GCC 与当前 `kernel/kernel` 的预期现象。故障注入会重编译内核时，不能把这段 C 空指针 UB 的某条精确指令或 panic 文本当成跨工具链验收条件。
 
 OOM 后“操作返回失败”不等于零副作用。例如 lazy copy 已物化的前置页保留；页表 walk 可留下空中间页到整个地址空间销毁；文件写入可在后续页 copyin 失败前已经分配块和修改前缀。测试必须按源码契约断言这些状态，而不是要求不存在的事务回滚。
 

@@ -138,7 +138,9 @@ TRAMPOLINE  所有进程映射同一代码页，无 PTE_U
 MAXVA
 ```
 
-`p->sz` 是用户低地址区域的逻辑上界，不表示其中每一页都有物理映射。这个 fork 的普通 `sbrk()` 使用 eager allocation，`sbrklazy()` 只抬高逻辑上界并留下未映射洞；负增长无论使用哪种策略都立即通过 `growproc()` 解除超出新边界的映射。
+`p->sz` 是用户低地址区域的逻辑上界，不表示其中每一页都有物理映射。这个 fork 的普通 `sbrk()` 使用 eager allocation，`sbrklazy()` 只抬高逻辑上界并留下未映射洞；负增长无论使用哪种策略都立即通过 `growproc()` 解除跨过的完整页，但新边界所在的部分页若原本已映射仍会保留，不能把 `p->sz` 当作硬件逐字节保护界限。
+
+上图中的 “ELF text/data/bss” 只是逻辑示意。`kexec()` 按 program header 出现顺序调用 `uvmalloc(pagetable, sz, ph.vaddr + ph.memsz, ...)`：如果下一个 segment 起点高于当前 `sz`，gap 中从 `PGROUNDUP(sz)` 开始的新整页会被分配、清零，并取得这次扩展使用的 PTE 权限；旧 `sz` 所在部分页的剩余字节已经属于旧页，继续保留前一段权限。如果 segment 重叠或逆序，已有页也不会重新分配或重新设置权限，`loadseg()` 仍可覆盖其中的字节。loader 因而依赖本仓库 linker 产生按地址递增、互不重叠的常规布局，不能把示意图理解成内核逐段保留了精确的 ELF 空洞和权限边界。
 
 ## 6. 主要对象及所有权
 
@@ -168,14 +170,14 @@ MAXVA
 | `NOFILE` | 16 | 每进程 fd 表 |
 | `NFILE` | 100 | 全局 open-file descriptions |
 | `NINODE` | 50 | 同时缓存的内存 inode 数量 |
-| `NDEV` | 10 | `devsw[]` 的 major 编号上界；合法 major 为 0..9 |
+| `NDEV` | 10 | `devsw[]` 的 major 编号范围检查接受 0..9；只有安装了 read/write handler 的槽（当前是 `CONSOLE=1`）真正可用 |
 | `ROOTDEV` | 1 | 当前唯一根文件系统设备号；不等于 console major 或 PLIC IRQ |
-| `MAXARG` | 32 | `exec` 内核 argv 数组 |
+| `MAXARG` | 32 | `exec` 内核 argv 槽数；系统调用路径必须在数组内保留结尾空指针，所以最多接收 31 个非空参数 |
 | `MAXOPBLOCKS` | 10 | 单个 `begin_op()`/`end_op()` 日志操作区间的空间预算 |
-| `LOGBLOCKS` | 30 | redo log 最多记录的不同 home blocks |
+| `LOGBLOCKS` | 30 | 内存 redo log 的 home-block 数组容量；`log_write()` 在 absorption 扫描前先检查满容量，实际调用序列不能把“最终不超过 30”简单当成总是安全 |
 | `NBUF` | 30 | buffer cache；还必须容纳被日志 pin 的 block |
 | `FSSIZE` | 2000 | `mkfs` 生成的块数 |
-| `MAXPATH` | 128 | 系统调用把用户路径导入固定内核缓冲区时的上界 |
+| `MAXPATH` | 128 | 系统调用导入路径的缓冲区大小；包括结尾 NUL，故可接受的路径正文最多 127 字节 |
 | `USERSTACK` | 1 | `exec` 分配的用户栈页数，不含 guard page |
 
 修改日志相关三个常量时，必须同时检查 `begin_op()` 的预留公式、`filewrite()` 的分批上限和提交阶段所需的临时 buffer；完整推导见[文件系统与日志资源上界](../kernel/resource-bounds.md)。修改 `NCPU` 时必须保证 QEMU 的 `CPUS` 不超过它。
@@ -188,7 +190,7 @@ MAXVA
 4. 线程不能在实际睡眠期间保留普通 spinlock；`sleep(chan, lock)` 会在登记睡眠后原子地释放作为条件锁传入的 spinlock，并在醒来后重新获取。inode 和 buffer 需要跨潜在阻塞操作保护内容，因此长临界区使用 sleeplock。
 5. `wait_lock` 必须先于任何相关 `p->lock` 获取；日志、inode 和 buffer 又形成各自的层次约束，详见[同步与锁](../kernel/synchronization.md)。
 6. `scheduler()` 持有目标 `p->lock` 跨越 `swtch()`；进程第一次进入 `forkret()` 时继承并释放它，之后每次通过 `sched()` 返回调度器前都必须重新持有它，且此时只能剩这一把 spinlock（`noff == 1`）。
-7. 用户指针从不直接解引用。`walkaddr()` 要求 `PTE_V|PTE_U`，`copyout()` 还要求 `PTE_W`；`copyin/copyout` 遇到未映射页时会尝试 `vmfault()`，此时才以 `p->sz` 限制 lazy 补页，而 `copyinstr()` 不会补页。
+7. 用户指针从不直接由系统调用代码解引用。`walkaddr()` 实际只要求 `PTE_V|PTE_U`，不会独立检查 `PTE_R` 或叶项类型；`copyout()` 随后额外要求 `PTE_W`。当前页表构造路径保证普通用户叶项带 `PTE_R`，所以这是一项构造不变量，不是 copy helper 自己完整执行的权限验证。`copyin/copyout` 遇到未映射页时会尝试 `vmfault()`，此时才以当前进程的 `p->sz` 限制 lazy 补页，而 `copyinstr()` 不会补页。
 
 ## 9. 初始化依赖
 
@@ -209,7 +211,7 @@ console/printk
   -> exec /init
 ```
 
-文件系统初始化不能直接放在 `main()`：日志恢复可能触发磁盘 I/O 并睡眠，而调度器尚未运行时无法完成这种等待。这个 fork 的 `userinit()` 不嵌入或加载 `initcode`；它创建空用户地址空间并取得根目录引用，第一次被调度到 `forkret()` 后才执行 `fsinit()` 和 `kexec("/init", ...)`。
+文件系统初始化不能直接放在 `main()`：日志恢复可能触发磁盘 I/O 并睡眠，而调度器尚未运行时无法完成这种等待。这个 fork 的 `userinit()` 不嵌入或加载 `initcode`；它创建空用户地址空间并取得根目录引用，第一次被调度到 `forkret()` 后才执行 `fsinit()` 和 `kexec("/init", ...)`。此时 `namei("/")` 之所以能早于 `fsinit()` 调用，是因为路径没有待遍历分量：它只在已初始化的 inode table 中为 `(ROOTDEV, ROOTINO)` 建立引用，不读取 superblock 或根目录块。这个例外不能推广到 `namei("/init")` 等普通路径。
 
 非零 hart 不重复上述共享初始化；观察到 `started != 0` 后，每个 hart 仍须依次执行自己的 `kvminithart()`、`trapinithart()` 和 `plicinithart()`，然后进入 `scheduler()`。
 

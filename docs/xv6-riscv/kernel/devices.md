@@ -280,6 +280,8 @@ kill 只在 `r==w` 的等待循环中检查。`kkill()` 会把任意 sleeping �
 
 `sleep(&cons.r, &cons.lock)` 先取得当前进程的 `p->lock`，再释放 condition lock，醒来后恢复 `cons.lock`。`consoleintr()` 在相同 condition lock 下改变 `w` 并 wakeup，因而“检查空缓冲区”和“真正进入睡眠”之间不存在丢失输入发布事件的窗口。
 
+这条无丢失保证只针对 `consoleintr()` 发布输入；`kkill()` 不取得 `cons.lock`。若 reader 在检查 `killed==0` 后、`sleep()` 取得 `p->lock` 前被 kill，killer 看到的仍是 `RUNNING`，reader 仍可能随后发布 `SLEEPING`，直到下一次输入或第二次 kill 才再次运行。设备条件锁因此不能自动把 kill 变成无窗口的取消协议，完整竞态见 [kill 阻塞进程](../flows/kill-blocked-process.md)。
+
 `either_copyout()` 也在 `cons.lock` 内执行。用户目标页尚未映射时，`copyout()` 可能调用 `vmfault()` 做 lazy allocation，并在此过程中取得页分配器锁，但不会 sleep。
 
 复制错误语义需要特别注意：代码先执行 `c = buf[r++ % 128]`，再调用 `either_copyout()`。如果用户目标地址无效，那个输入字节已经从环形缓冲区消费且不会放回（只有遇到 `Ctrl-D` 的专门分支可能回退 `r`）；函数返回此前成功复制的字节数。若第一个普通字节就复制失败，返回值是 0，调用者无法仅靠返回值把它与 EOF 区分。`user_dst=0` 的内核目标则直接 `memmove()`，没有这个失败分支。

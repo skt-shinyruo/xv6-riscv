@@ -320,7 +320,7 @@ CPU 0: kinit()
        -> kvminithart() 使用同一 kernel_pagetable
 ```
 
-CPU 0 在发布 `started = 1` 前构造完整页表；写入前和非零 CPU 读到标志后的 `__sync_synchronize()`，连同 `started` 的 store/load，组成这里的共享状态发布与等待协议，使其他 CPU 在使用页表前观察到初始化结果。它不是等待所有 hart 到齐的 barrier：CPU 0 发布后立即继续。所有 CPU 共享同一根 `kernel_pagetable`，但各自写自己的 `satp` 和刷新自己的 TLB。
+CPU 0 在发布 `started = 1` 前构造完整页表；源码在该 store 前、以及非零 CPU 读到非零标志后各执行一次 `__atomic_thread_fence(__ATOMIC_SEQ_CST)`。在当前 GCC/RISC-V 裸机实现中，这两道 fence 与 `volatile started` 的实际 load/store 组成内核采用的发布与等待协议，使其他 CPU 在使用页表前观察到初始化结果。`started` 本身不是 C `_Atomic` 对象，因此不能把这一写法推广成可移植 ISO C 多线程同步证明。这里也不是调用 `__sync_synchronize()`，更不是等待所有 hart 到齐的 barrier：CPU 0 发布后立即继续。所有 CPU 共享同一根 `kernel_pagetable`，但各自写自己的 `satp` 和刷新自己的 TLB。
 
 ### 6.2 映射清单
 
@@ -519,7 +519,7 @@ lazy 区域只由逻辑大小表达：
 `vmfault(pagetable, va, read)` 当前实现如下：
 
 1. 取得 `p = myproc()`；没有当前进程的上下文不能使用它。
-2. 若原始 `va >= p->sz`，返回 0。
+2. 若调用者传入的 `va >= p->sz`，返回 0；硬件入口传原始 `stval`，copy helpers 则传已向下取整的页首，二者语义在 9.4 节区分。
 3. `va = PGROUNDDOWN(va)`。
 4. 若 `ismapped(pagetable, va)` 为真，返回 0；已映射页上的权限错误不能转化为 lazy 分配。
 5. `kalloc()` 一页，OOM 返回 0。

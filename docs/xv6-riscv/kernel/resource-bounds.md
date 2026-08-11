@@ -433,6 +433,8 @@ xv6 没有 `lseek`，但 open file description 的 `f->off` 不会随另一个 f
 
 这仍不是对任意内核状态的无条件证明。`readi()` 会调用 `bmap()`；若损坏 inode 在 `[0,size)` 内含 hole，未建立事务的 read 甚至可能调用 `log_write()`。`log_write()` 只检查全局 `outstanding>=1`，不验证当前线程拥有预留；若恰有另一个区间 outstanding，异常 read 可把未预留更新塞进其 group。类似地，若允许第 6 条所述的并发 orphan 回收，多 bitmap 布局中的额外 `I+A(F)` 也可能使表中 rollback/路径操作超过表内数值；这正是需要重新建模调用交错的边界，而不是当前静态集合表的反例。
 
+损坏 executable 是另一个不同的 hole 入口：`kexec()` 已经为路径和 inode 读取调用 `begin_op()`，所以它不会借用别人的区间；但这次准入只预留 `MAXOPBLOCKS=10`。ELF/segment 读取可跨越许多 hole，每个新零数据块都会增加 unique log item，bitmap 和间接块还要占项，`readi()` 又不把新直接地址 `iupdate()` 回 dinode。于是 malformed sparse inode 可以在一次“读取区间”中超过 10，最终触发日志或 buffer cache panic，并留下已登记分配副作用。表中的“正常 exec 不登记”必须保留 dense、良构 inode 前提。
+
 ## 12. `MAXOPBLOCKS` 与 `LOGBLOCKS` 的条件证明
 
 令：
@@ -568,6 +570,7 @@ NBUF >= max over execution points (pinned slots + all simultaneously live non-pi
 - superblock 与内核编译常量、区域范围和 `nlog>=LOGBLOCKS+1` 一致；
 - 扩大到多 bitmap 文件系统后 `itrunc/unlink` 仍不超过 10；
 - 不能保证损坏的 sparse inode 或未来允许 `off > ip->size` 的实现中，任意 file offset/布局下 3072 字节 chunk 都不超过 10；当前 `writei()` 的入口检查和连续写约束只支持前述合法 dense 情形的 10 项推导；
+- 不能保证 `kexec()` 在损坏 sparse executable 上仍是零日志项或不超过自己的 10 项预留；事务边界存在不等于分配型 `readi()` 的最坏集合已经受控；
 - 每个线程只能消费自己的 `begin_op()` 预留，或单区间实际不超过 10；
 - 日志达到 30 项后重复登记已有 block 不 panic；
 - `NBUF==LOGBLOCKS` 足以应对日志满容量、并发 reader 以及所有临时 buffer；

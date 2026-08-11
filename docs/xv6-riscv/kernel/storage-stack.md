@@ -231,7 +231,7 @@ max = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE
 
 内核 RAM 恒等映射使这些内核指针数值也可作为设备 DMA 物理地址。移植到非恒等映射或有 IOMMU 的环境时不能沿用该假设。
 
-第 2 步不是合规的 VirtIO 1.1 reset 序列：规范要求写 0 后等待 `DeviceStatus` 实际读回 0，才能设置 `ACKNOWLEDGE`。当前 QEMU 同步完成 reset，所以现有代码看似可用；允许异步完成 reset 的设备上，立即覆盖 status 可能在 reset 尚未完成时开始初始化。这里是明确的协议差距，不应弱化成“少一次诊断读取”。
+第 2 步没有确认 reset 已在设置 `ACKNOWLEDGE` 前完成。VirtIO 1.1 的通用初始化顺序要求先 reset、再设置 `ACKNOWLEDGE`，MMIO 4.2 规定写 0 触发 reset；但“写 0 后必须等待 `DeviceStatus` 读回 0”这一明确 MUST 位于 PCI 4.1.4.3.2，并不是 1.1 对 MMIO transport 的通用条款，所以不能把当前代码定性为违反该 MMIO MUST。实现仍然缺少 reset-completion 的可观测步骤，并实际假定 reset 的效果在下一次状态写前已经生效；当前 QEMU 同步满足这一假定，异步完成 reset 的实现则需要额外等待/确认路径。
 
 `kernel/virtio.h` 没有定义 `DeviceFeaturesSel/DriverFeaturesSel`，初始化也没有显式选择 feature page。当前 QEMU 在 reset 后让 selector 为 0，才使代码碰到低 32 位；一般合规设备的所选 word 不能据此假定。代码更没有显式读取/写入高 32 位，因此既没从支持白名单构造 feature 集，也没有读取并接受 bit 32 的 `VIRTIO_F_VERSION_1`。严格的 modern 驱动必须协商该位，规范设备可以拒绝当前结果；QEMU 当前组合接受这种简化，不构成通用兼容性保证。失败时驱动直接 panic，也不会给设备设置 `FAILED` status。
 
@@ -274,6 +274,8 @@ queue size 是 `NUM=8`。现代 MMIO 分别接收 descriptor table、driver area
 ```text
 sector = b->blockno * (BSIZE / 512)
 ```
+
+这里还有一个由 C 类型决定的边界：`b->blockno` 是 32 位 `uint`，常量因子当前为整型 2，所以乘法先按 32 位无符号算术完成，再扩展赋给 64 位 `sector`。`blockno >= 2^31` 时结果会在扩展前按模 `2^32` 回绕，并映射到较低 sector；把左值写成 `uint64` 并不会让乘法自动变成 64 位。当前可信镜像只有 2000 个 block，不触及该范围，但扩大 block-number 空间时必须先把操作数显式提升到 64 位，并同时增加 capacity/range 校验。
 
 随后在 `disk.vdisk_lock` 下申请三个不要求连续的 descriptor：
 
@@ -351,7 +353,7 @@ uservec   -> usertrap   -> devintr -> plic_claim
 - VirtIO interrupt status 的低两位都会被 ACK，但实现只消费 used ring；configuration-change 中断没有独立重配置流程。
 - 磁盘 block/inode 耗尽：文件系统尽量返回短写或 `-1`，日志协议仍应保持结构一致；相关路径并非完整 POSIX 语义。
 - 设备丢失中断：等待请求永久睡眠；没有轮询 fallback/watchdog。
-- 日志 header 损坏或 `n` 越界：`read_head()` 在复制数组前不检查 `0 <= n <= LOGBLOCKS`，可能先覆盖内存，再读取/写入任意 block；教学实现假定 header 写入完整且镜像可信。
+- 日志 header 损坏：`read_head()` 不验证 `n` 和目标块。`n > LOGBLOCKS` 时，源端 `lh->block[i]` 和目标端 `log.lh.block[i]` 都立即越过声明的 30 项数组；目标端从第一项越界写起就已破坏内核内存，`n` 再大到超过磁盘块可容纳的整数数目时，源端还会越过整个 1024 字节 buffer。随后安装循环还可能读取/写入任意 block。`1 <= n <= LOGBLOCKS` 也可用恶意目标制造越界 I/O 或让 log/home buffer 别名自锁。负 `n` 的行为不同：两个 `i < n`/`tail < n` 循环都执行零次，恢复代码随后把 `n` 清零并重写 header，不会走正数越界的数组复制。教学实现对三类情况都不报告可恢复的镜像错误。
 - 日志没有 abort 路径。操作在返回错误前已经 `log_write()` 的局部修改仍会随本批 commit，调用者必须让这些中间状态本身保持文件系统一致。
 
 ## 18. 验证

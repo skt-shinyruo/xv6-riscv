@@ -88,7 +88,9 @@ for each covered block:
 return total
 ```
 
-正好 EOF 返回 0，跨 EOF 截短。`bmap()` 没有“只查询”模式：映射缺失时它会尝试 `balloc()`，而分配路径需要 `log_write()`。普通 read 没有 `begin_op()`，所以正确性依赖正常 inode 的 `[0,size)` 已全部映射；若损坏状态在该范围出现 hole，读路径可能因 `log_write outside of trans` panic，或在磁盘已满时得到 0。不能把这里的 `bmap()` 调用解释为不会修改状态的查询 API。
+正好 EOF 返回 0，跨 EOF 截短。`bmap()` 没有“只查询”模式：映射缺失时它会尝试 `balloc()`，而分配路径需要 `log_write()`。普通 read 没有 `begin_op()`，所以正确性依赖被读 inode 的 `[0,size)` 已全部映射；若该范围出现 hole，读路径可能因 `log_write outside of trans` panic，或在磁盘已满时得到 0。正常 `writei()` 和 `mkfs:iappend()` 建立的 regular file 满足 dense 前提，但 `mkfs` 对 root directory 的特殊 size padding 在原大小恰好块对齐时也会制造尾洞，并非只有任意外部损坏镜像才可能违反它。不能把这里的 `bmap()` 调用解释为不会修改状态的查询 API。
+
+同一个 `readi()` 还被 `kexec()` 用来读 ELF，但那条调用链已经进入 `begin_op()`。损坏 executable 的 hole 因而不会在第一次 `log_write()` 处按“事务外 read”失败，而会真正分配 bitmap/零块/间接项并加入 exec 的日志组；loader 后续失败不回滚这些文件系统副作用，直接地址又可能因没有 `iupdate()` 而泄漏。一次装载跨越的 hole 数也没有被 write 分片限制，可能超过 10-block 预留并在日志或 buffer cache 边界 panic。普通 dense 文件仍只走查询路径，这个差异来自调用上下文和损坏 inode，而不是两套 `readi()` 实现。
 
 ## 7. buffer cache 和磁盘读取
 
@@ -258,7 +260,7 @@ pipe 没有 inode、offset 或日志。512 字节环形区由 `nread/nwrite` 表
 - 所有 write ends 关闭且 empty：read 返回 EOF 0；
 - read ends 全关：write 返回 -1。
 
-`copyin`/`copyout` 按一个字节执行，也可补合法 lazy 页。`piperead()` 若坏目标发生在首字节返回 -1，已有前缀则返回部分字节；`pipewrite()` 的坏源会 break 并返回已经写入的字节数，哪怕是 0。若读端关闭或 writer 被 killed，`pipewrite()` 返回 -1，即使此前已写入部分数据；reader 只在“空且写端仍开”的等待路径检查 killed，有缓存数据时仍可读取。空且写端仍开的零长度 read 也会先进入等待循环。其错误语义与 inode file 不完全相同。
+`copyin`/`copyout` 按一个字节执行，也可补合法 lazy 页。`piperead()` 若坏目标发生在首字节返回 -1，已有前缀则返回部分字节；`pipewrite()` 的坏源会 break 并返回已经写入的字节数，哪怕是 0。若读端关闭或 writer 观察到 killed，`pipewrite()` 返回 -1，即使此前已写入部分数据；reader 只在“空且写端仍开”的等待路径检查 killed，有缓存数据时仍可读取。kill 若落在检查标志后、`sleep()` 取得 `p->lock` 前，目标仍可能睡到对端状态变化或第二次 kill，不能把“有检查”理解为取消没有窗口。空且写端仍开的零长度 read 也会先进入等待循环。其错误语义与 inode file 不完全相同。
 
 pipe 是字节流，不保留 write 边界；缓冲满而睡眠时会释放 `pipe.lock`，多个 writer 的长写可以交错。
 

@@ -41,7 +41,7 @@ int sysinfo(struct sysinfo *out);
 
 ### B. 最小分派链
 
-先让 handler 对合法指针返回全零结构。反汇编生成的 user stub，确认 `a7` 装载新 number，参数仍在 `a0`。检查未知 number 和相邻 syscall 未被覆盖。
+先让 handler 对合法指针返回全零结构。直接检查 `user/usys.pl` 生成的 `user/usys.S`：stub 应只把新 number 装入 `a7`，保留 `a0` 中的用户参数，然后执行 `ecall` 和 `ret`。再检查未知 number 和相邻 syscall 未被覆盖。这里的接口事实可由生成器和生成源码完整核对，不需要把反汇编作为主要证据。
 
 ### C. 模块内计数
 

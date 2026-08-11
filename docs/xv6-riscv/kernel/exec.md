@@ -121,6 +121,8 @@ fetchaddr(uargv + i * 8, &uarg)
 
 `fetchstr()` 使用的 `copyinstr()` 不会调用 `vmfault()`。所以参数字符串或路径若只处于逻辑上已由 `sbrklazy()` 扩展、但还未实际映射的页中，会失败；用户先触碰该页使其映射后才可成功。这是当前实现差异，不能从 `copyin()` 的行为推断所有用户复制函数都会补页。
 
+`fetchstr()` 也不像 `fetchaddr()` 那样检查字符串字节落在 `p->sz` 内；它只依赖 `copyinstr()` 逐页要求 `PTE_V|PTE_U` 并在给定 `max` 内找到 NUL。因此进程缩小 break 后仍保留的最后一个部分页中，位于新 `p->sz` 之后但仍有用户映射的字节，可以继续作为 exec 路径或参数字符串被读取。这里的逻辑大小边界是页粒度映射留下的限制，不能把“字符串不会补 lazy 页”误写成“字符串一定逐字节受 `p->sz` 限制”。
+
 ## 5. 第二阶段：打开 ELF 并创建临时页表
 
 `kexec()` 首先取得当前进程 `p = myproc()`，但不会立即修改 `p->pagetable`。其顺序是：
@@ -140,6 +142,8 @@ end_op()
 ```
 
 `begin_op()`/`end_op()` 包围路径解析、inode 引用和文件读取阶段。虽然正常 `exec` 只读取文件，`namei()`/`iput()` 所在的文件系统协议要求操作处于事务范围内；若文件在取得引用后被 unlink，最后一个 inode 引用的释放还可能截断并回收它。`begin_op()` 只在短时间持有日志 spinlock，记录 outstanding 操作后便释放，并非整个装载期间一直持有该 spinlock。`end_op()` 若结束的是最后一个 outstanding operation，则可能同步提交共享日志中的已有修改，因此也可能睡眠。
+
+事务边界还暴露了损坏 inode 的另一条副作用路径。`readi()` 使用“缺块就分配”的 `bmap()`；若可执行 inode 的 `[0,size)` 内含洞，ELF header、program header 或 segment 读取会在 `kexec()` 自己的 outstanding 区间内调用 `balloc()`，而不是像事务外普通 read 那样立刻触发 `log_write outside of trans`。bitmap、新零块以及已有间接块中的新条目可以加入日志组，即使 loader 稍后返回 `-1`；直接地址和新建间接块地址又没有由 `readi()` 调用 `iupdate()`，可能只留在内存 inode 并造成已登记块泄漏。洞足够多时，该“读取”还能超过 `MAXOPBLOCKS` 预留，最终在日志或 buffer cache 边界 panic。因此两阶段 exec 只回滚新用户页表，不回滚损坏文件读取已经产生的文件系统变化。当前 `mkfs:iappend()` 为每个 regular executable 连续建立 `[0,size)` 映射，故仓库构建出的程序不进入这条路径；`mkfs` 对 root directory 的特殊 size padding 另有恰好块对齐时制造尾洞的边界，不能据此笼统声称它生成的所有 inode 都 dense。
 
 `namei()` 返回带引用但未锁定的 inode。`ilock(ip)` 获取 inode sleeplock，此后 ELF header、所有 program header 和所有段数据都在同一 inode 锁保护下读取，避免装载期间与对该 inode 的普通读写交错。磁盘 I/O 可能睡眠，因此整个函数必须运行在普通进程上下文，不能在中断上下文调用。
 
@@ -180,7 +184,7 @@ loader 先要求 `readi()` 恰好返回 `sizeof(struct elfhdr)`，然后只比�
 | `filesz` | 从文件复制的字节数 |
 | `memsz` | 段在内存中的总字节数 |
 
-`paddr` 和 `align` 被忽略。
+`paddr` 和 `align` 被忽略。还有一处具体的窄化链：循环局部变量 `off` 是 `int`，初始化 `off = elf.phoff` 时会把 64 位无符号值转换成 `int`；每轮 `off += sizeof(ph)` 的结果也要再转换回 `int`，而 `readi()` 又把它转换成 32 位 `uint`。超出 `int` 范围的前两次转换是实现定义行为，不是 loader 显式拒绝；在当前常见补码工具链上通常表现为截取低位并可能把负 `int` 再按模转换为大 `uint`。恶意 `phoff/phnum` 因而可能从错误偏移短读、别名到别处，或在后续内部前置条件处失败，不能假定总会得到一个整洁的范围错误。
 
 每个 `PT_LOAD` 项只执行以下显式校验：
 
@@ -430,6 +434,8 @@ trapframe 物理页属于进程本身而不是旧用户映像，新页表已把�
 - 打开文件和 `cwd` 无论成功失败都不变；
 - 临时页表、临时用户页、inode 引用、inode 锁和 FS operation 均有唯一清理路径；
 - 普通 `sys_exec()` 路径返回给旧程序的错误只有 `-1`，不提供区分“文件不存在”“坏 ELF”或“内存不足”的 errno。若进程同时已被 kill，`usertrap()` 会在系统调用后退出而不返回用户态；首进程直接调用失败则由 `forkret()` panic。
+
+这些不变量不包含“可执行文件或日志状态不变”。良构 dense inode 的装载确实只是读取；损坏 sparse inode 触发的 `bmap()` 分配则可在同一个 `begin_op()` 内登记并最终提交，且 `bad` 分支没有相反的块释放或 inode 更新来回滚它。
 
 两阶段替换的代价是峰值内存：旧地址空间必须一直保留，同时存在新地址空间和最多 31 个参数暂存页。系统可能在“释放旧映像后本可装得下”的情况下仍让 `exec` 返回 `-1`；这换取了失败时可继续运行旧程序的语义。
 

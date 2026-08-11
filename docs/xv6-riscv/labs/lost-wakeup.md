@@ -49,7 +49,7 @@ gate 至少包含：唯一 id、generation、armed/arrived/released状态和 tra
 4. 再释放 consumer发布睡眠；
 5. 观察目标稳定处于 `SLEEPING,chan=expected`，同时 `ready==1`。
 
-gate实现本身不能复用被测试的同一条件协议，也不能在持 `p->lock` 时睡眠。可用测试专用 spin polling加宿主/第二进程协调，但要有有界 watchdog和内存序明确的原子状态。
+gate 实现本身不能复用被测试的同一条件协议，也不能在持 `p->lock` 时睡眠。宿主调试器或独立、已知正确且使用不同 channel/lock 的等待路径可以在 `CPUS=1` 协调；若 gate 只是共享原子变量上的自旋，控制者必须在另一 hart 上运行，因此必须显式要求 `CPUS>=2`。无论哪种方式都要有有界 watchdog 和明确的内存序，不能把“自旋 gate 在单 hart 也能推进”写成普遍事实。
 
 ## 4. 分阶段任务
 
@@ -63,7 +63,7 @@ gate实现本身不能复用被测试的同一条件协议，也不能在持 `p-
 
 ### C. 恢复正确顺序
 
-关闭 mutation，保持完全相同的控制步骤。因为 producer无法穿过正确交接窗口，控制器应观察到不同但合法的阻塞点，最终 consumer消费条件并退出。
+关闭 mutation，复用同一组对象、checkpoint 和目标交错，但不能机械照搬错误版本中“等待 `WAKE_DONE` 后才释放 consumer”这一步。正确 `sleep()` 先取得 `p->lock`、再释放 `lk`；producer 取得 `lk` 后即使写入谓词，也会在 `wakeup()` 取 `p->lock` 时等待，直到 consumer 发布 `SLEEPING` 并切回 scheduler。控制器应先确认 producer 阻塞在 `lk` 或目标 `p->lock`，再允许 consumer 继续，并最终观察 `FI_SLEEP_PUBLISHED < FI_WAKE_MATCH`、consumer 重新检查到真谓词。若仍坚持先等 `WAKE_DONE`，测试控制器自己会制造死锁，而不是证明正确实现失败。
 
 ### D. 生产者 mutation
 
@@ -71,8 +71,8 @@ gate实现本身不能复用被测试的同一条件协议，也不能在持 `p-
 
 ## 5. 验收条件
 
-- 错误版本在 100% 运行中到达可解释的 `ready=1 && target SLEEPING` 状态，不依赖延时或 CPU 数；
-- 正确版本在相同 gate sequence 下每次完成，无 missed event；
+- 错误版本在 100% 运行中到达可解释的 `ready=1 && target SLEEPING` 状态，不依赖延时；若使用原子自旋 gate，实验配置必须满足 `CPUS>=2`，否则改用宿主/独立等待控制面；
+- 正确版本复用相同 checkpoint/目标交错，并按正确协议预期的 producer 阻塞点推进；每次完成且无 missed event；
 - trace证明 consumer持 `p->lock` 到 scheduler接管，producer的 `wakeup` 也通过同一 `p->lock` 观察状态；
 - `while` 循环能容忍无条件/spurious wakeup，不能改成单次 `if`；
 - 测试结束通过受控最终 wake/kill回收目标，所有 proc槽和锁回到基线；

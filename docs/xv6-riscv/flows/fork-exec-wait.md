@@ -159,6 +159,8 @@ exec(ecmd->argv[0], ecmd->argv);
 
 重定向会在此前关闭/重新打开 fd，pipe 会再创建端点进程。无论拓扑多复杂，最终某个进程调用 exec；已经建立的 fd 引用由 exec 保留，所以管道和重定向自然进入新程序。
 
+若这个 `exec()` 失败，`runcmd(EXEC)` 打印错误后从 switch 跳到函数末尾的 `exit(0)`，并不会报告非零失败状态。已建立的 fd 会由 `kexit()` 关闭，所以 pipe EOF/破管道仍能推进；上层 shell 和 pipeline 管理进程又忽略 `wait()` 取得的状态，当前 shell 不把装载失败传播成命令状态失败。
+
 ## 9. `sys_exec()` 先复制不可信 argv
 
 系统调用层不能在装载过程中长期信任旧用户地址空间。`kernel/sysfile.c:sys_exec()`：
@@ -171,6 +173,8 @@ exec(ecmd->argv[0], ecmd->argv);
 6. 无论成功失败，释放所有 argv 内核页。
 
 这保证 `kexec()` 替换旧页表后仍能访问参数内容。坏指针、字符串不终止或内存不足都在页表提交前返回 -1，但“旧映像未被新映像替换”不等于没有任何可观察副作用：`fetchaddr()` 使用的 `copyin()` 会为位于 `p->sz` 内的合法 lazy hole 调用 `vmfault()`，所以读取用户 `argv[]` 指针槽时可能给旧页表物化并清零一页。路径和参数字符串走 `copyinstr()`，它不会补 lazy 页。exec 随后即使失败，旧页表身份、逻辑地址范围以及未被 loader 提交改写的 `sp/a1` 仍保留，刚物化的旧 lazy 页也会保留到以后退出或再次 exec；但这仍是一次正常返回的系统调用，trap 入口已经把 `epc` 推进到 `ecall` 后一条指令，分派层还会把 `a0` 写成 -1，不能概括成“全部寄存器不变”。
+
+`copyinstr()` 也不检查字符串逐字节位于 `p->sz` 内。缩小 break 后若最后一个部分页仍映射，位于新 break 之后、但仍在该 `PTE_U` 页中的 NUL 字符串可被当作 path 或 argument 读取；它既不是 lazy hole，也不会触发 `vmfault()`。只有 `argv[]` 指针槽的 `fetchaddr()` 额外强制整个 8 字节范围不超过 `p->sz`。
 
 `sys_exec()` 的 31 参数上界还遮住了 `kexec()` 自身的一个 off-by-one 前置条件。`kexec()` 的 `ustack[MAXARG]` 循环只在处理非空参数的循环体内检查 `argc >= MAXARG`，终止指针则在循环后执行 `ustack[argc] = 0`。内部调用者若直接传入恰好 `MAXARG` 个非空参数再加 NULL，会越界写 `ustack[MAXARG]`；系统调用编组层不会构造这种输入，当前 `forkret()` 也只传一个 `/init` 参数，但任何新增的内核调用者都必须把非空参数限制为 `MAXARG-1`。
 
@@ -186,6 +190,10 @@ exec(ecmd->argv[0], ecmd->argv);
 它创建全新页表，而不是先破坏旧表。`uvmalloc()` 为 segment 申请页并按 ELF flags 映射，`loadseg()` 从 inode 读入文件字节；`loadseg()` 的 `offset/sz` 形参是 32 位 `uint`，而 ELF header 的 `off/filesz` 是 64 位，所以这条“完整读取”只适用于当前小型文件系统和 32 位范围内的正常构建产物，不能外推为任意 ELF64 大文件支持。`memsz - filesz` 部分因新页清零形成 BSS。
 
 文件数据读完即解锁/释放 inode并 `end_op()`。后续用户栈构建不再依赖文件系统。
+
+正常 executable 的 `[0,size)` 是 dense 的，因此这些 `readi()` 只查询块。损坏 sparse inode 会改变失败模型：外围事务允许 `readi()->bmap()` 为 hole 分配并登记 bitmap、新零块和间接项；loader 即使返回 -1 也不撤销这些更新，直接地址还可能因没有 `iupdate()` 而形成泄漏。装载可跨很多 hole，没有 filewrite 的 3072-byte 分片，因而还能超过 `MAXOPBLOCKS` 并在日志/cache 边界 panic。两阶段替换回滚的是临时用户页表，不是这类异常磁盘副作用。
+
+program-header 游标也不是完整 64 位范围检查：`elf.phoff` 先转换给本地 `int off`，每轮加 `sizeof(ph)` 后再转换回 `int`，传给 `readi()` 时又转成 32 位 `uint`。超出 `int` 范围的转换是实现定义行为，可能别名错误文件偏移或短读，不能假定恶意 `phoff` 总会被明确拒绝。
 
 这些不是完整的敌对 ELF 校验。当前代码没有验证段按虚拟地址递增且互不重叠、段终点避开 `MAXVA/TRAPFRAME`，也不验证 `elf.entry` 确实落在可执行用户页。本文的正常流程针对本仓库 linker 生成并打入 `fs.img` 的 ELF；异常布局可能在现有内部前置条件处 panic，或者 exec 先成功、随后在首次取指时被 kill，不能一概视为会干净返回 -1。完整限制见 [`exec`](../kernel/exec.md)。
 
@@ -262,7 +270,7 @@ return pid
 
 `freeproc()` 才释放 trapframe、用户页表/物理页并把状态改为 `UNUSED`。因此 ZOMBIE 是“运行资源已关闭但身份/地址空间尚待父回收”的状态。页表回收会逐页扫描 `[0, child->sz)`；child 即使只有少量物化 lazy 页，成功 wait 仍可能在持有 `wait_lock` 和 child lock 时花费 `O(child->sz/PGSIZE)`。
 
-若 status 用户指针无效，copyout 失败后 wait 返回 -1，但不调用 `freeproc()`；zombie 保留，父进程可用合法指针或 0 再试。这避免因无法交付状态而永久丢失 child。
+若 status 用户指针无效，copyout 失败后 wait 返回 -1，但不调用 `freeproc()`；zombie 保留，父进程可用合法指针或 0 再试。这避免因无法交付状态而永久丢失 child，但 4 字节状态跨页时可能已写出前 1 至 3 字节，合法 lazy 目标还可能已经物化页。重试保留的是 child 身份，不会撤销父用户缓冲区或页表的部分副作用。
 
 扫描 zombie 的动作先于 `killed(p)` 判断。已经被 kill 的父进程若扫描到 zombie，`kwait()` 仍会先尝试复制状态并回收一个 child；成功返回内核系统调用层后，`usertrap()` 的统一 killed 检查会让父进程 `kexit(-1)`，所以用户态通常看不到这个 wait 返回值。只有完整扫描没有发现 zombie 时，`kwait()` 才根据“没有 child”或“父进程已 killed”返回 -1。
 
@@ -277,6 +285,8 @@ sleep(p, &wait_lock);
 `sleep` 在设置 SLEEPING/channel 时以 `p->lock` 接替条件锁，child 的 `wakeup(parent)` 扫描时也获取相同进程锁，因此“检查无 zombie”与“进入睡眠”之间不会丢失退出通知。醒来后 sleep 重新取得 `wait_lock`，循环再次扫描条件，而不是假设某个特定 child 已退出。
 
 若完整扫描没有 zombie：没有任何 child 时立即返回 -1；仍有 child 但父本身 killed 时也返回 -1；否则才睡眠。接口不能指定 pid，多个 child 时回收 proc table 扫描顺序中第一个 zombie，而不是按退出时间排序。
+
+child 退出通知受 `wait_lock` 保护，所以不会丢；kill 取消却不取得该锁。若 `kkill()` 恰好发生在 `kwait()` 的 `killed(p)` 返回 0 之后、`sleep()` 取得 `p->lock` 之前，它只看到父进程仍为 `RUNNING` 并置位，父随后仍可发布 `SLEEPING`。没有新的 child 状态变化或第二次 kill 时，这次 wait 可以继续睡眠；醒来重扫后才会根据 killed 返回 -1。
 
 ## 17. orphan 路径
 
@@ -303,14 +313,14 @@ shell 后台命令常走这条路：临时 command runner 派生后台 child 后
 |---|---|---|
 | 无 proc/trapframe/page | fork 返回 -1 | 无半发布 child、无页泄漏 |
 | uvmcopy 中途失败 | fork 返回 -1 | 已复制 child 页全部释放 |
-| 路径不存在、ELF magic/已实现约束失败或短读 | exec 返回 -1 | 不提交新映像的 entry PC、sp 或 a1，fd/cwd 不变；正常 syscall 返回仍已推进旧 `epc` 并把 a0 写成 -1，导入 argv 指针时物化的旧 lazy 页不会回滚 |
+| 路径不存在、ELF magic/已实现约束失败或短读 | exec 返回 -1 | 不提交新映像的 entry PC、sp 或 a1，fd/cwd 不变；正常 syscall 返回仍已推进旧 `epc` 并把 a0 写成 -1，导入 argv 指针时物化的旧 lazy 页不会回滚；损坏 sparse inode 的块分配也不在 VM 回滚范围内 |
 | exec 新页/栈/argv不足 | exec 返回 -1 | 临时页表完整回滚 |
 | 内核直接向 `kexec()` 传 32 个非空参数 | 未定义行为风险 | `ustack[32] = 0` 越界；当前 `sys_exec()` 上界和 `/init` 调用不会触发 |
 | ELF 通过现有检查但布局/entry 异常 | 可能稍后被 kill，部分内部前置条件还可能 panic | loader 不是面向敌对 ELF 的完整验证器 |
-| `userinit()` 中 `allocproc()` 返回 0 | 内核启动失败 | 当前代码随即解引用空 `p`，没有回滚或错误返回 |
+| `userinit()` 中 `allocproc()` 返回 0 | 空指针解引用使 C 语义进入 UB；当前 GCC 的 `kernel/kernel` 对低地址 336 执行 store，因而进入通用 `panic("kerneltrap")` | trap 向量此时已经安装且低地址未映射；没有回滚、错误返回或明确 OOM 诊断，其他工具链不保证相同精确结果 |
 | `userinit()` 获取 root 时 inode cache 无空槽 | 内核 `panic("iget: no inodes")` | `namei("/")` 的该分支不会返回 0；正常冷启动的空 table 避免此错误 |
 | 首次 `kexec("/init")` 失败 | 内核 `panic("exec")` | 不返回空地址空间，也没有备用 init |
-| wait status 地址坏 | wait 返回 -1 | zombie 尚未回收，可重试 |
+| wait status 地址坏 | wait 返回 -1 | zombie 尚未回收，可重试；已写状态前缀和已补 lazy 页保留 |
 | parent 被 kill 且已有 zombie | wait 先回收一个 zombie，随后 trap 路径 exit | killed 检查位于扫描之后；其余 children reparent 给 init |
 | parent 被 kill 且没有 zombie | wait 返回 -1，随后 trap 路径 exit | children reparent 给 init |
 | 用户调用 `kill(0)` | 可能错误返回成功并污染一个 UNUSED 槽 | 后续新进程继承 `killed == 1`；`allocproc()` 不主动清零 |
@@ -338,7 +348,7 @@ usertests forktest
 usertests -q
 ```
 
-`exectest` 覆盖正常 ELF 替换，`bigargtest` 覆盖参数页和栈边界，`exitwait/reparent/reparent2` 覆盖退出、回收和锁顺序，`forktest` 覆盖资源耗尽后的回滚。`usertests -q` 还会比较测试前后空闲页数，能发现 fork/exec 失败路径中的物理页泄漏。
+`exectest` 覆盖正常 ELF 替换，`bigargtest` 覆盖参数页和栈边界，`exitwait/reparent/reparent2` 覆盖退出、回收和锁顺序，`forktest` 覆盖资源耗尽后的回滚。`usertests -q` 还会比较整套 quick tests 开始与结束时的空闲页数，因此能发现最终留下的净物理页损失；它不在每条 fork/exec 失败路径后单独计数，不能定位泄漏来源，也不能证明每个回滚分支都完整，前后相抵的状态变化还可能被相同总数掩盖。
 
 GDB 可设置以下断点：
 

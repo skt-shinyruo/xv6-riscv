@@ -81,8 +81,9 @@ shell 恢复后，`sleep()` 先清 `chan`，释放 `p->lock`，重新取得 `con
 ## 6. Ctrl-D、kill 与失败副作用
 
 - 若 Ctrl-D 是本次 read 的第一个字节，返回 0 表示 EOF；若此前已复制普通字节，则 `r--` 留住 Ctrl-D，让下一次 read 返回 0。
-- `kkill()` 可把等待 console 的进程无条件改为 `RUNNABLE`。恢复后循环先检查 killed 并返回 `-1`，随后 `usertrap()` 的最终 killed 检查令普通进程 `kexit(-1)`。
+- 若 reader 已发布 `SLEEPING`，`kkill()` 会把它无条件改为 `RUNNABLE`；恢复后循环先检查 killed 并返回 `-1`，随后 `usertrap()` 的最终 killed 检查令普通进程 `kexit(-1)`。但 kill 不持 `cons.lock`：它若恰在 reader 检查 killed 后、`sleep()` 取得 `p->lock` 前到达，只会给仍为 `RUNNING` 的进程置位，reader 随后仍可能睡到下一次输入或第二次 kill。
 - `copyout` 失败发生在 `r++` 之后，当前字符已从全局输入流消费；返回短计数或 0，不回滚 `r`。合法 lazy 用户缓冲可能由 `copyout` 补页，OOM 则留下这一部分副作用。
+- `n==0` 时外层 `while (n>0)` 根本不进入，立即返回 0，不等待输入也不检查目标地址；负长度同样因循环条件为假返回 0。这个边界与空 pipe 的零长度 read 不同，后者当前会先进入“空且写端仍开”的等待循环。
 - 满缓冲会强制发布没有 newline 的 128 字节片段；调用者不能假定每次 read 都含完整终止行。
 - 同步回显使用 polling 输出路径，可能延长持有 `cons.lock` 和中断 handler 的时间。
 

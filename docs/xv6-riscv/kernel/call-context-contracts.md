@@ -67,6 +67,8 @@ trap 入口由硬件清除 `sstatus.SIE`。因此 UART/VirtIO handler 的第一�
 
 `allocproc()` 不重新初始化所有标量字段；正常复用依赖 `freeproc()`，而 `kill(0)` 可以污染 `UNUSED` 槽的 `killed`。因此“返回 `USED`”不等于所有字段都有构造函数式初值，详见[进程与调度](processes-and-scheduling.md)。
 
+`kexec()` 自建日志区间不等于其所有失败都只有地址空间副作用。良构 executable 的 `[0,size)` 是 dense 的，`readi()` 只查询现有映射；损坏 inode 含 hole 时，同一 `readi()->bmap()` 会在这个合法 outstanding 区间内分配并登记磁盘块。该异常路径既可能超过 `MAXOPBLOCKS`，又没有 `readi()` 的 `iupdate()`/释放回滚，因此“新页表提交前私有”只约束 VM 所有权，不能推广为文件系统状态也完全回滚。
+
 进程表还有两个刻意绕开普通运行期锁规则的入口：CPU 0 在任何槽可运行前由 `procinit()` 无锁写初始 `state=UNUSED`，而 `procdump()` 为避免死锁而无锁读取状态，仅提供可能不一致的诊断快照。它们不是新增运行期无锁访问的先例。
 
 ## 5. 页表、用户拷贝与物理页

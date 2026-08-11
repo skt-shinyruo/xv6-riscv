@@ -13,7 +13,7 @@ MAXVA
 
 每个进程有独立物理 trapframe，但虚拟地址相同。用户 PTE 没有 `PTE_U`，S-mode 在用户页表下可访问；内核页表通过物理内存恒等映射访问同一页。trampoline 必须在页内，链接脚本会对尺寸做断言。
 
-`struct trapframe` 共 288 字节：前 40 字节是内核入口元数据，40..280 是 31 个用户 GPR；用户 PC 单独保存在偏移 24 的 `epc`，由 C 读写 `sepc`。物理分配仍是一整页，但页内 288 字节结构和 4096 字节分配单位不能混为一谈。
+`struct trapframe` 共 288 字节：偏移 0、8、16、32 是内核入口所需的 `kernel_satp/kernel_sp/kernel_trap/kernel_hartid`，偏移 24 的 `epc` 是用户 continuation 的 PC，40..280 是 31 个非零用户 GPR。`epc` 由 C 在 `sepc` 与内存之间搬运，不由汇编的 GPR 保存表处理。物理分配仍是一整页，但页内 288 字节结构和 4096 字节分配单位不能混为一谈。
 
 ## 2. `uservec` 入口状态
 
@@ -131,7 +131,7 @@ sd   t0, 112(a0)
 
 ## 6. C handler 与返回准备
 
-`usertrap()` 立即把 `stvec` 改为 `kernelvec`，保存 `sepc`，然后按原因处理 syscall、设备中断或 lazy page fault。系统调用将 `epc += 4`；可修复页故障不推进 PC，以便重试原指令。
+`usertrap()` 立即把 `stvec` 改为 `kernelvec`，保存 `sepc`，然后按原因处理 syscall、设备中断或 lazy page fault。系统调用将 `epc += 4`；只有 load/store page fault 会尝试 `vmfault()`，成功时不推进 PC，以便重试原指令。当前 `vmfault(..., read)` 没有使用 `read` 参数，load 与 store 都物化为 `PTE_R|PTE_W|PTE_U` 的非执行页；instruction page fault 不进入该分支，最终设置 `killed`。分配失败、地址超出 `p->sz` 或页已映射也使 `vmfault()` 返回 0，并沿同一 kill 路径退出。
 
 返回前 `prepare_return()`：
 
@@ -183,11 +183,11 @@ sd   t0, 112(a0)
 | `scause` | 旧残留 | 本次原因 | C 在安全点读取；之后可被嵌套 trap 覆盖 | 残留，不恢复 | 残留 | 残留 |
 | `stval` | 旧残留 | 本次异常值或平台定义值 | fault 路径读取；之后可被嵌套 trap 覆盖 | 残留，不恢复 | 残留 | 残留 |
 | `stvec` | `uservec` | 不变 | 进入 C 后立即改 `kernelvec` | 改回 `uservec` | `uservec` | `uservec`，下次入 C 再改 |
-| `sscratch` | 无稳定 ABI | 硬件不改 | 用户 `a0`，软件不再依赖 | 同一残留 | 同一残留 | 无稳定 ABI；下次 trap 覆盖 |
+| `sscratch` | 无稳定 ABI | 硬件不改 | 保存入口 hart 的用户 `a0`，随后软件不再依赖 | 若处理期间迁移，则是恢复 hart 的残留 | 保留恢复 hart 的残留 | 无稳定 ABI；下次 trap 覆盖 |
 | `satp` | 用户页表 | 用户页表 | 内核页表 | 内核页表 | 用户页表 | 用户页表 |
 | `sie/sip` | 按设备/计时器状态 | 类别/挂起位不由入口自动清除 | handler/设备可改变 `sip` 原因 | 保持系统配置 | 保持 | 保持；投递按特权规则判断 |
 
-`sfence.vma` 不写上述 CSR 值，只约束本 hart 地址转换观察；`scause/stval` 没有像 `sepc` 那样的保存/恢复承诺。
+`sfence.vma` 不写上述 CSR 值，只约束本 hart 地址转换观察；`scause/stval/sscratch` 没有像 `sepc` 那样的保存/恢复承诺。用户 trap 处理可以在系统调用睡眠或 timer `yield()` 时迁移，所以表中“残留”可能来自另一个 hart，不能理解为入口值物理留存到返回。
 
 ## 9. 完整 happens-before 链
 

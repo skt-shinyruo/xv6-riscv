@@ -64,7 +64,9 @@ int block[LOGBLOCKS];
 - `fileclose()`/exit 释放最后 inode 引用；
 - 启动 `ireclaim()` 回收每个 orphan inode。
 
-纯普通文件 read 不建立事务，因为正常 `[0,size)` 不会分配块。这个选择依赖文件没有洞：`readi()` 使用会分配的 `bmap()`，损坏镜像若在 size 内出现 0 块地址，普通 `fileread()` 会走到 `balloc()`。没有其他 outstanding 区间时，第一次 `log_write()` 会因全局计数为 0 而 panic；若恰有别的区间，`log_write()` 不检查线程归属，该读可能无预留地把分配塞进对方 group；磁盘满时则以短读退出。`readi()` 又不负责 `iupdate()`，新 inode 地址可能不持久化并泄漏已登记块。当前代码不把这些情况当作可恢复 I/O 错误或稀疏文件。任何正常情况下可能调用 `log_write()` 或让 `iput()` 进入 `itrunc()` 的调用链都必须在 transaction 内。
+纯普通文件 read 不建立事务，因为预期的 `[0,size)` 不会分配块。这个选择依赖文件没有洞：`readi()` 使用会分配的 `bmap()`，inode 若在 size 内出现 0 块地址，普通 `fileread()` 会走到 `balloc()`。没有其他 outstanding 区间时，第一次 `log_write()` 会因全局计数为 0 而 panic；若恰有别的区间，`log_write()` 不检查线程归属，该读可能无预留地把分配塞进对方 group；磁盘满时则以短读退出。`readi()` 又不负责 `iupdate()`，新 inode 地址可能不持久化并泄漏已登记块。正常 regular file 写入是 dense 的，但 `mkfs` 的 root size padding 在原目录大小恰好块对齐时也能留下一个尾洞，所以这不只是任意损坏镜像的假设边界。当前代码不把这些情况当作可恢复 I/O 错误或稀疏文件。任何正常情况下可能调用 `log_write()` 或让 `iput()` 进入 `itrunc()` 的调用链都必须在 transaction 内。
+
+`kexec()` 展示了相反但同样危险的情况：它已经拥有自己的区间，损坏 executable 中的 hole 因此可以合法越过 `log_write()` 的全局 outstanding 检查并加入当前 group。事务存在只解决“能否登记”，不保证这次读取的分配有回滚或符合 10-block 上界；跨很多 ELF segment hole 时仍可超额并 panic，直接 inode 地址也没有 `readi()` 的 `iupdate()` 保证。正常 exec 依赖 dense inode 才是零日志项读取。
 
 `log_write()` 会检查 `log.outstanding >= 1`，违反时 panic `log_write outside of trans`，把漏掉边界暴露为内核错误。
 
@@ -221,6 +223,8 @@ recovering tail I dst BLOCK
 ```
 
 恢复时没有对应 pinned home buffers，因为这是全新启动，所以 `install_trans(1)` 不调用 bunpin。
+
+启动代码完全信任 header。若磁盘 `n < 0`，`read_head()` 的复制循环和 `install_trans()` 的安装循环都执行零次，随后 recovery 把 header 清零；它不会走数组负下标。若 `n > LOGBLOCKS`，`read_head()` 会立即越过源、目标两边声明的 30 项数组并从目标端破坏内核内存；只有当 `n` 继续大到超出一个磁盘块能容纳的整数数目时，源读取才越过整个 1024 字节 buffer。即使 `1 <= n <= LOGBLOCKS`，未经范围检查的目标 block 也可能造成任意位置覆盖，或让 log block 与 home block 是同一 buffer 而递归等待 sleeplock。三者都说明这是可信镜像假设，不能统称为一个相同的“n 越界”执行路径。
 
 ## 16. recovery 必须先于 orphan reclaim
 
