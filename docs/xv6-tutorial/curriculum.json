@@ -1,0 +1,416 @@
+{
+  "schema_version": 1,
+  "release": {
+    "version": "0.1.0",
+    "status": "draft",
+    "baseline_commit": "e6fc75076de152c5446f2c6be9bb80b848e7cc5d",
+    "coverage_complete": false,
+    "compatibility": "This draft teaches the pinned baseline. Later source changes require a deliberate tutorial release."
+  },
+  "stages": [
+    {
+      "id": "foundation",
+      "title": "基础路径",
+      "order": 0,
+      "kind": "foundation"
+    },
+    {
+      "id": "observe-system",
+      "title": "观察系统",
+      "order": 10,
+      "kind": "core"
+    },
+    {
+      "id": "programs-and-abi",
+      "title": "程序、构建与 ABI",
+      "order": 20,
+      "kind": "core"
+    },
+    {
+      "id": "kernel-boundaries",
+      "title": "进入和离开内核",
+      "order": 30,
+      "kind": "core"
+    },
+    {
+      "id": "processes-and-memory",
+      "title": "进程、调度与内存",
+      "order": 40,
+      "kind": "core"
+    },
+    {
+      "id": "communication-and-io",
+      "title": "通信与设备 I/O",
+      "order": 50,
+      "kind": "core"
+    },
+    {
+      "id": "persistence",
+      "title": "文件系统与持久化",
+      "order": 60,
+      "kind": "core"
+    },
+    {
+      "id": "evidence",
+      "title": "证据、失败与综合",
+      "order": 70,
+      "kind": "core"
+    }
+  ],
+  "units": [
+    {
+      "id": "foundation.command-line-build",
+      "path": "foundation/command-line-build.md",
+      "title": "从命令行构建并运行程序",
+      "stage": "foundation",
+      "order": 10,
+      "status": "draft",
+      "requires": [],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["command-line-build-workflow"],
+      "outcomes": [
+        "能区分源码、目标文件、可执行文件和运行中的进程",
+        "能使用编译器和 Make 运行教程资源，并解释命令失败发生在哪一步"
+      ],
+      "source_anchors": [
+        {"path": "Makefile", "symbol": "qemu:"},
+        {"path": "Makefile", "symbol": "qemu-gdb:"}
+      ],
+      "evidence_dimensions": ["F", "B"],
+      "resources": [
+        "resources/foundation/pointer-list.c",
+        "resources/foundation/check-pointer-list.sh"
+      ],
+      "reviews": []
+    },
+    {
+      "id": "foundation.c-memory",
+      "path": "foundation/c-memory.md",
+      "title": "用 C 表达内存、指针和链式结构",
+      "stage": "foundation",
+      "order": 20,
+      "status": "draft",
+      "requires": ["foundation.command-line-build"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["foundation-c-memory-model"],
+      "outcomes": [
+        "能画出数组、结构体、指针和链表节点的内存关系",
+        "能用移位和掩码独立设置、测试和清除位标志",
+        "能定位空指针、越界和悬空指针的失败位置"
+      ],
+      "source_anchors": [
+        {"path": "docs/xv6-tutorial/resources/foundation/pointer-list.c", "symbol": "NODE_PINNED"},
+        {"path": "user/ulib.c", "symbol": "memmove"},
+        {"path": "kernel/types.h", "symbol": "uint64"}
+      ],
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": [
+        "resources/foundation/pointer-list.c",
+        "resources/foundation/check-pointer-list.sh"
+      ],
+      "reviews": []
+    },
+    {
+      "id": "foundation.machine-and-riscv",
+      "path": "foundation/machine-and-riscv.md",
+      "title": "从 C 调用栈到基础 RISC-V",
+      "stage": "foundation",
+      "order": 30,
+      "status": "draft",
+      "requires": ["foundation.c-memory"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["foundation-machine-call-model"],
+      "outcomes": [
+        "能解释 pc、sp、ra 和参数寄存器在一次函数调用中的角色",
+        "能从短汇编片段还原栈和控制流变化"
+      ],
+      "source_anchors": [
+        {"path": "kernel/entry.S", "symbol": "_entry"},
+        {"path": "kernel/start.c", "symbol": "start"}
+      ],
+      "evidence_dimensions": ["S", "F"],
+      "resources": [],
+      "reviews": []
+    },
+    {
+      "id": "foundation.guided-debugging",
+      "path": "foundation/guided-debugging.md",
+      "title": "用 GDB 观察寄存器、内存和栈",
+      "stage": "foundation",
+      "order": 40,
+      "status": "draft",
+      "requires": ["foundation.machine-and-riscv"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["guided-gdb-observation"],
+      "outcomes": [
+        "能启动受控调试会话并命中符号断点",
+        "能记录寄存器、内存、调用栈和下一步执行位置"
+      ],
+      "source_anchors": [
+        {"path": "Makefile", "symbol": "qemu-gdb:"},
+        {"path": ".gdbinit.tmpl-riscv", "symbol": "target remote"}
+      ],
+      "evidence_dimensions": ["F", "B"],
+      "resources": ["resources/foundation/gdb-commands.txt"],
+      "reviews": []
+    },
+    {
+      "id": "foundation.gate",
+      "path": "foundation/gate.md",
+      "title": "Foundation gate",
+      "stage": "foundation",
+      "order": 50,
+      "status": "draft",
+      "requires": [
+        "foundation.command-line-build",
+        "foundation.c-memory",
+        "foundation.machine-and-riscv",
+        "foundation.guided-debugging"
+      ],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["foundation-entry-contract"],
+      "outcomes": [
+        "能以可审阅产物证明已经满足核心路径入口契约"
+      ],
+      "source_anchors": [],
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": [
+        "templates/trace-worksheet.md",
+        "resources/foundation/pointer-list.c",
+        "resources/foundation/check-pointer-list.sh",
+        "resources/foundation/gdb-commands.txt"
+      ],
+      "reviews": []
+    },
+    {
+      "id": "core.observe-system",
+      "path": "core/observe-system.md",
+      "title": "从 QEMU 启动到 shell 提示符",
+      "stage": "observe-system",
+      "order": 10,
+      "status": "draft",
+      "requires": ["foundation.gate"],
+      "related": [],
+      "black_boxes": ["first-user-process", "shell-image-path"],
+      "resolves": [],
+      "owns": ["first-system-observation"],
+      "outcomes": [
+        "能把 QEMU 输出、启动源码锚点和 shell 提示符放在同一条时间线上",
+        "能明确列出当前仍作为黑盒的首进程、调度和文件系统机制"
+      ],
+      "source_anchors": [
+        {"path": "Makefile", "symbol": "qemu:"},
+        {"path": "kernel/entry.S", "symbol": "_entry"},
+        {"path": "kernel/main.c", "symbol": "main"},
+        {"path": "kernel/proc.c", "symbol": "scheduler"},
+        {"path": "kernel/proc.c", "symbol": "forkret"}
+      ],
+      "evidence_dimensions": ["S", "F"],
+      "resources": ["templates/trace-worksheet.md"],
+      "reviews": []
+    },
+    {
+      "id": "core.user-program-and-abi",
+      "path": "core/user-program-and-abi.md",
+      "title": "用户程序如何成为可运行镜像",
+      "stage": "programs-and-abi",
+      "order": 10,
+      "status": "draft",
+      "requires": ["core.observe-system"],
+      "related": ["foundation.machine-and-riscv"],
+      "black_boxes": ["syscall-kernel-entry"],
+      "resolves": ["shell-image-path"],
+      "owns": ["user-program-build-and-abi"],
+      "outcomes": [
+        "能沿 Makefile、链接脚本、用户入口和系统调用 stub 解释用户程序的生成",
+        "能区分 C 函数接口、RISC-V 调用约定和 xv6 系统调用 ABI"
+      ],
+      "source_anchors": [
+        {"path": "Makefile", "symbol": "UPROGS"},
+        {"path": "user/user.ld", "symbol": "SECTIONS"},
+        {"path": "user/ulib.c", "symbol": "start"},
+        {"path": "user/usys.pl", "symbol": "entry"}
+      ],
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": ["templates/trace-worksheet.md"],
+      "reviews": []
+    },
+    {
+      "id": "core.syscall-roundtrip",
+      "path": "core/syscall-roundtrip.md",
+      "title": "一次系统调用如何往返",
+      "stage": "kernel-boundaries",
+      "order": 10,
+      "status": "draft",
+      "requires": ["core.user-program-and-abi"],
+      "related": ["foundation.guided-debugging"],
+      "black_boxes": ["full-trampoline-page-table-contract"],
+      "resolves": ["syscall-kernel-entry"],
+      "owns": ["syscall-roundtrip"],
+      "outcomes": [
+        "能追踪 getpid 从用户 stub、ecall、trap、分派到返回值恢复的完整路径",
+        "能记录特权级、页表、栈、关键寄存器和 trapframe 的变化"
+      ],
+      "source_anchors": [
+        {"path": "user/usys.pl", "symbol": "entry"},
+        {"path": "kernel/trampoline.S", "symbol": "uservec"},
+        {"path": "kernel/trap.c", "symbol": "usertrap"},
+        {"path": "kernel/syscall.c", "symbol": "syscall"},
+        {"path": "kernel/sysproc.c", "symbol": "sys_getpid"},
+        {"path": "kernel/trampoline.S", "symbol": "userret"}
+      ],
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": ["templates/trace-worksheet.md"],
+      "reviews": []
+    },
+    {
+      "id": "lab.add-system-call",
+      "path": "experiments/add-system-call.md",
+      "title": "有界实验：新增最小系统调用",
+      "stage": "kernel-boundaries",
+      "order": 20,
+      "status": "draft",
+      "requires": ["core.syscall-roundtrip"],
+      "related": ["core.user-program-and-abi"],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["bounded-add-system-call-lab"],
+      "outcomes": [
+        "能独立贯穿声明、生成 stub、编号、分派、handler 和用户测试",
+        "能为未知编号、返回值和回归范围写出明确 oracle"
+      ],
+      "source_anchors": [
+        {"path": "user/user.h", "symbol": "getpid"},
+        {"path": "user/usys.pl", "symbol": "entry"},
+        {"path": "kernel/syscall.h", "symbol": "SYS_getpid"},
+        {"path": "kernel/syscall.c", "symbol": "syscalls"},
+        {"path": "kernel/sysproc.c", "symbol": "sys_getpid"},
+        {"path": "Makefile", "symbol": "UPROGS"}
+      ],
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": [
+        "templates/bounded-change-report.md",
+        "templates/trace-worksheet.md"
+      ],
+      "reviews": []
+    },
+    {
+      "id": "core.process-and-memory",
+      "path": "core/process-and-memory.md",
+      "title": "进程、调度与地址空间",
+      "stage": "processes-and-memory",
+      "order": 10,
+      "status": "planned",
+      "requires": ["core.syscall-roundtrip"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": ["first-user-process", "full-trampoline-page-table-contract"],
+      "owns": ["process-scheduling-and-memory"],
+      "outcomes": ["能追踪进程状态、上下文和地址空间的生命周期"],
+      "source_anchors": [],
+      "evidence_dimensions": ["S", "F", "B", "C"],
+      "resources": [],
+      "reviews": []
+    },
+    {
+      "id": "core.communication-and-io",
+      "path": "core/communication-and-io.md",
+      "title": "文件描述符、管道、控制台与设备",
+      "stage": "communication-and-io",
+      "order": 10,
+      "status": "planned",
+      "requires": ["core.process-and-memory"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["communication-and-device-io"],
+      "outcomes": ["能追踪一次跨进程或设备的 I/O 路径及其资源所有权"],
+      "source_anchors": [],
+      "evidence_dimensions": ["S", "F", "B", "C"],
+      "resources": [],
+      "reviews": []
+    },
+    {
+      "id": "core.persistence",
+      "path": "core/persistence.md",
+      "title": "文件系统、日志与崩溃恢复",
+      "stage": "persistence",
+      "order": 10,
+      "status": "planned",
+      "requires": ["core.communication-and-io"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["filesystem-storage-and-recovery"],
+      "outcomes": ["能追踪持久化状态、事务提交和恢复边界"],
+      "source_anchors": [],
+      "evidence_dimensions": ["S", "F", "B", "C", "R"],
+      "resources": [],
+      "reviews": []
+    },
+    {
+      "id": "core.evidence-synthesis",
+      "path": "core/evidence-synthesis.md",
+      "title": "全局不变量、故障与证据综合",
+      "stage": "evidence",
+      "order": 10,
+      "status": "planned",
+      "requires": ["core.persistence"],
+      "related": [],
+      "black_boxes": [],
+      "resolves": [],
+      "owns": ["global-evidence-synthesis"],
+      "outcomes": ["能跨子系统构造不变量、确定性 oracle 和证据边界"],
+      "source_anchors": [],
+      "evidence_dimensions": ["S", "F", "B", "C", "R"],
+      "resources": [],
+      "reviews": []
+    }
+  ],
+  "source_scope": {
+    "include_globs": [
+      "kernel/*.c",
+      "kernel/*.h",
+      "kernel/*.S",
+      "kernel/*.ld",
+      "user/*.c",
+      "user/*.h",
+      "user/*.S",
+      "user/*.ld",
+      "user/*.pl",
+      "mkfs/*.c",
+      "Makefile",
+      "test-xv6.py",
+      ".gdbinit.tmpl-riscv",
+      ".vscode/*.json"
+    ],
+    "exclude_paths": ["user/usys.S"]
+  },
+  "source_areas": [
+    {"path": "Makefile", "kind": "build", "owner": "foundation.command-line-build", "secondary": ["core.observe-system", "core.user-program-and-abi", "lab.add-system-call"]},
+    {"path": ".gdbinit.tmpl-riscv", "kind": "debug", "owner": "foundation.guided-debugging", "secondary": []},
+    {"path": "kernel/entry.S", "kind": "assembly", "owner": "foundation.machine-and-riscv", "secondary": ["core.observe-system"]},
+    {"path": "kernel/start.c", "kind": "kernel", "owner": "foundation.machine-and-riscv", "secondary": ["core.observe-system"]},
+    {"path": "kernel/main.c", "kind": "kernel", "owner": "core.observe-system", "secondary": []},
+    {"path": "kernel/proc.c", "kind": "kernel", "owner": "core.process-and-memory", "secondary": ["core.observe-system"]},
+    {"path": "user/user.ld", "kind": "linker", "owner": "core.user-program-and-abi", "secondary": []},
+    {"path": "user/ulib.c", "kind": "user", "owner": "core.user-program-and-abi", "secondary": ["foundation.c-memory"]},
+    {"path": "user/user.h", "kind": "user", "owner": "core.user-program-and-abi", "secondary": ["lab.add-system-call"]},
+    {"path": "user/usys.pl", "kind": "generator", "owner": "core.user-program-and-abi", "secondary": ["core.syscall-roundtrip", "lab.add-system-call"]},
+    {"path": "kernel/trampoline.S", "kind": "assembly", "owner": "core.syscall-roundtrip", "secondary": []},
+    {"path": "kernel/trap.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": []},
+    {"path": "kernel/syscall.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]},
+    {"path": "kernel/syscall.h", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]},
+    {"path": "kernel/sysproc.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]}
+  ]
+}

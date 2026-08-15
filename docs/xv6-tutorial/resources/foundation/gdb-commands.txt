@@ -1,0 +1,5 @@
+break _entry
+continue
+info registers pc sp ra a0 a1
+x/8gx $sp
+backtrace
