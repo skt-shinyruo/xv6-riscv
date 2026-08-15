@@ -200,26 +200,47 @@
       "title": "从 QEMU 启动到 shell 提示符",
       "stage": "observe-system",
       "order": 10,
-      "status": "draft",
+      "status": "verified",
       "requires": ["foundation.gate"],
       "related": [],
-      "black_boxes": ["first-user-process", "shell-image-path"],
+      "black_boxes": [
+        "first-user-process",
+        "scheduler-selection",
+        "first-user-address-space",
+        "shell-image-path",
+        "console-device-path"
+      ],
       "resolves": [],
       "owns": ["first-system-observation"],
       "outcomes": [
         "能把 QEMU 输出、启动源码锚点和 shell 提示符放在同一条时间线上",
-        "能明确列出当前仍作为黑盒的首进程、调度和文件系统机制"
+        "能观察第一次用户态切换边界，并明确列出仍作为黑盒的首进程、内存、调度、文件系统和设备机制"
       ],
       "source_anchors": [
         {"path": "Makefile", "symbol": "qemu:"},
+        {"path": "Makefile", "symbol": "qemu-gdb:"},
         {"path": "kernel/entry.S", "symbol": "_entry"},
+        {"path": "kernel/start.c", "symbol": "start"},
         {"path": "kernel/main.c", "symbol": "main"},
+        {"path": "kernel/proc.c", "symbol": "userinit"},
         {"path": "kernel/proc.c", "symbol": "scheduler"},
-        {"path": "kernel/proc.c", "symbol": "forkret"}
+        {"path": "kernel/proc.c", "symbol": "forkret"},
+        {"path": "kernel/exec.c", "symbol": "kexec"},
+        {"path": "kernel/trap.c", "symbol": "prepare_return"},
+        {"path": "kernel/trampoline.S", "symbol": "userret"},
+        {"path": "kernel/memlayout.h", "symbol": "TRAMPOLINE"},
+        {"path": "kernel/riscv.h", "symbol": "MAXVA"},
+        {"path": "user/ulib.c", "symbol": "start"},
+        {"path": "user/init.c", "symbol": "main"},
+        {"path": "user/sh.c", "symbol": "main"},
+        {"path": "user/sh.c", "symbol": "getcmd"}
       ],
-      "evidence_dimensions": ["S", "F"],
-      "resources": ["templates/trace-worksheet.md"],
-      "reviews": []
+      "evidence_dimensions": ["S", "F", "B"],
+      "resources": [
+        "templates/trace-worksheet.md",
+        "resources/observe-system/run-qemu.sh"
+      ],
+      "reviews": ["reviews/observe-system-0.1.0.md"]
     },
     {
       "id": "core.user-program-and-abi",
@@ -316,7 +337,12 @@
       "requires": ["core.syscall-roundtrip"],
       "related": [],
       "black_boxes": [],
-      "resolves": ["first-user-process", "full-trampoline-page-table-contract"],
+      "resolves": [
+        "first-user-process",
+        "scheduler-selection",
+        "first-user-address-space",
+        "full-trampoline-page-table-contract"
+      ],
       "owns": ["process-scheduling-and-memory"],
       "outcomes": ["能追踪进程状态、上下文和地址空间的生命周期"],
       "source_anchors": [],
@@ -334,7 +360,7 @@
       "requires": ["core.process-and-memory"],
       "related": [],
       "black_boxes": [],
-      "resolves": [],
+      "resolves": ["console-device-path"],
       "owns": ["communication-and-device-io"],
       "outcomes": ["能追踪一次跨进程或设备的 I/O 路径及其资源所有权"],
       "source_anchors": [],

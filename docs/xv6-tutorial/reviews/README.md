@@ -5,3 +5,4 @@
 当前 `0.1.0` 发布版仍为 `draft`。已登记的增量验证记录：
 
 - [Foundation 0.1.0 非作者走查](foundation-0.1.0.md)：基础路径五个单元按 `requires` 顺序通过。
+- [Observe-system 0.1.0 非作者走查](observe-system-0.1.0.md)：首个核心单元的启动时间线、配置实验和清理证据通过。

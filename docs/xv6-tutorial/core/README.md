@@ -6,7 +6,7 @@
 
 ## 观察系统
 
-- [从 QEMU 启动到 shell 提示符](observe-system.md) - `draft`
+- [从 QEMU 启动到 shell 提示符](observe-system.md) - `verified`
 
 ## 程序、构建与 ABI
 
