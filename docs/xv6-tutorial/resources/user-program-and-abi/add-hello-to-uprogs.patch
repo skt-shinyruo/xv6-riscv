@@ -1,0 +1,7 @@
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -128 +128,2 @@
+-UPROGS=\
++UPROGS=\
++	$U/_hello\

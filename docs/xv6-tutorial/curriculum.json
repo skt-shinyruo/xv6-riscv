@@ -248,7 +248,7 @@
       "title": "用户程序如何成为可运行镜像",
       "stage": "programs-and-abi",
       "order": 10,
-      "status": "draft",
+      "status": "verified",
       "requires": ["core.observe-system"],
       "related": ["foundation.machine-and-riscv"],
       "black_boxes": ["syscall-kernel-entry"],
@@ -256,17 +256,38 @@
       "owns": ["user-program-build-and-abi"],
       "outcomes": [
         "能沿 Makefile、链接脚本、用户入口和系统调用 stub 解释用户程序的生成",
-        "能区分 C 函数接口、RISC-V 调用约定和 xv6 系统调用 ABI"
+        "能区分 C 函数接口、RISC-V 调用约定和 xv6 系统调用 ABI",
+        "能用隔离实验区分宿主 ELF 已生成与命令已进入 fs.img，并完成逆向清理"
       ],
       "source_anchors": [
-        {"path": "Makefile", "symbol": "UPROGS"},
+        {"path": "Makefile", "symbol": "_%: %.o"},
+        {"path": "Makefile", "symbol": "$U/usys.S :"},
+        {"path": "Makefile", "symbol": "UPROGS="},
+        {"path": "Makefile", "symbol": "fs.img:"},
         {"path": "user/user.ld", "symbol": "SECTIONS"},
-        {"path": "user/ulib.c", "symbol": "start"},
-        {"path": "user/usys.pl", "symbol": "entry"}
+        {"path": "user/ulib.c", "symbol": "start("},
+        {"path": "user/echo.c", "symbol": "main("},
+        {"path": "user/user.h", "symbol": "write("},
+        {"path": "user/usys.pl", "symbol": "sub entry"},
+        {"path": "kernel/syscall.h", "symbol": "SYS_write"},
+        {"path": "mkfs/mkfs.c", "symbol": "shortname[0] == '_'"},
+        {"path": "mkfs/mkfs.c", "symbol": "iappend("},
+        {"path": "kernel/proc.c", "symbol": "forkret("},
+        {"path": "kernel/exec.c", "symbol": "kexec("},
+        {"path": "user/init.c", "symbol": "main("},
+        {"path": "user/sh.c", "symbol": "runcmd("},
+        {"path": "kernel/sysfile.c", "symbol": "sys_exec("}
       ],
       "evidence_dimensions": ["S", "F", "B"],
-      "resources": ["templates/trace-worksheet.md"],
-      "reviews": []
+      "resources": [
+        "templates/trace-worksheet.md",
+        "templates/bounded-change-report.md",
+        "resources/user-program-and-abi/hello.c",
+        "resources/user-program-and-abi/add-hello-to-uprogs.patch",
+        "resources/user-program-and-abi/check-qemu.py",
+        "resources/user-program-and-abi/run-lab.sh"
+      ],
+      "reviews": ["reviews/user-program-and-abi-0.1.0.md"]
     },
     {
       "id": "core.syscall-roundtrip",

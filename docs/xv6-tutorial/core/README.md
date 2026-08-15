@@ -10,7 +10,7 @@
 
 ## 程序、构建与 ABI
 
-- [用户程序如何成为可运行镜像](user-program-and-abi.md) - `draft`
+- [用户程序如何成为可运行镜像](user-program-and-abi.md) - `verified`
 
 ## 进入和离开内核
 
