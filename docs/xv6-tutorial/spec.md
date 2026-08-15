@@ -112,7 +112,7 @@
 - Non-author walkthroughs are part of the test contract. The record must identify the anonymized learner profile, pinned baseline, attempted path, artifacts, blockers or misconceptions, corrections, and resulting status change. `verified` without this record is invalid.
 - A `coverage-complete` release is tested against the complete declared source scope and must have verified owners for every scoped handwritten input. Generated outputs are tested through their generator and ABI or contract checks.
 - Existing implementation-reference traceability, user-test registration, fault-injection specifications, and recovery-oracle conventions are prior art for evidence vocabulary. They inform the standalone tutorial but are not linked runtime dependencies.
-- Initial pilot verification has passed the manifest, navigation, JSON, source-anchor, internal-link, and foundation-resource checks. QEMU/GDB walkthroughs, actual learner submissions, and full evidence projects remain future release gates rather than being claimed as complete now.
+- Initial pilot verification passed the manifest, navigation, JSON, source-anchor, internal-link, and foundation-resource checks. The Foundation path additionally requires a recorded non-author command, C-memory, QEMU/GDB, and gate walkthrough before its units become verified; core learner submissions and full evidence projects remain later release gates.
 
 ## Out of Scope
 

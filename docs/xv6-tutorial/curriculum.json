@@ -64,7 +64,7 @@
       "title": "从命令行构建并运行程序",
       "stage": "foundation",
       "order": 10,
-      "status": "draft",
+      "status": "verified",
       "requires": [],
       "related": [],
       "black_boxes": [],
@@ -83,7 +83,7 @@
         "resources/foundation/pointer-list.c",
         "resources/foundation/check-pointer-list.sh"
       ],
-      "reviews": []
+      "reviews": ["reviews/foundation-0.1.0.md"]
     },
     {
       "id": "foundation.c-memory",
@@ -91,7 +91,7 @@
       "title": "用 C 表达内存、指针和链式结构",
       "stage": "foundation",
       "order": 20,
-      "status": "draft",
+      "status": "verified",
       "requires": ["foundation.command-line-build"],
       "related": [],
       "black_boxes": [],
@@ -112,7 +112,7 @@
         "resources/foundation/pointer-list.c",
         "resources/foundation/check-pointer-list.sh"
       ],
-      "reviews": []
+      "reviews": ["reviews/foundation-0.1.0.md"]
     },
     {
       "id": "foundation.machine-and-riscv",
@@ -120,7 +120,7 @@
       "title": "从 C 调用栈到基础 RISC-V",
       "stage": "foundation",
       "order": 30,
-      "status": "draft",
+      "status": "verified",
       "requires": ["foundation.c-memory"],
       "related": [],
       "black_boxes": [],
@@ -132,11 +132,12 @@
       ],
       "source_anchors": [
         {"path": "kernel/entry.S", "symbol": "_entry"},
-        {"path": "kernel/start.c", "symbol": "start"}
+        {"path": "kernel/start.c", "symbol": "start"},
+        {"path": "kernel/string.c", "symbol": "memcmp"}
       ],
       "evidence_dimensions": ["S", "F"],
       "resources": [],
-      "reviews": []
+      "reviews": ["reviews/foundation-0.1.0.md"]
     },
     {
       "id": "foundation.guided-debugging",
@@ -144,7 +145,7 @@
       "title": "用 GDB 观察寄存器、内存和栈",
       "stage": "foundation",
       "order": 40,
-      "status": "draft",
+      "status": "verified",
       "requires": ["foundation.machine-and-riscv"],
       "related": [],
       "black_boxes": [],
@@ -160,7 +161,7 @@
       ],
       "evidence_dimensions": ["F", "B"],
       "resources": ["resources/foundation/gdb-commands.txt"],
-      "reviews": []
+      "reviews": ["reviews/foundation-0.1.0.md"]
     },
     {
       "id": "foundation.gate",
@@ -168,7 +169,7 @@
       "title": "Foundation gate",
       "stage": "foundation",
       "order": 50,
-      "status": "draft",
+      "status": "verified",
       "requires": [
         "foundation.command-line-build",
         "foundation.c-memory",
@@ -185,12 +186,13 @@
       "source_anchors": [],
       "evidence_dimensions": ["S", "F", "B"],
       "resources": [
+        "templates/foundation-gate.md",
         "templates/trace-worksheet.md",
         "resources/foundation/pointer-list.c",
         "resources/foundation/check-pointer-list.sh",
         "resources/foundation/gdb-commands.txt"
       ],
-      "reviews": []
+      "reviews": ["reviews/foundation-0.1.0.md"]
     },
     {
       "id": "core.observe-system",

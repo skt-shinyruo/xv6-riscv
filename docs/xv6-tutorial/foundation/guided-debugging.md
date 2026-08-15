@@ -16,8 +16,8 @@
 
 调试需要两个进程：
 
-1. `make qemu-gdb` 构建 xv6，启动 QEMU，开放 gdb stub，并在第一条指令前暂停。
-2. RISC-V GDB 或 `gdb-multiarch` 读取 `kernel/kernel` 符号，通过 `.gdbinit` 连接 QEMU。
+1. `make CPUS=1 qemu-gdb` 构建 xv6，启动单 hart QEMU，开放 gdb stub，并在第一条指令前暂停。
+2. `gdb-multiarch` 读取 `kernel/kernel` 符号并连接 QEMU。
 
 普通 `make qemu` 和 `make qemu-gdb` 都会使用 `fs.img`。不要同时启动两个可写实例。退出旧 QEMU 后再改变模式。
 
@@ -32,39 +32,46 @@
 
 ## 观察任务
 
+第一次学习启动链时固定 `CPUS=1`，避免另一个 hart 先命中同一断点。多 hart 不是错误，但必须额外记录 GDB thread 和 hart；核心路径再引入这项观察。
+
 终端 A：
 
 ```sh
-make qemu-gdb
+make CPUS=1 qemu-gdb
 ```
 
-终端 B 使用可用的 RISC-V GDB，例如：
+终端 B 使用预检通过的 `gdb-multiarch`：
 
 ```sh
-gdb-multiarch kernel/kernel
+gdb-multiarch -q -nx kernel/kernel
 ```
 
-若本地 GDB 默认不读取仓库 `.gdbinit`，显式输入：
+`-nx` 明确不读取任何隐式初始化文件，因此本次练习总是显式连接实际端口。在 GDB 中输入：
 
 ```text
 set architecture riscv:rv64
 target remote 127.0.0.1:<make print-gdbport 的输出>
 symbol-file kernel/kernel
+source docs/xv6-tutorial/resources/foundation/gdb-commands.txt
 ```
 
-然后按 `resources/foundation/gdb-commands.txt` 的意图执行，但不要盲目粘贴尚未理解的命令。依次在 `_entry`、`start`、`main` 断下，记录：
+先读懂命令资源再执行。它依次在 `_entry`、`start`、`main` 断下，并记录：
 
 ```text
-info registers pc sp ra a0 a1
+info threads
+info registers pc sp ra a0 a1 tp
+x/i $pc
 x/8gx $sp
 backtrace
 ```
+
+进入 `_entry` 时 `sp` 尚未建立，所以该断点只记录寄存器和 backtrace；在 `start` 和 `main` 才读取 `$sp` 指向的内存。若在 `_entry` 执行 `x/8gx $sp` 得到 `Cannot access memory at address 0x0`，这是模型预测的边界结果，不是可以忽略后继续猜测的栈证据。
 
 如果工具链或 QEMU 缺失，把精确命令、退出状态和错误信息记录为环境失败；这时本单元不能标记完成。
 
 ## 有界修改任务
 
-复制 GDB 命令资源到临时文件，增加 `break usertrap`。解释为什么系统启动阶段不会立即命中它，以及必须发生什么用户态事件才可能命中。不要修改仓库中的共享资源文件。
+复制 GDB 命令资源到临时文件，在文件末尾追加 `break usertrap` 和 `continue`。必须追加在末尾，因为资源在早期阶段会用 `delete breakpoints` 清理启动断点；若插在这些命令之前，新断点也会被删除。解释为什么前三个启动断点不会命中 `usertrap`，以及随后必须发生什么用户态 trap 才会命中。不要修改仓库中的共享资源文件。
 
 ## Oracle、证据、失败路径和局限
 
@@ -75,4 +82,4 @@ backtrace
 
 ## 退出产物与后续单元
 
-提交填好的[源码追踪工作表](../templates/trace-worksheet.md)和环境失败记录（如有）。满足前四个基础单元后，进入 [Foundation gate](gate.md)。
+提交填好的[源码追踪工作表](../templates/trace-worksheet.md)和环境失败记录（如有），并写明 `CPUS`、GDB thread 与 hart。三个断点缺少任一项、顺序不符、`start` 的 `sp` 不满足上一单元公式、没有实际栈内存/backtrace，或任一必需工具缺失，都表示本单元未通过。满足前四个基础单元后，进入 [Foundation gate](gate.md)。

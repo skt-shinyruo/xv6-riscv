@@ -40,6 +40,20 @@ REQUIRED_UNIT_HEADINGS = (
     "## Oracle、证据、失败路径和局限",
     "## 退出产物与后续单元",
 )
+REQUIRED_WALKTHROUGH_FIELDS = (
+    "教程版本",
+    "源码基线",
+    "走查时教程提交",
+    "走查单元或连续路径",
+    "匿名入口能力",
+    "使用环境",
+)
+REQUIRED_WALKTHROUGH_SECTIONS = (
+    "观察到的卡点",
+    "验收产物",
+    "修正与复查",
+    "结果",
+)
 
 
 class Validation:
@@ -130,6 +144,52 @@ def validate_unit_page(unit, validation):
             validation.error(f"{unit['path']} is missing heading: {heading}")
 
 
+def validate_walkthrough_reviews(unit, validation):
+    for review in unit["reviews"]:
+        review_path = Path(review)
+        if (
+            review_path.is_absolute()
+            or ".." in review_path.parts
+            or not review_path.parts
+            or review_path.parts[0] != "reviews"
+            or review_path.suffix != ".md"
+        ):
+            validation.error(
+                "walkthrough record must be a Markdown file under reviews/: "
+                f"{unit['id']} -> {review}"
+            )
+            continue
+        path = TUTORIAL_ROOT / review_path
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for field in REQUIRED_WALKTHROUGH_FIELDS:
+            pattern = rf"^-[ \t]+{re.escape(field)}：[ \t]*[^ \t\r\n].*$"
+            if not re.search(pattern, text, re.MULTILINE):
+                validation.error(
+                    f"walkthrough record has missing or empty field for {unit['id']}: "
+                    f"{review} -> {field}"
+                )
+        for section in REQUIRED_WALKTHROUGH_SECTIONS:
+            heading = re.search(
+                rf"^##[ \t]+{re.escape(section)}[ \t]*$", text, re.MULTILINE
+            )
+            if heading is None:
+                validation.error(
+                    f"walkthrough record has missing or empty section for {unit['id']}: "
+                    f"{review} -> {section}"
+                )
+                continue
+            following = text[heading.end():]
+            next_heading = re.search(r"^##[ \t]+", following, re.MULTILINE)
+            body = following[:next_heading.start()] if next_heading else following
+            if not body.strip():
+                validation.error(
+                    f"walkthrough record has missing or empty section for {unit['id']}: "
+                    f"{review} -> {section}"
+                )
+
+
 def validate_units(manifest, stages, validation):
     units = manifest.get("units")
     if not isinstance(units, list) or not units:
@@ -193,6 +253,8 @@ def validate_units(manifest, stages, validation):
                 validation.error(f"missing resource for {unit_id}: {resource}")
         if unit["status"] == "verified" and not unit["reviews"]:
             validation.error(f"verified unit has no non-author walkthrough record: {unit_id}")
+        if unit["status"] == "verified" and unit["reviews"]:
+            validate_walkthrough_reviews(unit, validation)
         validate_unit_page(unit, validation)
         result[unit_id] = unit
     for unit_id, unit in result.items():

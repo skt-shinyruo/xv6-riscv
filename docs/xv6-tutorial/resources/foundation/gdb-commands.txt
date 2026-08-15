@@ -1,5 +1,30 @@
+set pagination off
+set confirm off
+
 break _entry
 continue
-info registers pc sp ra a0 a1
+printf "TRACE _entry\n"
+info threads
+info registers pc sp ra a0 a1 tp
+x/i $pc
+backtrace
+
+delete breakpoints
+break start
+continue
+printf "TRACE start\n"
+info threads
+info registers pc sp ra a0 a1 tp
+x/i $pc
+x/8gx $sp
+backtrace
+
+delete breakpoints
+break main
+continue
+printf "TRACE main\n"
+info threads
+info registers pc sp ra a0 a1 tp
+x/i $pc
 x/8gx $sp
 backtrace

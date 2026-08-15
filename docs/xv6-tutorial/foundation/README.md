@@ -6,8 +6,8 @@
 
 | 顺序 | 单元 | 状态 |
 |---:|---|---|
-| 10 | [从命令行构建并运行程序](command-line-build.md) | `draft` |
-| 20 | [用 C 表达内存、指针和链式结构](c-memory.md) | `draft` |
-| 30 | [从 C 调用栈到基础 RISC-V](machine-and-riscv.md) | `draft` |
-| 40 | [用 GDB 观察寄存器、内存和栈](guided-debugging.md) | `draft` |
-| 50 | [Foundation gate](gate.md) | `draft` |
+| 10 | [从命令行构建并运行程序](command-line-build.md) | `verified` |
+| 20 | [用 C 表达内存、指针和链式结构](c-memory.md) | `verified` |
+| 30 | [从 C 调用栈到基础 RISC-V](machine-and-riscv.md) | `verified` |
+| 40 | [用 GDB 观察寄存器、内存和栈](guided-debugging.md) | `verified` |
+| 50 | [Foundation gate](gate.md) | `verified` |

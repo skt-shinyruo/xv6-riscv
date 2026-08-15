@@ -4,7 +4,7 @@
 
 | 阶段 | planned | draft | verified |
 |---|---:|---:|---:|
-| 基础路径 (`foundation`) | 0 | 5 | 0 |
+| 基础路径 (`foundation`) | 0 | 0 | 5 |
 | 观察系统 (`observe-system`) | 0 | 1 | 0 |
 | 程序、构建与 ABI (`programs-and-abi`) | 0 | 1 | 0 |
 | 进入和离开内核 (`kernel-boundaries`) | 0 | 2 | 0 |
