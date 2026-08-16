@@ -4,15 +4,15 @@
 
 ## 问题
 
-1. **SYNC-01** spinlock 为什么既要原子操作又要关闭本 hart 中断？两者分别解决什么问题？
+1. **SYNC-01** 已迁移到[调度与同步问题 `SCHED-04`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-04原-sync-01)。此处只保留兼容入口。
 2. **SYNC-02** acquire/release 内存序能保证 CPU 临界区可见性，为什么不自动等价于 VirtIO DMA 的发布顺序？
-3. **SYNC-03** 外部设备中断为什么不能调用 `bread()`、`acquiresleep()` 或 `begin_op()`？即使当前恰好不阻塞也不行吗？
-4. **SYNC-04** 为什么持有额外 spinlock 或额外 `push_off()` 时调用 `yield()` 会触发 `sched locks`？
+3. **SYNC-03** 已迁移到[调度与同步问题 `SCHED-09`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-09原-sync-03)。此处只保留兼容入口。
+4. **SYNC-04** 已迁移到[调度与同步问题 `SCHED-02`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-02原-proc-02)。此处只保留兼容入口。
 5. **SYNC-05** 进程槽、物理页、fd、inode cache、buffer、日志和 VirtIO descriptor 耗尽时，为什么有的返回 `-1`、有的睡眠、有的 kill、有的 panic？
 6. **SYNC-06** `NINODE=50` 和磁盘 `NINODES=200` 分别是什么？为什么前者耗尽会 panic，后者通常只让创建失败？
 7. **SYNC-07** 为什么 `NBUF == LOGBLOCKS` 不能证明 buffer 数量足够？
 8. **SYNC-08** 提高 `NPROC` 为什么不仅是扩大数组，还会增加永久内核栈、扫描延迟、内存消耗和最大资源引用数？
-9. **SYNC-09** 一个并发测试连续运行一万次没有失败，为什么仍不能证明没有竞态？怎样为丢失唤醒设计确定性的失败 oracle？
+9. **SYNC-09** 已迁移到[调度与同步问题 `SCHED-07`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-07原-sync-09)。此处只保留兼容入口。
 
 ## 源码入口
 

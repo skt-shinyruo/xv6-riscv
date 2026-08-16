@@ -1,0 +1,853 @@
+diff --git a/Makefile b/Makefile
+index 95604e73b37d484ab1b58541d709d394403999d7..258333f0e44badf20d66a0198b34d7699a3dcdc0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -15,0 +16 @@ OBJS = \
++  $K/syncproject.o \
+@@ -147,0 +149 @@ UPROGS=\
++	$U/_schedtrace\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91a3d62b50e89ecfea2ca3f9f091f0cddfe..970bb1e657065dba94746477e8ae74631b577a2a 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -10,0 +11 @@ struct stat;
++struct syncsnapshot;
+@@ -105,0 +107,16 @@ void            procdump(void);
++// syncproject.c (tutorial-only evidence project)
++void            syncprojectinit(void);
++int             syncprojectreset(int);
++int             syncprojectwait(void);
++int             syncprojectproduce(void);
++void            syncprojectsnapshot(struct syncsnapshot*);
++int             syncprojectrescue(void);
++int             syncprojectclear(void);
++void            syncproject_sleep_before_release(struct proc*, void*);
++void            syncproject_sleep_after_release(struct proc*, void*);
++void            syncproject_sleep_published(struct proc*, void*);
++void            syncproject_sleep_resumed(struct proc*, void*);
++void            syncproject_wakeup_scan(struct proc*, void*, int);
++int             syncproject_scheduler_skip(struct proc*);
++void            syncproject_scheduler_select(struct proc*);
++
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 611e94cb4e84d0120cc26ba898aec6e783a94367..162b298755943d760ae3756ded4fadb68cd8f01e 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -53,0 +54 @@ procinit(void)
++  syncprojectinit();
+@@ -443 +444 @@ scheduler(void)
+-      if (p->state == RUNNABLE) {
++      if (p->state == RUNNABLE && !syncproject_scheduler_skip(p)) {
+@@ -446,0 +448 @@ scheduler(void)
++        syncproject_scheduler_select(p);
+@@ -554,0 +557 @@ sleep(void *chan, struct spinlock *lk)
++  syncproject_sleep_before_release(p, chan);
+@@ -555,0 +559 @@ sleep(void *chan, struct spinlock *lk)
++  syncproject_sleep_after_release(p, chan);
+@@ -559,0 +564 @@ sleep(void *chan, struct spinlock *lk)
++  syncproject_sleep_published(p, chan);
+@@ -561,0 +567 @@ sleep(void *chan, struct spinlock *lk)
++  syncproject_sleep_resumed(p, chan);
+@@ -581 +587,3 @@ wakeup(void *chan)
+-      if (p->state == SLEEPING && p->chan == chan) {
++      int matched = p->state == SLEEPING && p->chan == chan;
++      syncproject_wakeup_scan(p, chan, matched);
++      if (matched) {
+diff --git a/kernel/syncproject.c b/kernel/syncproject.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae3fb67d89adb4875542b8f271145f4432d40f07
+--- /dev/null
++++ b/kernel/syncproject.c
+@@ -0,0 +1,466 @@
++#include "types.h"
++#include "param.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "syncproject.h"
++
++struct syncprojectstate {
++  struct spinlock condition;
++  int channel;
++  volatile int active;
++  volatile int generation;
++  volatile int mode;
++  volatile int ready;
++  volatile int target_pid;
++  volatile int origin_hart;
++  volatile int resume_hart;
++  volatile int producer_attempt;
++  volatile int producer_started;
++  volatile int wait_plock_ready;
++  volatile int condition_released;
++  volatile int producer_acquired;
++  volatile int sleep_published;
++  volatile int wake_done;
++  volatile int force_migrate;
++  volatile int origin_skip_seen;
++  volatile int resume_allowed;
++  volatile int rescuing;
++  volatile int wake_misses;
++  volatile int wake_matches;
++  volatile int rescues;
++  volatile int next_event;
++  struct syncevent events[SYNC_MAX_EVENTS];
++};
++
++static struct syncprojectstate project;
++extern struct proc proc[NPROC];
++
++static int
++aload(volatile int *value)
++{
++  return __atomic_load_n(value, __ATOMIC_SEQ_CST);
++}
++
++static void
++astore(volatile int *value, int next)
++{
++  __atomic_store_n(value, next, __ATOMIC_SEQ_CST);
++}
++
++static int
++target_event(struct proc *p, void *chan)
++{
++  return aload(&project.active) && p &&
++         p->pid == aload(&project.target_pid) && chan == &project.channel;
++}
++
++static void
++record_event(int kind, struct proc *target, int state, int chan_match,
++             int proc_locked)
++{
++  int slot = __atomic_fetch_add(&project.next_event, 1, __ATOMIC_SEQ_CST);
++  if (slot >= SYNC_MAX_EVENTS)
++    return;
++
++  int interrupt_enabled = intr_get();
++  push_off();
++  struct cpu *c = mycpu();
++  struct proc *current = c->proc;
++  struct syncevent *event = &project.events[slot];
++  event->valid = 0;
++  event->seq = slot;
++  event->kind = kind;
++  event->pid = target ? target->pid : (current ? current->pid : 0);
++  event->hart = cpuid();
++  event->state = state;
++  event->ready = aload(&project.ready);
++  event->chan_match = chan_match;
++  event->condition_locked = __atomic_load_n(&project.condition.locked,
++                                            __ATOMIC_SEQ_CST);
++  struct cpu *condition_owner = __atomic_load_n(&project.condition.cpu,
++                                                 __ATOMIC_SEQ_CST);
++  event->condition_owner_hart = condition_owner ? condition_owner - cpus : -1;
++  event->proc_locked = proc_locked;
++  struct cpu *proc_owner = target ? __atomic_load_n(&target->lock.cpu,
++                                                     __ATOMIC_SEQ_CST) : 0;
++  event->proc_owner_hart = proc_owner ? proc_owner - cpus : -1;
++  event->interrupt_enabled = interrupt_enabled;
++  event->noff = c->noff - 1;
++  __atomic_store_n(&event->valid, 1, __ATOMIC_RELEASE);
++  pop_off();
++}
++
++void
++syncprojectinit(void)
++{
++  initlock(&project.condition, "syncproject condition");
++  project.origin_hart = -1;
++  project.resume_hart = -1;
++}
++
++static void
++reset_fields(int mode)
++{
++  int generation = aload(&project.generation) + 1;
++  memset(project.events, 0, sizeof(project.events));
++  astore(&project.mode, mode);
++  astore(&project.ready, 0);
++  astore(&project.target_pid, 0);
++  astore(&project.origin_hart, -1);
++  astore(&project.resume_hart, -1);
++  astore(&project.producer_attempt, 0);
++  astore(&project.producer_started, 0);
++  astore(&project.wait_plock_ready, 0);
++  astore(&project.condition_released, 0);
++  astore(&project.producer_acquired, 0);
++  astore(&project.sleep_published, 0);
++  astore(&project.wake_done, 0);
++  astore(&project.force_migrate, 0);
++  astore(&project.origin_skip_seen, 0);
++  astore(&project.resume_allowed, 0);
++  astore(&project.rescuing, 0);
++  astore(&project.wake_misses, 0);
++  astore(&project.wake_matches, 0);
++  astore(&project.rescues, 0);
++  astore(&project.next_event, 0);
++  astore(&project.generation, generation);
++  astore(&project.active, 1);
++}
++
++int
++syncprojectreset(int mode)
++{
++  if (mode != SYNC_MODE_FIXED && mode != SYNC_MODE_BROKEN)
++    return -1;
++  if (aload(&project.active) ||
++      __atomic_load_n(&project.condition.locked, __ATOMIC_SEQ_CST))
++    return -1;
++  reset_fields(mode);
++  return 0;
++}
++
++void
++syncproject_sleep_before_release(struct proc *p, void *chan)
++{
++  if (!target_event(p, chan) || aload(&project.mode) != SYNC_MODE_FIXED)
++    return;
++  record_event(SYNC_EVENT_WAIT_PLOCK, p, p->state, p->chan == chan, 1);
++  astore(&project.wait_plock_ready, 1);
++  while (!aload(&project.producer_attempt))
++    ;
++  record_event(SYNC_EVENT_WAIT_RELEASE_BOUNDARY, p, p->state,
++               p->chan == chan, 1);
++}
++
++void
++syncproject_sleep_after_release(struct proc *p, void *chan)
++{
++  if (!target_event(p, chan) || aload(&project.mode) != SYNC_MODE_FIXED)
++    return;
++  astore(&project.condition_released, 1);
++  while (!aload(&project.producer_acquired))
++    ;
++}
++
++void
++syncproject_sleep_published(struct proc *p, void *chan)
++{
++  if (!target_event(p, chan))
++    return;
++  record_event(SYNC_EVENT_WAIT_PUBLISH, p, p->state, p->chan == chan, 1);
++  astore(&project.origin_skip_seen, 0);
++  astore(&project.force_migrate, 1);
++  astore(&project.sleep_published, 1);
++}
++
++void
++syncproject_sleep_resumed(struct proc *p, void *chan)
++{
++  if (!target_event(p, chan))
++    return;
++  while (!aload(&project.resume_allowed))
++    ;
++  record_event(SYNC_EVENT_WAIT_RESUME, p, p->state, p->chan == chan, 1);
++}
++
++void
++syncproject_wakeup_scan(struct proc *p, void *chan, int matched)
++{
++  if (!target_event(p, chan))
++    return;
++  if (aload(&project.rescuing)) {
++    if (matched) {
++      __atomic_fetch_add(&project.rescues, 1, __ATOMIC_SEQ_CST);
++      record_event(SYNC_EVENT_RESCUE_MATCH, p, p->state, 1, 1);
++    }
++    return;
++  }
++  if (matched) {
++    __atomic_fetch_add(&project.wake_matches, 1, __ATOMIC_SEQ_CST);
++    record_event(SYNC_EVENT_WAKE_MATCH, p, p->state, 1, 1);
++  } else {
++    __atomic_fetch_add(&project.wake_misses, 1, __ATOMIC_SEQ_CST);
++    record_event(SYNC_EVENT_WAKE_MISS, p, p->state, p->chan == chan, 1);
++  }
++}
++
++int
++syncproject_scheduler_skip(struct proc *p)
++{
++  if (!aload(&project.active) || p->pid != aload(&project.target_pid) ||
++      !aload(&project.force_migrate) || aload(&project.resume_hart) >= 0)
++    return 0;
++  if (cpuid() == aload(&project.origin_hart)) {
++    if (aload(&project.wake_done) && !aload(&project.origin_skip_seen)) {
++      record_event(SYNC_EVENT_ORIGIN_SKIP, p, p->state,
++                   p->chan == &project.channel, 1);
++      astore(&project.origin_skip_seen, 1);
++    }
++    return 1;
++  }
++  return !aload(&project.origin_skip_seen) || !aload(&project.resume_allowed);
++}
++
++void
++syncproject_scheduler_select(struct proc *p)
++{
++  if (!aload(&project.active) || p->pid != aload(&project.target_pid) ||
++      !aload(&project.force_migrate) || aload(&project.resume_hart) >= 0)
++    return;
++  if (cpuid() == aload(&project.origin_hart) ||
++      !aload(&project.origin_skip_seen) || !aload(&project.resume_allowed))
++    return;
++  astore(&project.resume_hart, cpuid());
++  record_event(SYNC_EVENT_MIGRATE_SELECT, p, p->state,
++               p->chan == &project.channel, 1);
++}
++
++static void
++broken_sleep(void)
++{
++  struct proc *p = myproc();
++  push_off();
++  release(&project.condition);
++  record_event(SYNC_EVENT_WAIT_RELEASED, p, p->state, 0, 0);
++  astore(&project.condition_released, 1);
++  while (!aload(&project.wake_done))
++    ;
++
++  acquire(&p->lock);
++  pop_off();
++  p->chan = &project.channel;
++  p->state = SLEEPING;
++  syncproject_sleep_published(p, &project.channel);
++  sched();
++  syncproject_sleep_resumed(p, &project.channel);
++  p->chan = 0;
++  release(&p->lock);
++  acquire(&project.condition);
++}
++
++int
++syncprojectwait(void)
++{
++  if (!aload(&project.active))
++    return -1;
++  struct proc *p = myproc();
++  int expected = 0;
++  if (!__atomic_compare_exchange_n(&project.target_pid, &expected, p->pid, 0,
++                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) &&
++      expected != p->pid)
++    return -1;
++
++  push_off();
++  astore(&project.origin_hart, cpuid());
++  pop_off();
++
++  acquire(&project.condition);
++  record_event(SYNC_EVENT_WAIT_CHECK, p, p->state, 0, 0);
++  while (!aload(&project.ready)) {
++    if (aload(&project.mode) == SYNC_MODE_FIXED)
++      sleep(&project.channel, &project.condition);
++    else
++      broken_sleep();
++  }
++  record_event(SYNC_EVENT_WAIT_RECHECK, p, p->state, 0, 0);
++  release(&project.condition);
++  return 0;
++}
++
++int
++syncprojectproduce(void)
++{
++  if (!aload(&project.active))
++    return -1;
++  push_off();
++  record_event(SYNC_EVENT_PRODUCER_ARMED, 0, -1, 0, 0);
++  astore(&project.producer_started, 1);
++  int mode = aload(&project.mode);
++  if (mode == SYNC_MODE_FIXED) {
++    while (!aload(&project.wait_plock_ready))
++      ;
++    record_event(SYNC_EVENT_PRODUCER_ATTEMPT, 0, -1, 0, 0);
++    astore(&project.producer_attempt, 1);
++  } else {
++    while (!aload(&project.condition_released))
++      ;
++    record_event(SYNC_EVENT_PRODUCER_ATTEMPT, 0, -1, 0, 0);
++  }
++
++  acquire(&project.condition);
++  while (!aload(&project.condition_released))
++    ;
++  record_event(SYNC_EVENT_PRODUCER_ACQUIRE, 0, -1, 0, 0);
++  astore(&project.producer_acquired, 1);
++  if (mode == SYNC_MODE_FIXED)
++    while (!aload(&project.sleep_published))
++      ;
++
++  astore(&project.ready, 1);
++  record_event(SYNC_EVENT_PRODUCER_READY, 0, -1, 0, 0);
++  wakeup(&project.channel);
++  record_event(SYNC_EVENT_WAKE_DONE, 0, -1, 0, 0);
++  astore(&project.wake_done, 1);
++
++  if (mode == SYNC_MODE_FIXED) {
++    while (!aload(&project.origin_skip_seen))
++      ;
++    record_event(SYNC_EVENT_MIGRATE_RELEASE, 0, -1, 0, 0);
++    astore(&project.resume_allowed, 1);
++  }
++  release(&project.condition);
++  pop_off();
++  return 0;
++}
++
++static int
++bad_state_recorded(void)
++{
++  int found = 0;
++  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->pid == aload(&project.target_pid) && p->state == SLEEPING &&
++        p->chan == &project.channel && aload(&project.ready) == 1 &&
++        aload(&project.wake_misses) == 1 && p->killed == 0) {
++      record_event(SYNC_EVENT_BAD_ORACLE, p, p->state, 1, 1);
++      found = 1;
++    }
++    release(&p->lock);
++  }
++  return found;
++}
++
++int
++syncprojectrescue(void)
++{
++  if (aload(&project.mode) != SYNC_MODE_BROKEN || !bad_state_recorded())
++    return -1;
++  astore(&project.wake_done, 0);
++  astore(&project.rescuing, 1);
++  record_event(SYNC_EVENT_RESCUE_BEGIN, 0, -1, 0, 0);
++  wakeup(&project.channel);
++  record_event(SYNC_EVENT_RESCUE_DONE, 0, -1, 0, 0);
++  astore(&project.wake_done, 1);
++  while (!aload(&project.origin_skip_seen))
++    ;
++  record_event(SYNC_EVENT_MIGRATE_RELEASE, 0, -1, 0, 0);
++  astore(&project.resume_allowed, 1);
++  astore(&project.rescuing, 0);
++  return 0;
++}
++
++void
++syncprojectsnapshot(struct syncsnapshot *out)
++{
++  memset(out, 0, sizeof(*out));
++  out->active = aload(&project.active);
++  out->generation = aload(&project.generation);
++  out->mode = aload(&project.mode);
++  out->target_pid = aload(&project.target_pid);
++  out->ready = aload(&project.ready);
++  out->condition_locked = __atomic_load_n(&project.condition.locked,
++                                          __ATOMIC_SEQ_CST);
++  out->wake_misses = aload(&project.wake_misses);
++  out->wake_matches = aload(&project.wake_matches);
++  out->rescues = aload(&project.rescues);
++  out->origin_hart = aload(&project.origin_hart);
++  out->resume_hart = aload(&project.resume_hart);
++  out->migrated = out->origin_hart >= 0 && out->resume_hart >= 0 &&
++                  out->origin_hart != out->resume_hart;
++  out->producer_started = aload(&project.producer_started);
++  out->gate_pending = aload(&project.producer_attempt) +
++                      aload(&project.producer_started) +
++                      aload(&project.wait_plock_ready) +
++                      aload(&project.condition_released) +
++                      aload(&project.producer_acquired) +
++                      aload(&project.sleep_published) +
++                      aload(&project.wake_done) +
++                      aload(&project.force_migrate) +
++                      aload(&project.origin_skip_seen) +
++                      aload(&project.resume_allowed) +
++                      aload(&project.rescuing);
++
++  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state != UNUSED)
++      out->used++;
++    if (out->target_pid > 0 && p->state != UNUSED &&
++        p->pid == out->target_pid) {
++      out->target_present = 1;
++      out->target_state = p->state;
++      out->target_chan_match = p->chan == &project.channel;
++      out->target_killed = p->killed;
++    }
++    release(&p->lock);
++  }
++
++  int count = aload(&project.next_event);
++  if (count > SYNC_MAX_EVENTS)
++    count = SYNC_MAX_EVENTS;
++  for (int i = 0; i < count; i++) {
++    if (__atomic_load_n(&project.events[i].valid, __ATOMIC_ACQUIRE)) {
++      out->events[out->trace_count] = project.events[i];
++      out->trace_count++;
++    }
++  }
++}
++
++int
++syncprojectclear(void)
++{
++  if (!aload(&project.active) ||
++      __atomic_load_n(&project.condition.locked, __ATOMIC_SEQ_CST))
++    return -1;
++  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    int target_present = p->pid == aload(&project.target_pid);
++    release(&p->lock);
++    if (target_present)
++      return -1;
++  }
++  memset(project.events, 0, sizeof(project.events));
++  astore(&project.active, 0);
++  astore(&project.mode, 0);
++  astore(&project.ready, 0);
++  astore(&project.target_pid, 0);
++  astore(&project.origin_hart, -1);
++  astore(&project.resume_hart, -1);
++  astore(&project.producer_attempt, 0);
++  astore(&project.producer_started, 0);
++  astore(&project.wait_plock_ready, 0);
++  astore(&project.condition_released, 0);
++  astore(&project.producer_acquired, 0);
++  astore(&project.sleep_published, 0);
++  astore(&project.wake_done, 0);
++  astore(&project.force_migrate, 0);
++  astore(&project.origin_skip_seen, 0);
++  astore(&project.resume_allowed, 0);
++  astore(&project.rescuing, 0);
++  astore(&project.wake_misses, 0);
++  astore(&project.wake_matches, 0);
++  astore(&project.rescues, 0);
++  astore(&project.next_event, 0);
++  return 0;
++}
+diff --git a/kernel/syncproject.h b/kernel/syncproject.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed69abfdf6f16a2e5238a4dd0afaa405796e3812
+--- /dev/null
++++ b/kernel/syncproject.h
+@@ -0,0 +1,74 @@
++#define SYNC_MODE_FIXED 1
++#define SYNC_MODE_BROKEN 2
++
++#define SYNC_OP_RESET 1
++#define SYNC_OP_WAIT 2
++#define SYNC_OP_PRODUCE 3
++#define SYNC_OP_SNAPSHOT 4
++#define SYNC_OP_RESCUE 5
++#define SYNC_OP_CLEAR 6
++
++#define SYNC_EVENT_WAIT_CHECK 1
++#define SYNC_EVENT_WAIT_PLOCK 2
++#define SYNC_EVENT_PRODUCER_ATTEMPT 3
++#define SYNC_EVENT_WAIT_RELEASE_BOUNDARY 4
++#define SYNC_EVENT_PRODUCER_ACQUIRE 5
++#define SYNC_EVENT_WAIT_PUBLISH 6
++#define SYNC_EVENT_PRODUCER_READY 7
++#define SYNC_EVENT_WAKE_MATCH 8
++#define SYNC_EVENT_WAKE_MISS 9
++#define SYNC_EVENT_WAKE_DONE 10
++#define SYNC_EVENT_BAD_ORACLE 11
++#define SYNC_EVENT_RESCUE_BEGIN 12
++#define SYNC_EVENT_RESCUE_MATCH 13
++#define SYNC_EVENT_RESCUE_DONE 14
++#define SYNC_EVENT_ORIGIN_SKIP 15
++#define SYNC_EVENT_MIGRATE_RELEASE 16
++#define SYNC_EVENT_MIGRATE_SELECT 17
++#define SYNC_EVENT_WAIT_RESUME 18
++#define SYNC_EVENT_WAIT_RECHECK 19
++#define SYNC_EVENT_PRODUCER_ARMED 20
++#define SYNC_EVENT_WAIT_RELEASED 21
++
++#define SYNC_MAX_EVENTS 32
++
++struct syncevent {
++  int valid;
++  int seq;
++  int kind;
++  int pid;
++  int hart;
++  int state;
++  int ready;
++  int chan_match;
++  int condition_locked;
++  int condition_owner_hart;
++  int proc_locked;
++  int proc_owner_hart;
++  int interrupt_enabled;
++  int noff;
++};
++
++struct syncsnapshot {
++  int active;
++  int generation;
++  int mode;
++  int used;
++  int target_pid;
++  int target_present;
++  int target_state;
++  int target_chan_match;
++  int target_killed;
++  int ready;
++  int condition_locked;
++  int gate_pending;
++  int trace_count;
++  int wake_misses;
++  int wake_matches;
++  int rescues;
++  int origin_hart;
++  int resume_hart;
++  int migrated;
++  int producer_started;
++  struct syncevent events[SYNC_MAX_EVENTS];
++};
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f2260e09b1885831b3cb6488fe7b560016..e0aa46a663d7b64fca3e796b506d203eb78df68f 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,0 +105 @@ extern uint64 sys_close(void);
++extern uint64 sys_syncproject(void);
+@@ -130,0 +132 @@ static uint64 (*syscalls[])(void) = {
++  [SYS_syncproject] sys_syncproject,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4479e64ba193a425db9af0de44bea4464a..b5f29c288c749e289b197bc0dc3a05b00022703e 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,0 +23 @@
++#define SYS_syncproject 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3a2fca413fcf9d22f3bdc00bda74815825..eb796a05bdec3d525f1314a2a57f75eec0baadbb 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -8,0 +9 @@
++#include "syncproject.h"
+@@ -109,0 +111,31 @@ sys_uptime(void)
++
++uint64
++sys_syncproject(void)
++{
++  int operation;
++  int value;
++  uint64 address;
++  struct syncsnapshot snapshot;
++
++  argint(0, &operation);
++  argint(1, &value);
++  argaddr(2, &address);
++  switch (operation) {
++  case SYNC_OP_RESET:
++    return syncprojectreset(value);
++  case SYNC_OP_WAIT:
++    return syncprojectwait();
++  case SYNC_OP_PRODUCE:
++    return syncprojectproduce();
++  case SYNC_OP_SNAPSHOT:
++    syncprojectsnapshot(&snapshot);
++    return copyout(myproc()->pagetable, address, (char *)&snapshot,
++                   sizeof(snapshot));
++  case SYNC_OP_RESCUE:
++    return syncprojectrescue();
++  case SYNC_OP_CLEAR:
++    return syncprojectclear();
++  default:
++    return -1;
++  }
++}
+diff --git a/user/schedtrace.c b/user/schedtrace.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..00e95e7d5ca895bffd56b6cc6b2be63e6a12020d
+--- /dev/null
++++ b/user/schedtrace.c
+@@ -0,0 +1,174 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/syncproject.h"
++#include "user/user.h"
++
++static struct syncsnapshot snapshot;
++
++static void
++fail(char *message)
++{
++  printf("SYNC FAIL %s\n", message);
++  exit(1);
++}
++
++static char *
++event_name(int kind)
++{
++  switch (kind) {
++  case SYNC_EVENT_WAIT_CHECK: return "WAIT_CHECK";
++  case SYNC_EVENT_WAIT_PLOCK: return "WAIT_PLOCK";
++  case SYNC_EVENT_PRODUCER_ATTEMPT: return "PRODUCER_ATTEMPT";
++  case SYNC_EVENT_WAIT_RELEASE_BOUNDARY: return "WAIT_RELEASE_BOUNDARY";
++  case SYNC_EVENT_PRODUCER_ACQUIRE: return "PRODUCER_ACQUIRE";
++  case SYNC_EVENT_WAIT_PUBLISH: return "WAIT_PUBLISH";
++  case SYNC_EVENT_PRODUCER_READY: return "PRODUCER_READY";
++  case SYNC_EVENT_WAKE_MATCH: return "WAKE_MATCH";
++  case SYNC_EVENT_WAKE_MISS: return "WAKE_MISS";
++  case SYNC_EVENT_WAKE_DONE: return "WAKE_DONE";
++  case SYNC_EVENT_BAD_ORACLE: return "BAD_ORACLE";
++  case SYNC_EVENT_RESCUE_BEGIN: return "RESCUE_BEGIN";
++  case SYNC_EVENT_RESCUE_MATCH: return "RESCUE_MATCH";
++  case SYNC_EVENT_RESCUE_DONE: return "RESCUE_DONE";
++  case SYNC_EVENT_ORIGIN_SKIP: return "ORIGIN_SKIP";
++  case SYNC_EVENT_MIGRATE_RELEASE: return "MIGRATE_RELEASE";
++  case SYNC_EVENT_MIGRATE_SELECT: return "MIGRATE_SELECT";
++  case SYNC_EVENT_WAIT_RESUME: return "WAIT_RESUME";
++  case SYNC_EVENT_WAIT_RECHECK: return "WAIT_RECHECK";
++  case SYNC_EVENT_PRODUCER_ARMED: return "PRODUCER_ARMED";
++  case SYNC_EVENT_WAIT_RELEASED: return "WAIT_RELEASED";
++  }
++  return "UNKNOWN";
++}
++
++static void
++read_snapshot(void)
++{
++  if (syncproject(SYNC_OP_SNAPSHOT, 0, &snapshot) < 0)
++    fail("snapshot");
++}
++
++static void
++dump_events(char *mode)
++{
++  for (int i = 0; i < snapshot.trace_count; i++) {
++    struct syncevent *event = &snapshot.events[i];
++    printf("SYNC EVENT mode=%s gen=%d seq=%d kind=%s pid=%d hart=%d state=%d ready=%d chan=%d cond=%d cond_owner=%d plock=%d proc_owner=%d intr=%d noff=%d\n",
++           mode, snapshot.generation, event->seq, event_name(event->kind),
++           event->pid, event->hart, event->state, event->ready,
++           event->chan_match, event->condition_locked,
++           event->condition_owner_hart, event->proc_locked,
++           event->proc_owner_hart, event->interrupt_enabled, event->noff);
++  }
++}
++
++static void
++wait_child(void)
++{
++  int status = -999;
++  if (wait(&status) < 0 || status != 0)
++    fail("child status");
++}
++
++static void
++run_case(int mode, char *name)
++{
++  if (syncproject(SYNC_OP_RESET, mode, 0) < 0)
++    fail("reset");
++  read_snapshot();
++  int baseline_used = snapshot.used;
++
++  int producer = fork();
++  if (producer < 0)
++    fail("fork producer");
++  if (producer == 0) {
++    int result = syncproject(SYNC_OP_PRODUCE, 0, 0);
++    exit(result < 0 ? 1 : 0);
++  }
++
++  int start_deadline = uptime() + 50;
++  do {
++    read_snapshot();
++    if (uptime() >= start_deadline)
++      fail("producer-start watchdog");
++  } while (!snapshot.producer_started);
++
++  int waiter = fork();
++  if (waiter < 0)
++    fail("fork waiter");
++  if (waiter == 0) {
++    int result = syncproject(SYNC_OP_WAIT, 0, 0);
++    exit(result < 0 ? 1 : 0);
++  }
++
++  if (mode == SYNC_MODE_BROKEN) {
++    int deadline = uptime() + 50;
++    for (;;) {
++      read_snapshot();
++      if (snapshot.ready == 1 && snapshot.target_present &&
++          snapshot.target_state == 2 && snapshot.target_chan_match &&
++          snapshot.wake_misses == 1 && snapshot.target_killed == 0)
++        break;
++      if (uptime() >= deadline)
++        fail("bad-state watchdog");
++      pause(1);
++    }
++    printf("SYNC BADSTATE mode=%s gen=%d ready=%d state=%d chan=%d miss=%d killed=%d\n",
++           name, snapshot.generation, snapshot.ready, snapshot.target_state,
++           snapshot.target_chan_match, snapshot.wake_misses,
++           snapshot.target_killed);
++    if (syncproject(SYNC_OP_RESCUE, 0, 0) < 0)
++      fail("rescue");
++  }
++
++  wait_child();
++  wait_child();
++  read_snapshot();
++  dump_events(name);
++  printf("SYNC FINAL mode=%s gen=%d used_before=%d used_after=%d target=%d ready=%d miss=%d match=%d rescue=%d origin=%d resume=%d migrated=%d events=%d cond=%d\n",
++         name, snapshot.generation, baseline_used, snapshot.used,
++         snapshot.target_present, snapshot.ready, snapshot.wake_misses,
++         snapshot.wake_matches, snapshot.rescues, snapshot.origin_hart,
++         snapshot.resume_hart, snapshot.migrated, snapshot.trace_count,
++         snapshot.condition_locked);
++
++  if (snapshot.used != baseline_used || snapshot.target_present ||
++      snapshot.condition_locked || !snapshot.migrated)
++    fail("final resources");
++  if (mode == SYNC_MODE_FIXED &&
++      (snapshot.wake_misses != 0 || snapshot.wake_matches != 1 ||
++       snapshot.rescues != 0))
++    fail("fixed oracle");
++  if (mode == SYNC_MODE_BROKEN &&
++      (snapshot.wake_misses != 1 || snapshot.wake_matches != 0 ||
++       snapshot.rescues != 1))
++    fail("broken oracle");
++
++  int generation = snapshot.generation;
++  if (syncproject(SYNC_OP_CLEAR, 0, 0) < 0)
++    fail("clear");
++  read_snapshot();
++  printf("SYNC CLEAN mode=%s gen=%d used=%d baseline=%d active=%d target=%d ready=%d cond=%d trace=%d gates=%d\n",
++         name, generation, snapshot.used, baseline_used, snapshot.active,
++         snapshot.target_present, snapshot.ready, snapshot.condition_locked,
++         snapshot.trace_count, snapshot.gate_pending);
++  if (snapshot.used != baseline_used || snapshot.active ||
++      snapshot.target_present || snapshot.ready || snapshot.condition_locked ||
++      snapshot.trace_count || snapshot.gate_pending)
++    fail("cleanup");
++  printf("SYNC PASS mode=%s\n", name);
++}
++
++int
++main(int argc, char **argv)
++{
++  if (argc != 2)
++    fail("usage: schedtrace fixed|broken");
++  if (strcmp(argv[1], "fixed") == 0)
++    run_case(SYNC_MODE_FIXED, "fixed");
++  else if (strcmp(argv[1], "broken") == 0)
++    run_case(SYNC_MODE_BROKEN, "broken");
++  else
++    fail("unknown mode");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921c8f26a96ee75b5d0ac3295e3229dc3596..8d18e1e8251804b166b083c86391d14fa669ec33 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -3,0 +4 @@ struct stat;
++struct syncsnapshot;
+@@ -26,0 +28 @@ int uptime(void);
++int syncproject(int, int, struct syncsnapshot *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a750aea5c8f23fca00f89c9c2610408ff8..e69d0f8c3b72c6616384209097e5dac58e6afef7 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,0 +45 @@ entry("uptime");
++entry("syncproject");

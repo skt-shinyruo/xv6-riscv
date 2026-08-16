@@ -13,7 +13,7 @@
 7. **BOOT-07** 已迁移到[系统调用往返问题 `SYSCALL-02`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-02原-boot-07)。此处只保留兼容入口。
 8. **BOOT-08** 已迁移到[系统调用往返问题 `SYSCALL-03`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-03原-boot-08)。此处只保留兼容入口。
 9. **BOOT-09** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-04`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-04原-boot-09)。此处只保留兼容入口。
-10. **BOOT-10** 进程跨 hart 恢复后，为什么不能简单恢复旧的 `tp`？
+10. **BOOT-10** 已迁移到[调度与同步问题 `SCHED-05`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-05原-boot-10)。此处只保留兼容入口。
 
 ## 源码入口
 

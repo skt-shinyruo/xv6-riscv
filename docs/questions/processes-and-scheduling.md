@@ -4,16 +4,16 @@
 
 ## 问题
 
-1. **PROC-01** scheduler 为什么持有 `p->lock` 跨越 `swtch()`，并让切换后的进程负责释放它？
-2. **PROC-02** `sched()` 为什么要求中断关闭、`noff == 1`、只持有 `p->lock`，且状态不能是 `RUNNING`？
+1. **PROC-01** 已迁移到[调度与同步问题 `SCHED-01`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-01原-proc-01)。此处只保留兼容入口。
+2. **PROC-02** 已迁移到[调度与同步问题 `SCHED-02`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-02原-proc-02)。此处只保留兼容入口。
 3. **PROC-03** 已迁移到[进程生命周期问题 `LIFE-02`](../xv6-tutorial/questions/process-lifecycle.md#life-02原-proc-03)。此处只保留兼容入口。
 4. **PROC-04** 已迁移到[进程生命周期问题 `LIFE-03`](../xv6-tutorial/questions/process-lifecycle.md#life-03原-proc-04)。此处只保留兼容入口。
 5. **PROC-05** 已迁移到[进程生命周期问题 `LIFE-04`](../xv6-tutorial/questions/process-lifecycle.md#life-04原-proc-05)。此处只保留兼容入口。
 6. **PROC-06** 已迁移到[进程生命周期问题 `LIFE-05`](../xv6-tutorial/questions/process-lifecycle.md#life-05原-proc-06)。此处只保留兼容入口。
 7. **PROC-07** 已迁移到[进程生命周期问题 `LIFE-06`](../xv6-tutorial/questions/process-lifecycle.md#life-06原-proc-07)。此处只保留兼容入口。
 8. **PROC-08** 已迁移到[进程生命周期问题 `LIFE-07`](../xv6-tutorial/questions/process-lifecycle.md#life-07原-proc-08)。此处只保留兼容入口。
-9. **PROC-09** 请证明 `sleep(chan, lk)` 不会丢失唤醒。为什么 waiter 和 producer 只使用相同 `chan` 仍然不够？
-10. **PROC-10** `wakeup()` 为什么只把进程设为 `RUNNABLE`，而不直接把资源交给它？
+9. **PROC-09** 已迁移到[调度与同步问题 `SCHED-06`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-06原-proc-09)。此处只保留兼容入口。
+10. **PROC-10** 已迁移到[调度与同步问题 `SCHED-08`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-08原-proc-10)。此处只保留兼容入口。
 11. **PROC-11** 已迁移到[进程生命周期问题 `LIFE-08`](../xv6-tutorial/questions/process-lifecycle.md#life-08原-proc-11)。此处只保留兼容入口。
 12. **PROC-12** 已迁移到[进程生命周期问题 `LIFE-09`](../xv6-tutorial/questions/process-lifecycle.md#life-09原-proc-12)。此处只保留兼容入口。
 

@@ -21,7 +21,7 @@
 ## 进程、调度与内存
 
 - [进程生命周期与回收](process-and-memory.md) - `verified`
-- 调度、同步与等待 (`core.scheduling-and-synchronization`) - `planned`
+- [调度、同步与等待](scheduling-and-synchronization.md) - `verified`
 - 虚拟内存、映射与 fault (`core.virtual-memory`) - `planned`
 - 证据项目：Copy-on-Write fork (`project.copy-on-write`) - `planned`
 
