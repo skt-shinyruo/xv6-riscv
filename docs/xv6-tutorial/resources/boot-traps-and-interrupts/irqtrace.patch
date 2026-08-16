@@ -1,0 +1,119 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..7490cca 100644
+--- a/Makefile
++++ b/Makefile
+@@ -147 +147,2 @@ UPROGS=\
+-	$U/_dorphan\
++	$U/_dorphan\
++	$U/_irqtrace\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..7617eed 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -145 +145,2 @@ extern struct spinlock tickslock;
+-void            prepare_return(void);
++void            prepare_return(void);
++void            irqtrace_arm(void);
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..07ce1d3 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,5 @@ sys_uptime(void)
+   release(&tickslock);
++  if (strncmp(myproc()->name, "irqtrace", sizeof(myproc()->name)) == 0)
++    irqtrace_arm();
+   return xticks;
+ }
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 684e288..60ba7bd 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -10 +10,4 @@ struct spinlock tickslock;
+-uint ticks;
++uint ticks;
++static int irqtrace_pid = -1;
++static int irqtrace_stage;
++static uint irqtrace_before;
+@@ -19,2 +22,16 @@ extern int devintr();
++// Tutorial-only single-hart gate; applied only in the private lab tree.
++void
++irqtrace_arm(void)
++{
++  struct proc *p = myproc();
++
++  intr_off();
++  if (irqtrace_stage == 0) {
++    irqtrace_pid = p->pid;
++    irqtrace_before = ticks;
++    irqtrace_stage = 1;
++  }
++}
++
+ void
+ trapinit(void)
+@@ -52 +69,6 @@ usertrap(void)
+-  p->trapframe->epc = r_sepc();
++  p->trapframe->epc = r_sepc();
++  int irqtrace_timer = irqtrace_stage == 1 && p->pid == irqtrace_pid &&
++                       r_scause() == 0x8000000000000005L;
++  if (irqtrace_timer)
++    printk("IRQTRACE 1 USERTRAP pid=%d scause=0x%lx sepc=0x%lx\n", p->pid,
++           r_scause(), r_sepc());
+@@ -81,2 +103,9 @@ usertrap(void)
++  if (irqtrace_timer) {
++    if (which_dev != 2 || ticks != irqtrace_before + 1)
++      panic("irqtrace timer contract");
++    printk("IRQTRACE 2 CLOCK pid=%d ticks=%d->%d\n", p->pid,
++           irqtrace_before, ticks);
++  }
++
+   if (killed(p))
+     kexit(-1);
+@@ -85,4 +114,16 @@ usertrap(void)
+-  if (which_dev == 2)
+-    yield();
+-
++  if (which_dev == 2) {
++    if (irqtrace_timer) {
++      if (p->state != RUNNING)
++        panic("irqtrace before yield state");
++      printk("IRQTRACE 3 YIELD pid=%d state=RUNNING\n", p->pid);
++    }
++    yield();
++    if (irqtrace_timer) {
++      if (p->state != RUNNING)
++        panic("irqtrace after yield state");
++      printk("IRQTRACE 4 RESUME pid=%d state=RUNNING\n", p->pid);
++      irqtrace_stage = 2;
++    }
++  }
++
+   prepare_return();
+diff --git a/user/irqtrace.c b/user/irqtrace.c
+new file mode 100644
+index 0000000..5ccaf95
+--- /dev/null
++++ b/user/irqtrace.c
+@@ -0,0 +1,22 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(void)
++{
++  int before;
++  int after;
++  volatile uint64 spin = 0;
++
++  printf("IRQTRACE ARM\n");
++  before = uptime();
++  after = before;
++  while (after == before) {
++    for (int i = 0; i < 10000000; i++)
++      spin += i;
++    after = uptime();
++  }
++  printf("IRQTRACE USER ticks=%d->%d spin=%d\n", before, after, spin != 0);
++
++  exit(0);
++}

@@ -4,15 +4,15 @@
 
 ## 问题
 
-1. **BOOT-01** 从 QEMU reset 到 shell 提示符，中间切换了哪些特权级、栈、页表和 trap 入口？
-2. **BOOT-02** `_entry` 在进入 C 代码前就用 hart id 计算栈地址；如果 `CPUS > NCPU`，为什么可能先破坏内存而不是干净报错？
-3. **BOOT-03** 为什么其他 hart 必须等待 hart 0 完成初始化？只使用普通变量而没有内存栅栏会发生什么？
+1. **BOOT-01** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-01`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-01原-boot-01)。此处只保留兼容入口。
+2. **BOOT-02** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-02`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-02原-boot-02)。此处只保留兼容入口。
+3. **BOOT-03** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-03`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-03原-boot-03)。此处只保留兼容入口。
 4. **BOOT-04** 本仓库为什么把 `fsinit()` 和 `kexec("/init")` 放在第一次 `forkret()`，而不是 `main()`？
 5. **BOOT-05** 已迁移到[系统调用往返问题 `SYSCALL-01`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-01原-boot-05)。此处只保留兼容入口。
 6. **BOOT-06** 为什么 trampoline 必须在用户页表和内核页表中映射到同一个虚拟地址？
 7. **BOOT-07** 已迁移到[系统调用往返问题 `SYSCALL-02`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-02原-boot-07)。此处只保留兼容入口。
 8. **BOOT-08** 已迁移到[系统调用往返问题 `SYSCALL-03`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-03原-boot-08)。此处只保留兼容入口。
-9. **BOOT-09** `trapframe` 和 `context` 分别保存什么？一个进程阻塞在系统调用中时，两者何时会同时有效？
+9. **BOOT-09** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-04`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-04原-boot-09)。此处只保留兼容入口。
 10. **BOOT-10** 进程跨 hart 恢复后，为什么不能简单恢复旧的 `tp`？
 
 ## 源码入口
