@@ -1,0 +1,687 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..56bddb9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -147,0 +148,2 @@ UPROGS=\
++	$U/_lifecycle\
++	$U/_lifeexec\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..fad58e6 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -5,0 +6 @@ struct inode;
++struct lifesnapshot;
+@@ -36,0 +38 @@ int             filewrite(struct file*, uint64, int n);
++void            filerefcount(int*, int*);
+@@ -62,0 +65 @@ void            kinit(void);
++int             freepagecount(void);
+@@ -104,0 +108 @@ void            procdump(void);
++void            procsnapshot(int, struct lifesnapshot*);
+diff --git a/kernel/file.c b/kernel/file.c
+index 13a4e69..5e7796e 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -27,0 +28,17 @@ fileinit(void)
++void
++filerefcount(int *active, int *refs)
++{
++  struct file *f;
++
++  *active = 0;
++  *refs = 0;
++  acquire(&ftable.lock);
++  for (f = ftable.file; f < ftable.file + NFILE; f++) {
++    if (f->ref > 0) {
++      (*active)++;
++      *refs += f->ref;
++    }
++  }
++  release(&ftable.lock);
++}
++
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 2fcec38..f8d7f2b 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -82,0 +83,13 @@ kalloc(void)
++
++int
++freepagecount(void)
++{
++  int count = 0;
++  struct run *r;
++
++  acquire(&kmem.lock);
++  for (r = kmem.freelist; r; r = r->next)
++    count++;
++  release(&kmem.lock);
++  return count;
++}
+diff --git a/kernel/lifecycle.h b/kernel/lifecycle.h
+new file mode 100644
+index 0000000..426b1f7
+--- /dev/null
++++ b/kernel/lifecycle.h
+@@ -0,0 +1,35 @@
++#define LIFE_NAME 16
++#define LIFE_EVENT_BEFORE 1
++#define LIFE_EVENT_AFTER 2
++#define LIFE_EVENT_ORPHAN 3
++
++struct lifeevent {
++  int kind;
++  int pid;
++  int value;
++};
++
++// Read-only process/resource data returned by the tutorial snapshot syscall.
++struct lifesnapshot {
++  int used;
++  int sleeping;
++  int runnable;
++  int running;
++  int zombie;
++  int free_pages;
++  int active_files;
++  int file_refs;
++  int parent_links;
++  int target_present;
++  int target_sleeping;
++  int target_zombie;
++  int target_parent_is_init;
++  int target_parent_is_caller;
++  int target_ofile_slots;
++  uint64 target_sz;
++  uint64 target_pagetable;
++  uint64 target_trapframe;
++  uint64 target_epc;
++  uint64 target_cwd;
++  char target_name[LIFE_NAME];
++};
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 611e94c..5574e99 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -6,0 +7 @@
++#include "lifecycle.h"
+@@ -631,0 +633,47 @@ killed(struct proc *p)
++void
++procsnapshot(int target_pid, struct lifesnapshot *out)
++{
++  struct proc *p;
++  struct proc *caller = myproc();
++
++  memset(out, 0, sizeof(*out));
++  acquire(&wait_lock);
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state != UNUSED) {
++      out->used++;
++      if (p->state == SLEEPING)
++        out->sleeping++;
++      if (p->state == RUNNABLE)
++        out->runnable++;
++      if (p->state == RUNNING)
++        out->running++;
++      if (p->state == ZOMBIE)
++        out->zombie++;
++      if (p->parent)
++        out->parent_links++;
++      if (p->pid == target_pid) {
++        out->target_present = 1;
++        out->target_sleeping = p->state == SLEEPING;
++        out->target_zombie = p->state == ZOMBIE;
++        out->target_parent_is_init = p->parent == initproc;
++        out->target_parent_is_caller = p->parent == caller;
++        out->target_sz = p->sz;
++        out->target_pagetable = (uint64)p->pagetable;
++        out->target_trapframe = (uint64)p->trapframe;
++        out->target_epc = p->trapframe ? p->trapframe->epc : 0;
++        out->target_cwd = (uint64)p->cwd;
++        for (int fd = 0; fd < NOFILE; fd++)
++          if (p->ofile[fd])
++            out->target_ofile_slots++;
++        safestrcpy(out->target_name, p->name, sizeof(out->target_name));
++      }
++    }
++    release(&p->lock);
++  }
++  release(&wait_lock);
++
++  out->free_pages = freepagecount();
++  filerefcount(&out->active_files, &out->file_refs);
++}
++
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..2ffe09c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,0 +105 @@ extern uint64 sys_close(void);
++extern uint64 sys_lifesnapshot(void);
+@@ -130,0 +132 @@ static uint64 (*syscalls[])(void) = {
++  [SYS_lifesnapshot] sys_lifesnapshot,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..de10484 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,0 +23 @@
++#define SYS_lifesnapshot 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..4e03dcd 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,0 +8 @@
++#include "lifecycle.h"
+@@ -109,0 +111,16 @@ sys_uptime(void)
++
++uint64
++sys_lifesnapshot(void)
++{
++  int target_pid;
++  uint64 address;
++  struct lifesnapshot snapshot;
++
++  argint(0, &target_pid);
++  argaddr(1, &address);
++  procsnapshot(target_pid, &snapshot);
++  if (copyout(myproc()->pagetable, address, (char *)&snapshot,
++              sizeof(snapshot)) < 0)
++    return -1;
++  return 0;
++}
+diff --git a/user/lifecycle.c b/user/lifecycle.c
+new file mode 100644
+index 0000000..1695506
+--- /dev/null
++++ b/user/lifecycle.c
+@@ -0,0 +1,444 @@
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/lifecycle.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++static struct lifesnapshot snapbuf;
++static char oversized_args[MAXARG - 1][300];
++
++static void
++fail(char *message)
++{
++  printf("LIFE FAIL %s\n", message);
++  exit(1);
++}
++
++static void
++snapshot(int target_pid, struct lifesnapshot *out)
++{
++  if (lifesnapshot(target_pid, &snapbuf) < 0)
++    fail("snapshot");
++  *out = snapbuf;
++}
++
++static int
++same_ledger(struct lifesnapshot *left, struct lifesnapshot *right)
++{
++  return left->used == right->used && left->free_pages == right->free_pages &&
++         left->active_files == right->active_files &&
++         left->file_refs == right->file_refs &&
++         left->parent_links == right->parent_links;
++}
++
++static void
++itoa10(int value, char *buffer)
++{
++  char reverse[16];
++  int count = 0;
++
++  do {
++    reverse[count++] = '0' + value % 10;
++    value /= 10;
++  } while (value);
++  for (int i = 0; i < count; i++)
++    buffer[i] = reverse[count - i - 1];
++  buffer[count] = 0;
++}
++
++static void
++must_pipe(int descriptors[2])
++{
++  if (pipe(descriptors) < 0)
++    fail("pipe");
++}
++
++static void
++write_byte(int fd)
++{
++  char byte = 'x';
++  if (write(fd, &byte, 1) != 1)
++    fail("write-byte");
++}
++
++static void
++read_event(int fd, struct lifeevent *event)
++{
++  if (read(fd, event, sizeof(*event)) != sizeof(*event))
++    fail("read-event");
++}
++
++static void
++wait_sleeping(int pid, int parent_is_init, struct lifesnapshot *out)
++{
++  for (int i = 0; i < 200; i++) {
++    snapshot(pid, out);
++    if (out->target_present && out->target_sleeping &&
++        (!parent_is_init || out->target_parent_is_init))
++      return;
++    pause(1);
++  }
++  fail("target-not-sleeping");
++}
++
++static void
++wait_zombie(int pid, struct lifesnapshot *out)
++{
++  for (int i = 0; i < 200; i++) {
++    snapshot(pid, out);
++    if (out->target_present && out->target_zombie)
++      return;
++    pause(1);
++  }
++  fail("target-not-zombie");
++}
++
++static void
++wait_absent(int pid, struct lifesnapshot *out)
++{
++  for (int i = 0; i < 200; i++) {
++    snapshot(pid, out);
++    if (!out->target_present)
++      return;
++    pause(1);
++  }
++  fail("target-not-reclaimed");
++}
++
++static void
++exec_phase(struct lifesnapshot *base)
++{
++  int event_pipe[2], before_gate[2], after_gate[2];
++  int inherited = open("README", O_RDONLY);
++  if (inherited < 0)
++    fail("open-readme");
++  must_pipe(event_pipe);
++  must_pipe(before_gate);
++  must_pipe(after_gate);
++
++  int child = fork();
++  if (child < 0)
++    fail("exec-fork");
++  if (child == 0) {
++    struct lifeevent event;
++    char token;
++    char pid_text[16], event_text[16], gate_text[16], inherited_text[16];
++
++    close(event_pipe[0]);
++    close(before_gate[1]);
++    close(after_gate[1]);
++    event.kind = LIFE_EVENT_BEFORE;
++    event.pid = getpid();
++    event.value = inherited >= 0;
++    if (write(event_pipe[1], &event, sizeof(event)) != sizeof(event))
++      exit(70);
++    if (read(before_gate[0], &token, 1) != 1)
++      exit(71);
++    close(before_gate[0]);
++    itoa10(event.pid, pid_text);
++    itoa10(event_pipe[1], event_text);
++    itoa10(after_gate[0], gate_text);
++    itoa10(inherited, inherited_text);
++    char *arguments[] = {
++      "lifeexec", pid_text, event_text, gate_text, inherited_text, 0,
++    };
++    exec("lifeexec", arguments);
++    exit(72);
++  }
++
++  close(event_pipe[1]);
++  close(before_gate[0]);
++  close(after_gate[0]);
++  struct lifeevent before_event, after_event;
++  struct lifesnapshot before, after, zombie, retained, reaped;
++  read_event(event_pipe[0], &before_event);
++  if (before_event.kind != LIFE_EVENT_BEFORE || before_event.pid != child)
++    fail("before-event");
++  wait_sleeping(child, 0, &before);
++  if (!before.target_parent_is_caller)
++    fail("before-parent");
++  printf("LIFE EXEC_READY pid=%d pid_same=%d fd_ok=%d sleeping=%d name=%s "
++         "used=%d free=%d active_files=%d refs=%d parents=%d ofile=%d\n",
++         child, before_event.pid == child, before_event.value,
++         before.target_sleeping, before.target_name, before.used,
++         before.free_pages, before.active_files, before.file_refs,
++         before.parent_links, before.target_ofile_slots);
++
++  write_byte(before_gate[1]);
++  close(before_gate[1]);
++  read_event(event_pipe[0], &after_event);
++  if (after_event.kind != LIFE_EVENT_AFTER || after_event.pid != child)
++    fail("after-event");
++  wait_sleeping(child, 0, &after);
++  int sz_changed = before.target_sz != after.target_sz;
++  int pagetable_changed = before.target_pagetable != after.target_pagetable;
++  int trapframe_same = before.target_trapframe == after.target_trapframe;
++  int cwd_same = before.target_cwd == after.target_cwd;
++  printf("LIFE EXEC_AFTER pid=%d pid_same=%d fd_ok=%d sleeping=%d name=%s "
++         "sz_changed=%d pagetable_changed=%d trapframe_same=%d cwd_same=%d "
++         "used=%d free=%d active_files=%d refs=%d parents=%d ofile=%d\n",
++         child, after_event.pid == child, after_event.value,
++         after.target_sleeping, after.target_name, sz_changed,
++         pagetable_changed, trapframe_same, cwd_same, after.used,
++         after.free_pages, after.active_files, after.file_refs,
++         after.parent_links, after.target_ofile_slots);
++  if (!sz_changed || !pagetable_changed || !trapframe_same || !cwd_same)
++    fail("exec-identity");
++
++  write_byte(after_gate[1]);
++  close(after_gate[1]);
++  wait_zombie(child, &zombie);
++  int bad_wait = wait((int *)(uint64)-1);
++  snapshot(child, &retained);
++  printf("LIFE WAIT_BAD pid=%d ret=%d target_present=%d zombie=%d ofile=%d\n",
++         child, bad_wait, retained.target_present, retained.target_zombie,
++         retained.target_ofile_slots);
++  if (bad_wait != -1 || !retained.target_present || !retained.target_zombie ||
++      retained.target_ofile_slots != 0)
++    fail("bad-wait-reclaimed");
++
++  int status = 0;
++  int waited = wait(&status);
++  close(event_pipe[0]);
++  close(inherited);
++  snapshot(child, &reaped);
++  printf("LIFE EXEC_REAP pid=%d waited=%d status=%d target_present=%d "
++         "used=%d free=%d active_files=%d refs=%d parents=%d\n",
++         child, waited, status, reaped.target_present, reaped.used,
++         reaped.free_pages, reaped.active_files, reaped.file_refs,
++         reaped.parent_links);
++  if (waited != child || status != 37 || reaped.target_present ||
++      !same_ledger(base, &reaped))
++    fail("exec-reap");
++}
++
++static void
++exec_failure_phase(struct lifesnapshot *base)
++{
++  int descriptor = open("README", O_RDONLY);
++  if (descriptor < 0)
++    fail("execfail-open");
++  int pid = getpid();
++  char *size = sbrk(0);
++  char *arguments[MAXARG];
++  for (int i = 0; i < MAXARG - 1; i++) {
++    arguments[i] = oversized_args[i];
++    for (int j = 0; j < 299; j++)
++      oversized_args[i][j] = 'a';
++    oversized_args[i][299] = 0;
++  }
++  arguments[0] = "lifeexec";
++  arguments[MAXARG - 1] = 0;
++  int result = exec("lifeexec", arguments);
++  char byte;
++  int fd_ok = read(descriptor, &byte, 1) == 1;
++  int same_size = sbrk(0) == size;
++  int same_pid = getpid() == pid;
++  close(descriptor);
++  struct lifesnapshot after;
++  snapshot(0, &after);
++  printf("LIFE EXECFAIL ret=%d pid_same=%d sz_same=%d fd_ok=%d "
++         "used=%d free=%d active_files=%d refs=%d parents=%d\n",
++         result, same_pid, same_size, fd_ok, after.used, after.free_pages,
++         after.active_files, after.file_refs, after.parent_links);
++  if (result != -1 || !same_pid || !same_size || !fd_ok ||
++      !same_ledger(base, &after))
++    fail("execfail-rollback");
++}
++
++static void
++kill_phase(struct lifesnapshot *base)
++{
++  int event_pipe[2], block_pipe[2];
++  must_pipe(event_pipe);
++  must_pipe(block_pipe);
++  int child = fork();
++  if (child < 0)
++    fail("kill-fork");
++  if (child == 0) {
++    struct lifeevent event = {LIFE_EVENT_BEFORE, getpid(), 1};
++    char byte;
++    close(event_pipe[0]);
++    close(block_pipe[1]);
++    if (write(event_pipe[1], &event, sizeof(event)) != sizeof(event))
++      exit(60);
++    close(event_pipe[1]);
++    read(block_pipe[0], &byte, 1);
++    exit(61);
++  }
++
++  close(event_pipe[1]);
++  close(block_pipe[0]);
++  struct lifeevent event;
++  struct lifesnapshot sleeping, reaped;
++  read_event(event_pipe[0], &event);
++  close(event_pipe[0]);
++  wait_sleeping(child, 0, &sleeping);
++  printf("LIFE KILL_SLEEP pid=%d target_present=%d sleeping=%d used=%d "
++         "free=%d active_files=%d refs=%d parents=%d\n",
++         child, sleeping.target_present, sleeping.target_sleeping,
++         sleeping.used, sleeping.free_pages, sleeping.active_files,
++         sleeping.file_refs, sleeping.parent_links);
++  if (kill(child) < 0)
++    fail("kill-call");
++  int status = 0;
++  int waited = wait(&status);
++  close(block_pipe[1]);
++  snapshot(child, &reaped);
++  printf("LIFE KILL_REAP pid=%d waited=%d status=%d target_present=%d "
++         "used=%d free=%d active_files=%d refs=%d parents=%d\n",
++         child, waited, status, reaped.target_present, reaped.used,
++         reaped.free_pages, reaped.active_files, reaped.file_refs,
++         reaped.parent_links);
++  if (waited != child || status != -1 || reaped.target_present ||
++      !same_ledger(base, &reaped))
++    fail("kill-reap");
++}
++
++static void
++orphan_phase(struct lifesnapshot *base)
++{
++  int event_pipe[2], gate[2];
++  must_pipe(event_pipe);
++  must_pipe(gate);
++  int middle = fork();
++  if (middle < 0)
++    fail("orphan-middle");
++  if (middle == 0) {
++    close(event_pipe[0]);
++    int grandchild = fork();
++    if (grandchild < 0)
++      exit(50);
++    if (grandchild == 0) {
++      struct lifeevent event = {LIFE_EVENT_ORPHAN, getpid(), 1};
++      char byte;
++      close(gate[1]);
++      if (write(event_pipe[1], &event, sizeof(event)) != sizeof(event))
++        exit(51);
++      close(event_pipe[1]);
++      if (read(gate[0], &byte, 1) != 1)
++        exit(52);
++      exit(0);
++    }
++    close(event_pipe[1]);
++    close(gate[0]);
++    close(gate[1]);
++    exit(23);
++  }
++
++  close(event_pipe[1]);
++  close(gate[0]);
++  struct lifeevent event;
++  read_event(event_pipe[0], &event);
++  if (event.kind != LIFE_EVENT_ORPHAN)
++    fail("orphan-event");
++  int middle_status = 0;
++  if (wait(&middle_status) != middle || middle_status != 23)
++    fail("orphan-middle-wait");
++  struct lifesnapshot adopted, reclaimed;
++  wait_sleeping(event.pid, 1, &adopted);
++  printf("LIFE ORPHAN_REPARENT pid=%d target_present=%d sleeping=%d "
++         "target_parent_init=%d used=%d free=%d active_files=%d refs=%d parents=%d\n",
++         event.pid, adopted.target_present, adopted.target_sleeping,
++         adopted.target_parent_is_init, adopted.used, adopted.free_pages,
++         adopted.active_files, adopted.file_refs, adopted.parent_links);
++  write_byte(gate[1]);
++  close(gate[1]);
++  close(event_pipe[0]);
++  wait_absent(event.pid, &reclaimed);
++  printf("LIFE ORPHAN_REAP pid=%d target_present=%d absent=%d used=%d "
++         "free=%d active_files=%d refs=%d parents=%d\n",
++         event.pid, reclaimed.target_present, !reclaimed.target_present,
++         reclaimed.used, reclaimed.free_pages, reclaimed.active_files,
++         reclaimed.file_refs, reclaimed.parent_links);
++  if (!same_ledger(base, &reclaimed))
++    fail("orphan-ledger");
++}
++
++static void
++capacity_phase(struct lifesnapshot *base)
++{
++  int gate[2];
++  must_pipe(gate);
++  int children = 0;
++  int fork_fail = 0;
++  for (;;) {
++    int pid = fork();
++    if (pid < 0) {
++      fork_fail = pid;
++      break;
++    }
++    if (pid == 0) {
++      char byte;
++      close(gate[1]);
++      int result = read(gate[0], &byte, 1);
++      close(gate[0]);
++      exit(result == 1 ? 0 : 1);
++    }
++    children++;
++  }
++
++  struct lifesnapshot full;
++  for (int i = 0; i < 200; i++) {
++    snapshot(0, &full);
++    if (full.used == NPROC && full.sleeping >= base->sleeping + children)
++      break;
++    if (i == 199)
++      fail("capacity-not-sleeping");
++    pause(1);
++  }
++  int inherited_refs = full.file_refs - base->file_refs;
++  printf("LIFE CAPACITY children=%d fork_fail=%d used=%d sleeping=%d "
++         "free=%d active_files=%d refs=%d inherited_refs=%d parents=%d\n",
++         children, fork_fail, full.used, full.sleeping, full.free_pages,
++         full.active_files, full.file_refs, inherited_refs, full.parent_links);
++  if (fork_fail != -1 || full.used != NPROC || full.free_pages <= 0 ||
++      children != full.used - base->used ||
++      full.parent_links != base->parent_links + children ||
++      full.active_files != base->active_files + 2 ||
++      full.file_refs != base->file_refs + 2 + children * 4)
++    fail("capacity-ledger");
++
++  for (int i = 0; i < children; i++)
++    write_byte(gate[1]);
++  close(gate[1]);
++  close(gate[0]);
++  for (int i = 0; i < children; i++) {
++    int status = -1;
++    if (wait(&status) < 0 || status != 0)
++      fail("capacity-wait");
++  }
++  struct lifesnapshot reaped;
++  snapshot(0, &reaped);
++  printf("LIFE CAPACITY_REAP children=%d used=%d free=%d active_files=%d "
++         "refs=%d parents=%d\n",
++         children, reaped.used, reaped.free_pages, reaped.active_files,
++         reaped.file_refs, reaped.parent_links);
++  if (!same_ledger(base, &reaped))
++    fail("capacity-reap-ledger");
++}
++
++int
++main(void)
++{
++  struct lifesnapshot base, final;
++  snapshot(0, &base);
++  printf("LIFE BASE used=%d sleeping=%d runnable=%d running=%d zombie=%d "
++         "free=%d active_files=%d refs=%d parents=%d\n",
++         base.used, base.sleeping, base.runnable, base.running, base.zombie,
++         base.free_pages, base.active_files, base.file_refs, base.parent_links);
++  exec_phase(&base);
++  exec_failure_phase(&base);
++  kill_phase(&base);
++  orphan_phase(&base);
++  capacity_phase(&base);
++  snapshot(0, &final);
++  printf("LIFE FINAL used=%d free=%d active_files=%d refs=%d parents=%d\n",
++         final.used, final.free_pages, final.active_files, final.file_refs,
++         final.parent_links);
++  if (!same_ledger(&base, &final))
++    fail("final-ledger");
++  printf("LIFE PASS\n");
++  exit(0);
++}
+diff --git a/user/lifeexec.c b/user/lifeexec.c
+new file mode 100644
+index 0000000..269218b
+--- /dev/null
++++ b/user/lifeexec.c
+@@ -0,0 +1,28 @@
++#include "kernel/types.h"
++#include "kernel/lifecycle.h"
++#include "user/user.h"
++
++int
++main(int argc, char **argv)
++{
++  char byte;
++  struct lifeevent event;
++
++  if (argc != 5)
++    exit(80);
++  int expected_pid = atoi(argv[1]);
++  int event_fd = atoi(argv[2]);
++  int gate_fd = atoi(argv[3]);
++  int inherited_fd = atoi(argv[4]);
++  int fd_ok = read(inherited_fd, &byte, 1) == 1;
++
++  event.kind = LIFE_EVENT_AFTER;
++  event.pid = getpid();
++  event.value = fd_ok;
++  if (event.pid != expected_pid || !fd_ok ||
++      write(event_fd, &event, sizeof(event)) != sizeof(event))
++    exit(81);
++  if (read(gate_fd, &byte, 1) != 1)
++    exit(82);
++  exit(37);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921..880a18c 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -26,0 +27 @@ int uptime(void);
++int lifesnapshot(int, void *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..3b45408 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,0 +45 @@ entry("uptime");
++entry("lifesnapshot");

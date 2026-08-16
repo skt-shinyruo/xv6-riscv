@@ -7,7 +7,7 @@
 1. **BOOT-01** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-01`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-01原-boot-01)。此处只保留兼容入口。
 2. **BOOT-02** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-02`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-02原-boot-02)。此处只保留兼容入口。
 3. **BOOT-03** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-03`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-03原-boot-03)。此处只保留兼容入口。
-4. **BOOT-04** 本仓库为什么把 `fsinit()` 和 `kexec("/init")` 放在第一次 `forkret()`，而不是 `main()`？
+4. **BOOT-04** 已迁移到[进程生命周期问题 `LIFE-01`](../xv6-tutorial/questions/process-lifecycle.md#life-01原-boot-04)。此处只保留兼容入口。
 5. **BOOT-05** 已迁移到[系统调用往返问题 `SYSCALL-01`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-01原-boot-05)。此处只保留兼容入口。
 6. **BOOT-06** 为什么 trampoline 必须在用户页表和内核页表中映射到同一个虚拟地址？
 7. **BOOT-07** 已迁移到[系统调用往返问题 `SYSCALL-02`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-02原-boot-07)。此处只保留兼容入口。

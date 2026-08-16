@@ -20,7 +20,10 @@
 
 ## 进程、调度与内存
 
-- 进程、调度与地址空间 (`core.process-and-memory`) - `planned`
+- [进程生命周期与回收](process-and-memory.md) - `verified`
+- 调度、同步与等待 (`core.scheduling-and-synchronization`) - `planned`
+- 虚拟内存、映射与 fault (`core.virtual-memory`) - `planned`
+- 证据项目：Copy-on-Write fork (`project.copy-on-write`) - `planned`
 
 ## 通信与设备 I/O
 

@@ -8,7 +8,7 @@
 | 观察系统 (`observe-system`) | 0 | 0 | 1 |
 | 程序、构建与 ABI (`programs-and-abi`) | 0 | 0 | 1 |
 | 进入和离开内核 (`kernel-boundaries`) | 0 | 0 | 3 |
-| 进程、调度与内存 (`processes-and-memory`) | 1 | 0 | 0 |
+| 进程、调度与内存 (`processes-and-memory`) | 3 | 0 | 1 |
 | 通信与设备 I/O (`communication-and-io`) | 1 | 0 | 0 |
 | 文件系统与持久化 (`persistence`) | 1 | 0 | 0 |
 | 证据、失败与综合 (`evidence`) | 1 | 0 | 0 |
