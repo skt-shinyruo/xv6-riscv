@@ -8,3 +8,4 @@
 - [Observe-system 0.1.0 非作者走查](observe-system-0.1.0.md)：首个核心单元的启动时间线、配置实验和清理证据通过。
 - [User-program-and-ABI 0.1.0 非作者走查](user-program-and-abi-0.1.0.md)：用户程序构建、ELF/ABI、镜像路径和隔离实验通过。
 - [Syscall-roundtrip 0.1.0 非作者走查](syscall-roundtrip-0.1.0.md)：`getpid` 正常与未知编号的特权级、页表、栈、trapframe 和返回轨迹通过。
+- [Add-system-call 0.1.0 非作者走查](add-system-call-0.1.0.md)：六文件 `sysprobe` patch、missing-dispatch、三个 `int` 往返、三层回归和 cleanup 通过。

@@ -339,30 +339,33 @@
       "title": "有界实验：新增最小系统调用",
       "stage": "kernel-boundaries",
       "order": 20,
-      "status": "draft",
+      "status": "verified",
       "requires": ["core.syscall-roundtrip"],
       "related": ["core.user-program-and-abi"],
       "black_boxes": [],
       "resolves": [],
       "owns": ["bounded-add-system-call-lab"],
       "outcomes": [
-        "能独立贯穿声明、生成 stub、编号、分派、handler 和用户测试",
-        "能为未知编号、返回值和回归范围写出明确 oracle"
+        "能用六文件 patch 独立贯穿声明、生成 stub、编号、分派、handler 和用户测试",
+        "能用受控 missing-dispatch、三个 int 返回值和三层回归建立 S/F/B oracle"
       ],
       "source_anchors": [
         {"path": "user/user.h", "symbol": "getpid"},
-        {"path": "user/usys.pl", "symbol": "entry"},
+        {"path": "user/usys.pl", "symbol": "sub entry"},
         {"path": "kernel/syscall.h", "symbol": "SYS_getpid"},
         {"path": "kernel/syscall.c", "symbol": "syscalls"},
         {"path": "kernel/sysproc.c", "symbol": "sys_getpid"},
-        {"path": "Makefile", "symbol": "UPROGS"}
+        {"path": "user/usertests.c", "symbol": "quicktests"},
+        {"path": "Makefile", "symbol": "$U/usys.S :"},
+        {"path": "test-xv6.py", "symbol": "test_usertests"}
       ],
       "evidence_dimensions": ["S", "F", "B"],
       "resources": [
-        "templates/bounded-change-report.md",
-        "templates/trace-worksheet.md"
+        "resources/add-system-call/sysprobe.patch",
+        "resources/add-system-call/run-lab.py",
+        "templates/bounded-change-report.md"
       ],
-      "reviews": []
+      "reviews": ["reviews/add-system-call-0.1.0.md"]
     },
     {
       "id": "core.process-and-memory",
@@ -476,6 +479,8 @@
     {"path": "kernel/trap.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": []},
     {"path": "kernel/syscall.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]},
     {"path": "kernel/syscall.h", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]},
-    {"path": "kernel/sysproc.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]}
+    {"path": "kernel/sysproc.c", "kind": "kernel", "owner": "core.syscall-roundtrip", "secondary": ["lab.add-system-call"]},
+    {"path": "user/usertests.c", "kind": "user", "owner": "lab.add-system-call", "secondary": ["core.syscall-roundtrip"]},
+    {"path": "test-xv6.py", "kind": "test", "owner": "lab.add-system-call", "secondary": []}
   ]
 }

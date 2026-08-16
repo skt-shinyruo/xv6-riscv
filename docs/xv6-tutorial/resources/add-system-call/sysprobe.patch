@@ -1,0 +1,97 @@
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..2085c7b 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -92,6 +92,7 @@ extern uint64 sys_fstat(void);
+ extern uint64 sys_chdir(void);
+ extern uint64 sys_dup(void);
+ extern uint64 sys_getpid(void);
++extern uint64 sys_sysprobe(void);
+ extern uint64 sys_sbrk(void);
+ extern uint64 sys_pause(void);
+ extern uint64 sys_uptime(void);
+@@ -118,6 +119,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_chdir]   sys_chdir,
+   [SYS_dup]     sys_dup,
+   [SYS_getpid]  sys_getpid,
++  [SYS_sysprobe] sys_sysprobe,
+   [SYS_sbrk]    sys_sbrk,
+   [SYS_pause]   sys_pause,
+   [SYS_uptime]  sys_uptime,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..23466d5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sysprobe 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..878d93b 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -25,3 +25,12 @@
++uint64
++sys_sysprobe(void)
++{
++  int value;
++
++  argint(0, &value);
++  return value;
++}
++
+ uint64
+ sys_fork(void)
+ {
+diff --git a/user/user.h b/user/user.h
+index ecd0921..274e592 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -21,6 +21,7 @@ int mkdir(const char *);
+ int chdir(const char *);
+ int dup(int);
+ int getpid(void);
++int sysprobe(int);
+ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+diff --git a/user/usertests.c b/user/usertests.c
+index d97bceb..e3e1ab5 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -2766,3 +2766,18 @@
++void
++sysprobetest(char *s)
++{
++  int values[] = {0, 12345, -7};
++
++  for (int i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
++    int got = sysprobe(values[i]);
++    if (got != values[i]) {
++      printf("%s: sysprobe(%d) returned %d, expected %d\n", s, values[i], got,
++             values[i]);
++      exit(1);
++    }
++  }
++}
++
+ struct test {
+   void (*f)(char *);
+   char *s;
+@@ -2769,2 +2784,3 @@ struct test {
+ } quicktests[] = {
++  {sysprobetest, "sysprobe"},
+   {copyin, "copyin"},
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..8c189e5 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -39,6 +39,7 @@ entry("mkdir");
+ entry("chdir");
+ entry("dup");
+ entry("getpid");
++entry("sysprobe");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");

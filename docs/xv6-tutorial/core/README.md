@@ -15,7 +15,7 @@
 ## 进入和离开内核
 
 - [一次系统调用如何往返](syscall-roundtrip.md) - `verified`
-- [有界实验：新增最小系统调用](../experiments/add-system-call.md) - `draft`
+- [有界实验：新增最小系统调用](../experiments/add-system-call.md) - `verified`
 
 ## 进程、调度与内存
 
