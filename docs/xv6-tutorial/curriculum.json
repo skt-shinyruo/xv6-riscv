@@ -295,7 +295,7 @@
       "title": "一次系统调用如何往返",
       "stage": "kernel-boundaries",
       "order": 10,
-      "status": "draft",
+      "status": "verified",
       "requires": ["core.user-program-and-abi"],
       "related": ["foundation.guided-debugging"],
       "black_boxes": ["full-trampoline-page-table-contract"],
@@ -303,19 +303,35 @@
       "owns": ["syscall-roundtrip"],
       "outcomes": [
         "能追踪 getpid 从用户 stub、ecall、trap、分派到返回值恢复的完整路径",
-        "能记录特权级、页表、栈、关键寄存器和 trapframe 的变化"
+        "能记录特权级、页表、栈、关键寄存器和 trapframe 的变化",
+        "能用正常与未知编号两个隔离实例验证 epc 前进、分派和返回关系"
       ],
       "source_anchors": [
-        {"path": "user/usys.pl", "symbol": "entry"},
+        {"path": "user/usys.pl", "symbol": "entry(\"getpid\")"},
+        {"path": "user/usertests.c", "symbol": "reparent("},
+        {"path": "kernel/syscall.h", "symbol": "SYS_getpid"},
+        {"path": "kernel/proc.h", "symbol": "struct trapframe"},
         {"path": "kernel/trampoline.S", "symbol": "uservec"},
+        {"path": "kernel/trampoline.S", "symbol": "userret"},
         {"path": "kernel/trap.c", "symbol": "usertrap"},
-        {"path": "kernel/syscall.c", "symbol": "syscall"},
+        {"path": "kernel/trap.c", "symbol": "prepare_return"},
+        {"path": "kernel/syscall.c", "symbol": "syscalls[]"},
+        {"path": "kernel/syscall.c", "symbol": "unknown sys call"},
         {"path": "kernel/sysproc.c", "symbol": "sys_getpid"},
-        {"path": "kernel/trampoline.S", "symbol": "userret"}
+        {"path": "kernel/memlayout.h", "symbol": "TRAPFRAME"},
+        {"path": "kernel/riscv.h", "symbol": "SSTATUS_SPP"},
+        {"path": "kernel/riscv.h", "symbol": "MAKE_SATP"}
       ],
       "evidence_dimensions": ["S", "F", "B"],
-      "resources": ["templates/trace-worksheet.md"],
-      "reviews": []
+      "resources": [
+        "templates/trace-worksheet.md",
+        "resources/syscall-roundtrip/getpid-trace-worksheet.md",
+        "resources/syscall-roundtrip/trace.gdb.in",
+        "resources/syscall-roundtrip/run-trace.py",
+        "questions/syscall-roundtrip.md",
+        "questions/answers/syscall-roundtrip.md"
+      ],
+      "reviews": ["reviews/syscall-roundtrip-0.1.0.md"]
     },
     {
       "id": "lab.add-system-call",

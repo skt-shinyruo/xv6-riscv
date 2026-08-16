@@ -8,10 +8,10 @@
 2. **BOOT-02** `_entry` 在进入 C 代码前就用 hart id 计算栈地址；如果 `CPUS > NCPU`，为什么可能先破坏内存而不是干净报错？
 3. **BOOT-03** 为什么其他 hart 必须等待 hart 0 完成初始化？只使用普通变量而没有内存栅栏会发生什么？
 4. **BOOT-04** 本仓库为什么把 `fsinit()` 和 `kexec("/init")` 放在第一次 `forkret()`，而不是 `main()`？
-5. **BOOT-05** 用户执行 `ecall` 时，硬件到底自动完成了什么？哪些工作必须由 `uservec` 完成？
+5. **BOOT-05** 已迁移到[系统调用往返问题 `SYSCALL-01`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-01原-boot-05)。此处只保留兼容入口。
 6. **BOOT-06** 为什么 trampoline 必须在用户页表和内核页表中映射到同一个虚拟地址？
-7. **BOOT-07** 为什么系统调用要执行 `epc += 4`，而 page fault 不能推进 `epc`？
-8. **BOOT-08** `usertrap()` 为什么要先切换 `stvec`、保存 trap 原因，然后才能打开中断？
+7. **BOOT-07** 已迁移到[系统调用往返问题 `SYSCALL-02`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-02原-boot-07)。此处只保留兼容入口。
+8. **BOOT-08** 已迁移到[系统调用往返问题 `SYSCALL-03`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-03原-boot-08)。此处只保留兼容入口。
 9. **BOOT-09** `trapframe` 和 `context` 分别保存什么？一个进程阻塞在系统调用中时，两者何时会同时有效？
 10. **BOOT-10** 进程跨 hart 恢复后，为什么不能简单恢复旧的 `tp`？
 

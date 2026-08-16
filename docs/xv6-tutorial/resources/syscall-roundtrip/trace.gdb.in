@@ -1,0 +1,97 @@
+set pagination off
+set confirm off
+set print elements 0
+set architecture riscv:rv64
+target remote 127.0.0.1:@PORT@
+
+printf "\nTRACE ARMED\n"
+hbreak *@STUB@
+continue
+delete breakpoints
+printf "\nTRACE STUB priv=0x%lx pc=0x%lx sp=0x%lx ra=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $ra, $a0, $a7, $satp
+
+hbreak *@ECALL@
+continue
+delete breakpoints
+printf "\nTRACE ECALL_BEFORE priv=0x%lx pc=0x%lx sp=0x%lx ra=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $ra, $a0, $a7, $satp
+if @MUTATE@
+  set $a7 = @UNKNOWN@
+end
+printf "\nTRACE ECALL priv=0x%lx pc=0x%lx sp=0x%lx ra=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $ra, $a0, $a7, $satp
+
+hbreak *@USERVEC@
+continue
+delete breakpoints
+printf "\nTRACE USERVEC priv=0x%lx pc=0x%lx sp=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx sepc=0x%lx scause=0x%lx sstatus=0x%lx stvec=0x%lx sscratch=0x%lx\n", $priv, $pc, $sp, $a0, $a7, $satp, $sepc, $scause, $sstatus, $stvec, $sscratch
+
+hbreak *@SAVED@
+continue
+delete breakpoints
+set $trace_tf = @TRAPFRAME@
+printf "\nTRACE SAVED priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx tf_sp=0x%lx tf_a0=0x%lx tf_a7=0x%lx\n", $priv, $pc, $sp, $satp, *(unsigned long *)($trace_tf + 48), *(unsigned long *)($trace_tf + 112), *(unsigned long *)($trace_tf + 168)
+
+hbreak *@KSTACK@
+continue
+delete breakpoints
+printf "\nTRACE KSTACK priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $satp
+
+hbreak *@KPAGETABLE@
+continue
+delete breakpoints
+printf "\nTRACE KPAGETABLE priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $satp
+
+break usertrap
+continue
+delete breakpoints
+printf "\nTRACE USERTRAP priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx sepc=0x%lx scause=0x%lx sstatus=0x%lx\n", $priv, $pc, $sp, $satp, $sepc, $scause, $sstatus
+
+hbreak *@ADVANCED@
+continue
+delete breakpoints
+set $trace_p = cpus[$tp].proc
+printf "\nTRACE ADVANCED priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx sepc=0x%lx scause=0x%lx sstatus=0x%lx tf_epc=0x%lx tf_a7=0x%lx\n", $priv, $pc, $sp, $satp, $sepc, $scause, $sstatus, $trace_p->trapframe->epc, $trace_p->trapframe->a7
+
+break syscall
+continue
+delete breakpoints
+set $trace_p = cpus[$tp].proc
+printf "\nTRACE SYSCALL priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx pid=0x%lx tf_epc=0x%lx tf_a0=0x%lx tf_a7=0x%lx\n", $priv, $pc, $sp, $satp, $trace_p->pid, $trace_p->trapframe->epc, $trace_p->trapframe->a0, $trace_p->trapframe->a7
+
+set $trace_handler_hits = 0
+set $trace_handler_pid = 0
+break sys_getpid
+commands
+  silent
+  set $trace_handler_hits = $trace_handler_hits + 1
+  set $trace_handler_pid = cpus[$tp].proc->pid
+  printf "\nTRACE HANDLER priv=0x%lx pid=0x%lx\n", $priv, $trace_handler_pid
+  continue
+end
+break prepare_return
+continue
+delete breakpoints
+set $trace_p = cpus[$tp].proc
+printf "\nTRACE PREPARE priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx pid=0x%lx handler_hits=0x%lx tf_epc=0x%lx tf_a0=0x%lx tf_a7=0x%lx\n", $priv, $pc, $sp, $satp, $trace_p->pid, $trace_handler_hits, $trace_p->trapframe->epc, $trace_p->trapframe->a0, $trace_p->trapframe->a7
+
+hbreak *@USERRET@
+continue
+delete breakpoints
+printf "\nTRACE USERRET priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx target_satp=0x%lx sepc=0x%lx sstatus=0x%lx\n", $priv, $pc, $sp, $satp, $a0, $sepc, $sstatus
+
+hbreak *@USER_SATP@
+continue
+delete breakpoints
+printf "\nTRACE USER_SATP priv=0x%lx pc=0x%lx sp=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $satp
+
+hbreak *@RESTORED@
+continue
+delete breakpoints
+printf "\nTRACE RESTORED priv=0x%lx pc=0x%lx sp=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx sepc=0x%lx sstatus=0x%lx\n", $priv, $pc, $sp, $a0, $a7, $satp, $sepc, $sstatus
+
+hbreak *@AFTER@
+continue
+delete breakpoints
+printf "\nTRACE AFTER priv=0x%lx pc=0x%lx sp=0x%lx ra=0x%lx a0=0x%lx a7=0x%lx satp=0x%lx\n", $priv, $pc, $sp, $ra, $a0, $a7, $satp
+printf "\nTRACE DONE\n"
+detach
+quit
