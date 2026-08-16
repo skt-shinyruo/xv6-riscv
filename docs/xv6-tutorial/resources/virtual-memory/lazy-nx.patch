@@ -1,0 +1,785 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..4b5dc8a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -145,6 +145,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_vmtrace\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..335e3bd 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -60,6 +60,7 @@ void            ireclaim(int);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             kfreepages(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -169,6 +170,9 @@ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+ int             ismapped(pagetable_t, uint64);
+ uint64          vmfault(pagetable_t, uint64, int);
++int             vmprobe_kalloc_should_fail(void);
++void            vmprobe_trap(uint64, uint64, uint64);
++int             vmprobe_command(int, uint64, uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 2fcec38..22571c1 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -70,6 +70,9 @@ kalloc(void)
+ {
+   struct run *r;
+ 
++  if (vmprobe_kalloc_should_fail())
++    return 0;
++
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+   if (r)
+@@ -80,3 +83,16 @@ kalloc(void)
+     memset((char *)r, 5, PGSIZE); // fill with junk
+   return (void *)r;
+ }
++
++int
++kfreepages(void)
++{
++  int n = 0;
++  struct run *r;
++
++  acquire(&kmem.lock);
++  for (r = kmem.freelist; r; r = r->next)
++    n++;
++  release(&kmem.lock);
++  return n;
++}
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..918b742 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -102,6 +102,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_vmprobe(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -128,6 +129,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_link]    sys_link,
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
++  [SYS_vmprobe] sys_vmprobe,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..1796eb5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_vmprobe 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..e0da420 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "vm.h"
++#include "vmprobe.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -107,3 +108,15 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_vmprobe(void)
++{
++  int op;
++  uint64 arg, out;
++
++  argint(0, &op);
++  argaddr(1, &arg);
++  argaddr(2, &out);
++  return vmprobe_command(op, arg, out);
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 684e288..c184043 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "vmprobe.h"
+ 
+ struct spinlock tickslock;
+ uint ticks;
+@@ -69,10 +70,13 @@ usertrap(void)
+   } else if ((which_dev = devintr()) != 0) {
+     // ok
+   } else if ((r_scause() == 15 || r_scause() == 13) &&
+-             vmfault(p->pagetable, r_stval(), (r_scause() == 13) ? 1 : 0) !=
++             vmfault(p->pagetable, r_stval(),
++                     (r_scause() == 13) ? VMACCESS_LOAD : VMACCESS_STORE) !=
+                0) {
+     // page fault on lazily-allocated page
+   } else {
++    if (r_scause() == 12 || r_scause() == 13 || r_scause() == 15)
++      vmprobe_trap(r_scause(), r_stval(), r_sepc());
+     printk("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+     printk("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+     setkilled(p);
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 6bc3730..dd344f5 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -7,6 +7,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "fs.h"
++#include "vmprobe.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -354,7 +355,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ 
+     pa0 = walkaddr(pagetable, va0);
+     if (pa0 == 0) {
+-      if ((pa0 = vmfault(pagetable, va0, 0)) == 0) {
++      if ((pa0 = vmfault(pagetable, va0, VMACCESS_COPYOUT)) == 0) {
+         return -1;
+       }
+     }
+@@ -388,7 +389,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+     va0 = PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+     if (pa0 == 0) {
+-      if ((pa0 = vmfault(pagetable, va0, 0)) == 0) {
++      if ((pa0 = vmfault(pagetable, va0, VMACCESS_COPYIN)) == 0) {
+         return -1;
+       }
+     }
+@@ -447,30 +448,215 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+   }
+ }
+ 
++struct {
++  int active;
++  int in_fault;
++  int pid;
++  int generation;
++  int fail_at;
++  int allocations;
++  struct vmprobe_record record;
++} vmprobe_state;
++
++static int
++vmprobe_pte_flags(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte = walk(pagetable, PGROUNDDOWN(va), 0);
++  if (pte == 0 || (*pte & PTE_V) == 0)
++    return 0;
++  return PTE_FLAGS(*pte);
++}
++
++static uint64
++vmprobe_pte_pa(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte = walk(pagetable, PGROUNDDOWN(va), 0);
++  if (pte == 0 || (*pte & PTE_V) == 0)
++    return 0;
++  return PTE2PA(*pte);
++}
++
++int
++vmprobe_kalloc_should_fail(void)
++{
++  struct proc *p;
++
++  if (!vmprobe_state.active || !vmprobe_state.in_fault)
++    return 0;
++  p = myproc();
++  if (p == 0 || p->pid != vmprobe_state.pid)
++    return 0;
++  vmprobe_state.allocations++;
++  return vmprobe_state.fail_at != 0 &&
++         vmprobe_state.allocations == vmprobe_state.fail_at;
++}
++
++static void
++vmprobe_begin(int access, uint64 va, int pid)
++{
++  if (!vmprobe_state.active || vmprobe_state.pid != pid)
++    return;
++  vmprobe_state.in_fault = 1;
++  vmprobe_state.allocations = 0;
++  vmprobe_state.record.pid = pid;
++  vmprobe_state.record.access = access;
++  vmprobe_state.record.va = PGROUNDDOWN(va);
++  vmprobe_state.record.fail_at = vmprobe_state.fail_at;
++  vmprobe_state.record.allocations = 0;
++  vmprobe_state.record.before_flags =
++      vmprobe_pte_flags(myproc()->pagetable, va);
++  vmprobe_state.record.free_before = kfreepages();
++  vmprobe_state.record.scause = 0;
++  vmprobe_state.record.stval = 0;
++  vmprobe_state.record.epc = 0;
++  if (access == VMACCESS_LOAD || access == VMACCESS_STORE) {
++    vmprobe_state.record.scause = access == VMACCESS_LOAD ? 13 : 15;
++    vmprobe_state.record.stval = va;
++    vmprobe_state.record.epc = r_sepc();
++  }
++}
++
++static void
++vmprobe_finish(int result, uint64 va, int flags)
++{
++  if (!vmprobe_state.in_fault)
++    return;
++  vmprobe_state.record.result = result;
++  vmprobe_state.record.allocations = vmprobe_state.allocations;
++  vmprobe_state.record.after_flags = result ? flags :
++      vmprobe_pte_flags(myproc()->pagetable, va);
++  vmprobe_state.record.free_after = kfreepages();
++  vmprobe_state.record.generation = vmprobe_state.generation;
++  vmprobe_state.active = 0;
++  vmprobe_state.in_fault = 0;
++}
++
++void
++vmprobe_trap(uint64 scause, uint64 stval, uint64 epc)
++{
++  struct proc *p = myproc();
++
++  if (p == 0 || p->pid != vmprobe_state.pid)
++    return;
++  if (!vmprobe_state.active && vmprobe_state.record.result != 0)
++    return;
++  vmprobe_state.record.pid = p->pid;
++  vmprobe_state.record.scause = scause;
++  vmprobe_state.record.stval = stval;
++  vmprobe_state.record.epc = epc;
++  vmprobe_state.record.result = 0;
++  vmprobe_state.record.allocations = vmprobe_state.allocations;
++  vmprobe_state.record.after_flags =
++      vmprobe_pte_flags(p->pagetable, stval);
++  if (vmprobe_state.record.free_before == 0)
++    vmprobe_state.record.free_before = kfreepages();
++  vmprobe_state.record.free_after = kfreepages();
++  vmprobe_state.record.generation = vmprobe_state.generation;
++  if (scause == 12)
++    vmprobe_state.record.access = VMACCESS_EXEC;
++  vmprobe_state.active = 0;
++  vmprobe_state.in_fault = 0;
++}
++
++int
++vmprobe_command(int op, uint64 arg, uint64 out)
++{
++  struct proc *p = myproc();
++  struct vmprobe_special special;
++  int flags, result;
++
++  if (op == VMPROBE_ARM) {
++    vmprobe_state.active = 1;
++    vmprobe_state.in_fault = 0;
++    vmprobe_state.pid = p->pid;
++    vmprobe_state.generation = arg >> 32;
++    vmprobe_state.fail_at = arg & 0xffffffff;
++    memset(&vmprobe_state.record, 0, sizeof(vmprobe_state.record));
++    vmprobe_state.record.generation = vmprobe_state.generation;
++    vmprobe_state.record.pid = p->pid;
++    vmprobe_state.record.fail_at = vmprobe_state.fail_at;
++    return 0;
++  }
++  if (op == VMPROBE_FREE)
++    return kfreepages();
++  if (op == VMPROBE_SET_X) {
++    pte_t *pte = walk(p->pagetable, arg, 0);
++    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
++      return -1;
++    flags = PTE_FLAGS(*pte);
++    *pte |= PTE_X;
++    sfence_vma();
++    vmprobe_state.record.access = VMACCESS_EXEC;
++    vmprobe_state.record.va = PGROUNDDOWN(arg);
++    vmprobe_state.record.before_flags = flags;
++    vmprobe_state.record.after_flags = flags | PTE_X;
++    vmprobe_state.record.result = 1;
++    vmprobe_state.record.free_before = kfreepages();
++    vmprobe_state.record.free_after = vmprobe_state.record.free_before;
++    vmprobe_state.record.generation = vmprobe_state.generation;
++    vmprobe_state.active = 0;
++    return 0;
++  }
++  if (op == VMPROBE_SPECIAL) {
++    memset(&special, 0, sizeof(special));
++    special.user_root = (uint64)p->pagetable;
++    special.kernel_root = (uint64)kernel_pagetable;
++    special.trampoline_va = TRAMPOLINE;
++    special.trapframe_va = TRAPFRAME;
++    special.user_trampoline_pa = vmprobe_pte_pa(p->pagetable, TRAMPOLINE);
++    special.kernel_trampoline_pa = vmprobe_pte_pa(kernel_pagetable, TRAMPOLINE);
++    special.trapframe_pa = vmprobe_pte_pa(p->pagetable, TRAPFRAME);
++    special.trapframe_owner_pa = (uint64)p->trapframe;
++    special.user_trampoline_flags = vmprobe_pte_flags(p->pagetable, TRAMPOLINE);
++    special.kernel_trampoline_flags = vmprobe_pte_flags(kernel_pagetable, TRAMPOLINE);
++    special.trapframe_flags = vmprobe_pte_flags(p->pagetable, TRAPFRAME);
++    special.kernel_trapframe_flags = vmprobe_pte_flags(kernel_pagetable, TRAPFRAME);
++    return copyout(p->pagetable, out, (char *)&special, sizeof(special));
++  }
++  if (op == VMPROBE_FETCH) {
++    if (arg != (uint64)vmprobe_state.pid)
++      return -1;
++    result = copyout(p->pagetable, out, (char *)&vmprobe_state.record,
++                     sizeof(vmprobe_state.record));
++    vmprobe_state.active = 0;
++    vmprobe_state.in_fault = 0;
++    return result;
++  }
++  return -1;
++}
++
+ // allocate and map user memory if process is referencing a page
+ // that was lazily allocated in sys_sbrk().
+ // returns 0 if va is invalid or already mapped, or if
+ // out of physical memory, and physical address if successful.
+ uint64
+-vmfault(pagetable_t pagetable, uint64 va, int read)
++vmfault(pagetable_t pagetable, uint64 va, int access)
+ {
+   uint64 mem;
+   struct proc *p = myproc();
+ 
+-  if (va >= p->sz)
++  vmprobe_begin(access, va, p->pid);
++  if (va >= p->sz) {
++    vmprobe_finish(0, va, 0);
+     return 0;
++  }
+   va = PGROUNDDOWN(va);
+   if (ismapped(pagetable, va)) {
++    vmprobe_finish(0, va, 0);
+     return 0;
+   }
+   mem = (uint64)kalloc();
+-  if (mem == 0)
++  if (mem == 0) {
++    vmprobe_finish(0, va, 0);
+     return 0;
++  }
+   memset((void *)mem, 0, PGSIZE);
+   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W | PTE_U | PTE_R) != 0) {
+     kfree((void *)mem);
++    vmprobe_finish(0, va, 0);
+     return 0;
+   }
++  vmprobe_finish(1, va, PTE_W | PTE_U | PTE_R | PTE_V);
+   return mem;
+ }
+ 
+diff --git a/kernel/vmprobe.h b/kernel/vmprobe.h
+new file mode 100644
+index 0000000..504e9cf
+--- /dev/null
++++ b/kernel/vmprobe.h
+@@ -0,0 +1,43 @@
++#define VMPROBE_ARM      1
++#define VMPROBE_FETCH    2
++#define VMPROBE_FREE     3
++#define VMPROBE_SET_X    5
++#define VMPROBE_SPECIAL  6
++
++#define VMACCESS_LOAD    1
++#define VMACCESS_STORE   2
++#define VMACCESS_COPYIN  3
++#define VMACCESS_COPYOUT 4
++#define VMACCESS_EXEC    5
++
++struct vmprobe_record {
++  int generation;
++  int pid;
++  int access;
++  int result;
++  int fail_at;
++  int allocations;
++  int before_flags;
++  int after_flags;
++  int free_before;
++  int free_after;
++  uint64 va;
++  uint64 scause;
++  uint64 stval;
++  uint64 epc;
++};
++
++struct vmprobe_special {
++  uint64 user_root;
++  uint64 kernel_root;
++  uint64 trampoline_va;
++  uint64 trapframe_va;
++  uint64 user_trampoline_pa;
++  uint64 kernel_trampoline_pa;
++  uint64 trapframe_pa;
++  uint64 trapframe_owner_pa;
++  int user_trampoline_flags;
++  int kernel_trampoline_flags;
++  int trapframe_flags;
++  int kernel_trapframe_flags;
++};
+diff --git a/user/user.h b/user/user.h
+index ecd0921..027a406 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ int getpid(void);
+ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
++int vmprobe(int, uint64, void *);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..69e63db 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("vmprobe");
+diff --git a/user/vmtrace.c b/user/vmtrace.c
+new file mode 100644
+index 0000000..2a253d5
+--- /dev/null
++++ b/user/vmtrace.c
+@@ -0,0 +1,311 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++#include "kernel/vmprobe.h"
++
++#define TARGET (1ULL << 30)
++
++static char exec_arg[3000];
++static char exec_arg2[3000];
++
++static void
++fail(const char *why)
++{
++  printf("VM FAIL %s\n", why);
++  exit(1);
++}
++
++static char *
++lazy_page(void)
++{
++  uint64 top = (uint64)sbrk(0);
++  uint64 rem = top % PGSIZE;
++  char *p;
++
++  if (rem != 0 && sbrk((int)(PGSIZE - rem)) == SBRK_ERROR)
++    fail("align");
++  p = sbrklazy(PGSIZE);
++  if (p == SBRK_ERROR)
++    fail("sbrklazy");
++  return p;
++}
++
++static void
++ret_instruction(char *p)
++{
++  *(volatile uint32 *)p = 0x00008067;
++  asm volatile("fence.i" ::: "memory");
++}
++
++static void
++print_record(const char *name, int pid, int status, int base, int after,
++             struct vmprobe_record *r)
++{
++  printf("VM CASE name=%s pid=%d status=%d base=%d after=%d gen=%d access=%d "
++         "result=%d fail_at=%d allocations=%d before=0x%x after_flags=0x%x "
++         "free_before=%d free_after=%d va=0x%lx scause=%ld stval=0x%lx epc=0x%lx\n",
++         name, pid, status, base, after, r->generation, r->access, r->result,
++         r->fail_at, r->allocations, r->before_flags, r->after_flags,
++         r->free_before, r->free_after, r->va, r->scause, r->stval, r->epc);
++}
++
++enum killed_case {
++  KILLED_INVALID,
++  KILLED_PERMISSION,
++  KILLED_NX,
++};
++
++static void
++run_success(const char *name, int generation, int access)
++{
++  int pid, status, base, after;
++  struct vmprobe_record record;
++
++  base = vmprobe(VMPROBE_FREE, 0, 0);
++  pid = fork();
++  if (pid < 0)
++    fail("fork");
++  if (pid == 0) {
++    char *p = lazy_page();
++    if (vmprobe(VMPROBE_ARM, ((uint64)generation << 32), 0) < 0)
++      exit(2);
++    if (access == VMACCESS_LOAD) {
++      if (*(volatile uchar *)p != 0)
++        exit(3);
++    } else if (access == VMACCESS_STORE) {
++      *(volatile uchar *)p = 0x5a;
++    } else {
++      int fds[2];
++      uchar bytes[4] = {0xaa, 0xaa, 0xaa, 0xaa};
++      uchar pattern[4] = {0x11, 0x22, 0x33, 0x44};
++      if (pipe(fds) < 0)
++        exit(4);
++      if (access == VMACCESS_COPYOUT) {
++        if (write(fds[1], pattern, sizeof(pattern)) != sizeof(pattern))
++          exit(5);
++        if (read(fds[0], p, sizeof(pattern)) != sizeof(pattern))
++          exit(6);
++        if (p[0] != 0x11 || p[1] != 0x22 || p[2] != 0x33 || p[3] != 0x44)
++          exit(9);
++      } else {
++        if (write(fds[1], p, sizeof(bytes)) != sizeof(bytes))
++          exit(7);
++        if (read(fds[0], bytes, sizeof(bytes)) != sizeof(bytes))
++          exit(8);
++        if (bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0)
++          exit(10);
++      }
++      close(fds[0]);
++      close(fds[1]);
++    }
++    exit(0);
++  }
++  if (wait(&status) != pid)
++    fail("wait");
++  after = vmprobe(VMPROBE_FREE, 0, 0);
++  if (vmprobe(VMPROBE_FETCH, pid, &record) < 0)
++    fail("fetch");
++  print_record(name, pid, status, base, after, &record);
++  if (status != 0 || after != base || record.result != 1 ||
++      record.before_flags != 0 ||
++      (record.after_flags & (PTE_V | PTE_R | PTE_W | PTE_U | PTE_X)) !=
++          (PTE_V | PTE_R | PTE_W | PTE_U) ||
++      (record.after_flags & PTE_X) != 0 || record.allocations < 1)
++    fail(name);
++}
++
++static void
++run_killed(const char *name, int generation, enum killed_case kind)
++{
++  int pid, status, base, after;
++  struct vmprobe_record record;
++
++  base = vmprobe(VMPROBE_FREE, 0, 0);
++  pid = fork();
++  if (pid < 0)
++    fail("fork");
++  if (pid == 0) {
++    char *p;
++    if (kind == KILLED_INVALID) {
++      uint64 bad = (uint64)sbrk(0);
++      if (vmprobe(VMPROBE_ARM, (uint64)generation << 32, 0) < 0)
++        exit(2);
++      *(volatile uchar *)bad = 1;
++    } else if (kind == KILLED_PERMISSION) {
++      if (vmprobe(VMPROBE_ARM, (uint64)generation << 32, 0) < 0)
++        exit(2);
++      *(volatile uint32 *)(uint64)&fail = 0;
++    } else {
++      p = lazy_page();
++      ret_instruction(p);
++      if (vmprobe(VMPROBE_ARM, (uint64)generation << 32, 0) < 0)
++        exit(2);
++      ((int (*)(void))p)();
++    }
++    exit(9);
++  }
++  if (wait(&status) != pid)
++    fail("wait");
++  after = vmprobe(VMPROBE_FREE, 0, 0);
++  if (vmprobe(VMPROBE_FETCH, pid, &record) < 0)
++    fail("fetch");
++  print_record(name, pid, status, base, after, &record);
++  if (status != -1 || after != base || record.result != 0)
++    fail(name);
++  if (kind == KILLED_INVALID &&
++      (record.scause != 15 || record.allocations != 0))
++    fail("invalid-oracle");
++  if (kind == KILLED_PERMISSION &&
++      (record.scause != 15 || record.allocations != 0))
++    fail("permission-oracle");
++  if (kind == KILLED_NX &&
++      (record.scause != 12 || record.allocations != 0 ||
++       (record.before_flags & PTE_X) != 0))
++    fail("nx-oracle");
++}
++
++static void
++run_oom(int generation, int fail_at)
++{
++  int pid, status, base, after;
++  struct vmprobe_record record;
++
++  base = vmprobe(VMPROBE_FREE, 0, 0);
++  pid = fork();
++  if (pid < 0)
++    fail("fork");
++  if (pid == 0) {
++    uint64 top = (uint64)sbrk(0);
++    if (sbrklazy((int)(TARGET + PGSIZE - top)) == SBRK_ERROR)
++      exit(2);
++    if (vmprobe(VMPROBE_ARM,
++                ((uint64)generation << 32) | (uint64)fail_at, 0) < 0)
++      exit(3);
++    *(volatile uchar *)TARGET = 1;
++    exit(9);
++  }
++  if (wait(&status) != pid)
++    fail("wait");
++  after = vmprobe(VMPROBE_FREE, 0, 0);
++  if (vmprobe(VMPROBE_FETCH, pid, &record) < 0)
++    fail("fetch");
++  print_record("oom", pid, status, base, after, &record);
++  if (status != -1 || after != base || record.result != 0 ||
++      record.allocations != fail_at || record.after_flags != 0)
++    fail("oom-oracle");
++  if (fail_at < 3 && record.free_after != record.free_before)
++    fail("oom-rollback");
++  if (fail_at == 3 && record.free_after != record.free_before - 1)
++    fail("oom-intermediate");
++}
++
++static void
++run_exec_rollback(void)
++{
++  int pid, status, base, after;
++
++  base = vmprobe(VMPROBE_FREE, 0, 0);
++  pid = fork();
++  if (pid < 0)
++    fail("fork");
++  if (pid == 0) {
++    char *p = lazy_page();
++    char *argv[4];
++    int before = getpid();
++    int i;
++    for (i = 0; i < (int)sizeof(exec_arg) - 1; i++)
++      exec_arg[i] = 'x';
++    exec_arg[sizeof(exec_arg) - 1] = 0;
++    for (i = 0; i < (int)sizeof(exec_arg2) - 1; i++)
++      exec_arg2[i] = 'y';
++    exec_arg2[sizeof(exec_arg2) - 1] = 0;
++    *(volatile uchar *)p = 0x42;
++    argv[0] = "echo";
++    argv[1] = exec_arg;
++    argv[2] = exec_arg2;
++    argv[3] = 0;
++    if (exec("echo", argv) != -1 || getpid() != before ||
++        *(volatile uchar *)p != 0x42)
++      exit(3);
++    exit(42);
++  }
++  if (wait(&status) != pid)
++    fail("wait");
++  after = vmprobe(VMPROBE_FREE, 0, 0);
++  printf("VM EXEC pid=%d status=%d base=%d after=%d\n", pid, status, base,
++         after);
++  if (status != 42 || base != after)
++    fail("exec-rollback");
++}
++
++int
++main(void)
++{
++  struct vmprobe_special special;
++
++  if (vmprobe(VMPROBE_SPECIAL, 0, &special) < 0)
++    fail("special");
++  printf("VM SPECIAL user_root=0x%lx kernel_root=0x%lx tramp_va=0x%lx "
++         "trap_va=0x%lx user_tramp_pa=0x%lx kernel_tramp_pa=0x%lx "
++         "trap_pa=0x%lx owner_pa=0x%lx user_tramp_flags=0x%x "
++         "kernel_tramp_flags=0x%x trap_flags=0x%x kernel_trap_flags=0x%x\n",
++         special.user_root, special.kernel_root, special.trampoline_va,
++         special.trapframe_va, special.user_trampoline_pa,
++         special.kernel_trampoline_pa, special.trapframe_pa,
++         special.trapframe_owner_pa, special.user_trampoline_flags,
++         special.kernel_trampoline_flags, special.trapframe_flags,
++         special.kernel_trapframe_flags);
++  if (special.user_root == special.kernel_root ||
++      special.user_trampoline_pa != special.kernel_trampoline_pa ||
++      special.trapframe_pa != special.trapframe_owner_pa ||
++      (special.user_trampoline_flags & (PTE_V | PTE_R | PTE_X | PTE_U)) !=
++          (PTE_V | PTE_R | PTE_X) ||
++      (special.trapframe_flags & (PTE_V | PTE_R | PTE_W | PTE_U)) !=
++          (PTE_V | PTE_R | PTE_W) || special.kernel_trapframe_flags != 0)
++    fail("special-oracle");
++
++  run_success("load", 1, VMACCESS_LOAD);
++  run_success("store", 2, VMACCESS_STORE);
++  run_success("copyout", 3, VMACCESS_COPYOUT);
++  run_success("copyin", 4, VMACCESS_COPYIN);
++  run_killed("invalid", 5, KILLED_INVALID);
++  run_killed("permission", 6, KILLED_PERMISSION);
++  run_killed("nx", 7, KILLED_NX);
++
++  {
++    int pid, status;
++    char *p;
++    struct vmprobe_record record;
++    int base = vmprobe(VMPROBE_FREE, 0, 0);
++    pid = fork();
++    if (pid == 0) {
++      p = lazy_page();
++      ret_instruction(p);
++      if (vmprobe(VMPROBE_ARM, (uint64)8 << 32, 0) < 0 ||
++          vmprobe(VMPROBE_SET_X, (uint64)p, 0) < 0)
++        exit(2);
++      if (((int (*)(void))p)() != 0)
++        exit(3);
++      exit(0);
++    }
++    if (wait(&status) != pid || status != 0)
++      fail("mutation-status");
++    if (vmprobe(VMPROBE_FETCH, pid, &record) < 0 ||
++        (record.after_flags & PTE_X) == 0 || record.result != 1)
++      fail("mutation-oracle");
++    if (vmprobe(VMPROBE_FREE, 0, 0) != base)
++      fail("mutation-ledger");
++    printf("VM MUTATION pid=%d status=%d flags=0x%x\n", pid, status,
++           record.after_flags);
++  }
++
++  run_oom(9, 1);
++  run_oom(10, 2);
++  run_oom(11, 3);
++  run_exec_rollback();
++  printf("VM PASS cases=12\n");
++  exit(0);
++}

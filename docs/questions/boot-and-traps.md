@@ -9,7 +9,7 @@
 3. **BOOT-03** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-03`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-03原-boot-03)。此处只保留兼容入口。
 4. **BOOT-04** 已迁移到[进程生命周期问题 `LIFE-01`](../xv6-tutorial/questions/process-lifecycle.md#life-01原-boot-04)。此处只保留兼容入口。
 5. **BOOT-05** 已迁移到[系统调用往返问题 `SYSCALL-01`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-01原-boot-05)。此处只保留兼容入口。
-6. **BOOT-06** 为什么 trampoline 必须在用户页表和内核页表中映射到同一个虚拟地址？
+6. **BOOT-06** 已迁移到[虚拟内存问题 `VM-06`](../xv6-tutorial/questions/virtual-memory.md#vm-06原-vm-06)。此处只保留兼容入口。
 7. **BOOT-07** 已迁移到[系统调用往返问题 `SYSCALL-02`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-02原-boot-07)。此处只保留兼容入口。
 8. **BOOT-08** 已迁移到[系统调用往返问题 `SYSCALL-03`](../xv6-tutorial/questions/syscall-roundtrip.md#syscall-03原-boot-08)。此处只保留兼容入口。
 9. **BOOT-09** 已迁移到[启动、陷阱、中断与汇编边界问题 `BOUNDARY-04`](../xv6-tutorial/questions/boot-traps-and-interrupts.md#boundary-04原-boot-09)。此处只保留兼容入口。
