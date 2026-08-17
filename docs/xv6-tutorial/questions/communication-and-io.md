@@ -31,14 +31,14 @@
 
 ### IO-05
 
-console read 的 `cons.r/cons.w`、UART transmit busy、PLIC claim/complete 各自拥有
-什么状态？为什么 console file descriptor 不等于 UART wait channel？
+console file descriptor、`devsw[CONSOLE]` 与 `cons.r/cons.w` 各自属于哪一层？为什么
+本单元只能把 `consolewrite/consoleread` 当作 device handoff，而不能据此推出 UART/PLIC 状态？
 
 ### IO-06
 
-一次 inode read 怎样经过 `fileread -> readi -> bread`，并在 cache miss 时进入
-`virtio_disk_rw -> interrupt -> brelse`？为什么普通 read 不持有 log reservation，
-哪些资源仍属于后续 persistence 单元？
+一次 inode read 怎样经过 `fileread -> readi` 到达 buffer/device 边界？为什么普通 read
+不持有 log reservation，cache miss/completion 与完整 cache/LRU、log persistence 分别由
+哪些后续单元拥有？
 
 ### IO-07
 

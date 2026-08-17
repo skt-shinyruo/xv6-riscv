@@ -28,6 +28,7 @@
 ## 通信与设备 I/O
 
 - [文件描述符、管道、控制台与设备](communication-and-io.md) - `verified`
+- [设备中断与 VirtIO 队列：从外部事件到完成回收](device-io.md) - `verified`
 
 ## 文件系统与持久化
 

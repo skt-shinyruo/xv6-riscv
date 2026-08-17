@@ -5,7 +5,7 @@
 ## 问题
 
 1. **SYNC-01** 已迁移到[调度与同步问题 `SCHED-04`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-04原-sync-01)。此处只保留兼容入口。
-2. **SYNC-02** acquire/release 内存序能保证 CPU 临界区可见性，为什么不自动等价于 VirtIO DMA 的发布顺序？
+2. **SYNC-02** 已迁移到[设备中断与 VirtIO 队列问题 `DEVICE-08`](../xv6-tutorial/questions/device-io.md#device-08-两个-fenceavail-idx-和-notify-建立了什么没建立什么)。此处只保留兼容入口。
 3. **SYNC-03** 已迁移到[调度与同步问题 `SCHED-09`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-09原-sync-03)。此处只保留兼容入口。
 4. **SYNC-04** 已迁移到[调度与同步问题 `SCHED-02`](../xv6-tutorial/questions/scheduling-and-synchronization.md#sched-02原-proc-02)。此处只保留兼容入口。
 5. **SYNC-05** 进程槽、物理页、fd、inode cache、buffer、日志和 VirtIO descriptor 耗尽时，为什么有的返回 `-1`、有的睡眠、有的 kill、有的 panic？

@@ -1,0 +1,1300 @@
+diff --git a/Makefile b/Makefile
+index 95604e73b37d484ab1b58541d709d394403999d7..90ecbab8d7f1813b1052170864327374e84daf25 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,8 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/devaudit.o
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -145,6 +146,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_devtrace
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/bio.c b/kernel/bio.c
+index de8603923839467477500181fb2040a6d20c152e..e6ad843e8afa4e8fddef743221d930ab9e379317 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -150,3 +150,15 @@ bunpin(struct buf *b)
+   b->refcnt--;
+   release(&bcache.lock);
+ }
++
++int
++bioauditrefs(void)
++{
++  int refs = 0;
++
++  acquire(&bcache.lock);
++  for (struct buf *b = bcache.buf; b < bcache.buf + NBUF; b++)
++    refs += b->refcnt;
++  release(&bcache.lock);
++  return refs;
++}
+diff --git a/kernel/console.c b/kernel/console.c
+index cd6fc1525cc91c3696b659b5e2f89bfe63008af3..c1f68d3c706a5cc89d051377e9c463504328e8f5 100644
+--- a/kernel/console.c
++++ b/kernel/console.c
+@@ -21,6 +21,7 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "proc.h"
++#include "devaudit.h"
+ 
+ #define BACKSPACE 0x100       // erase the last output character
+ #define C(x)      ((x) - '@') // Control-x
+@@ -130,8 +131,9 @@ consoleread(int user_dst, uint64 dst, int n)
+     }
+   }
+   release(&cons.lock);
+-
+-  return target - n;
++  int result = target - n;
++  devaudit_console_done(myproc()->pid, result);
++  return result;
+ }
+ 
+ //
+@@ -144,6 +146,7 @@ void
+ consoleintr(int c)
+ {
+   acquire(&cons.lock);
++  uint64 before = cons.w;
+ 
+   switch (c) {
+   case C('P'): // Print process list.
+@@ -183,6 +186,8 @@ consoleintr(int c)
+     break;
+   }
+ 
++  devaudit_console_char(c, before, cons.w, holding(&cons.lock));
++
+   release(&cons.lock);
+ }
+ 
+diff --git a/kernel/devaudit.c b/kernel/devaudit.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..79dfb941056688085f60b9be399d8edff859d558
+--- /dev/null
++++ b/kernel/devaudit.c
+@@ -0,0 +1,472 @@
++#include "types.h"
++#include "param.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "riscv.h"
++#include "memlayout.h"
++#include "defs.h"
++#include "fs.h"
++#include "buf.h"
++#include "virtio.h"
++#include "proc.h"
++#include "devaudit.h"
++
++struct {
++  struct spinlock lock;
++  struct devsnapshot s;
++} devaudit;
++
++void virtio_disk_audit_ledger(int *, int *, int *, uint16 *, uint16 *,
++                              uint64 *, uint64 *, uint64 *, int *);
++int virtio_disk_audit_release(void);
++int bioauditrefs(void);
++
++static uint64
++next_locked(void)
++{
++  devaudit.s.seq++;
++  return devaudit.s.seq;
++}
++
++static void
++held_locked(uint64 *field, int held)
++{
++  *field = held;
++  if (!held)
++    devaudit.s.lock_errors++;
++}
++
++static void
++fresh_locked(int mode, int generation)
++{
++  memset(&devaudit.s, 0, sizeof(devaudit.s));
++  devaudit.s.active = 1;
++  devaudit.s.mode = mode;
++  devaudit.s.generation = generation;
++}
++
++static void
++ledger(struct devsnapshot *out)
++{
++  int free_desc;
++  int info;
++  int deferred;
++  int ready;
++  int buf_refs;
++  uint16 avail;
++  uint16 used;
++  uint64 desc;
++  uint64 avail_addr;
++  uint64 used_addr;
++
++  virtio_disk_audit_ledger(&free_desc, &info, &deferred, &avail, &used,
++                           &desc, &avail_addr, &used_addr, &ready);
++  buf_refs = bioauditrefs();
++  acquire(&devaudit.lock);
++  devaudit.s.free_desc = free_desc;
++  devaudit.s.info_active = info;
++  devaudit.s.deferred = deferred;
++  devaudit.s.queue_desc = desc;
++  devaudit.s.queue_avail = avail_addr;
++  devaudit.s.queue_used = used_addr;
++  devaudit.s.queue_ready = ready;
++  devaudit.s.buf_refs = buf_refs;
++  devaudit.s.avail_after = avail;
++  devaudit.s.used_after = used;
++  if (devaudit.s.mode == DEV_MODE_QUEUE && devaudit.s.reclaims == 3) {
++    devaudit.s.free_after = free_desc;
++    devaudit.s.info_after = info;
++    devaudit.s.deferred_after = deferred;
++    devaudit.s.avail_after = avail;
++    devaudit.s.used_after = used;
++  }
++  *out = devaudit.s;
++  release(&devaudit.lock);
++}
++
++void
++devauditinit(void)
++{
++  initlock(&devaudit.lock, "devaudit");
++  memset(&devaudit.s, 0, sizeof(devaudit.s));
++}
++
++int
++devaudit_command(int op, int arg, struct devsnapshot *out)
++{
++  struct buf *b;
++  int result = 0;
++
++  if (op == DEV_ARM_CONSOLE) {
++    acquire(&devaudit.lock);
++    fresh_locked(DEV_MODE_CONSOLE, 1);
++    devaudit.s.pid = myproc()->pid;
++    release(&devaudit.lock);
++  } else if (op == DEV_DISK_READ) {
++    struct devsnapshot before;
++    ledger(&before);
++    acquire(&devaudit.lock);
++    fresh_locked(DEV_MODE_DISK, 2);
++    devaudit.s.pid = myproc()->pid;
++    devaudit.s.free_before = before.free_desc;
++    devaudit.s.avail_before = before.avail_after;
++    devaudit.s.used_before = before.used_after;
++    devaudit.s.queue_desc = before.queue_desc;
++    devaudit.s.queue_avail = before.queue_avail;
++    devaudit.s.queue_used = before.queue_used;
++    devaudit.s.queue_ready = before.queue_ready;
++    release(&devaudit.lock);
++    b = bread(ROOTDEV, arg);
++    result = b->data[0];
++    brelse(b);
++    acquire(&devaudit.lock);
++    devaudit.s.read_value = result;
++    release(&devaudit.lock);
++  } else if (op == DEV_ARM_QUEUE) {
++    struct devsnapshot before;
++    ledger(&before);
++    acquire(&devaudit.lock);
++    fresh_locked(DEV_MODE_QUEUE, 3);
++    devaudit.s.free_before = before.free_desc;
++    devaudit.s.avail_before = before.avail_after;
++    devaudit.s.used_before = before.used_after;
++    release(&devaudit.lock);
++  } else if (op == DEV_QUEUE_READ) {
++    int slot = (arg >> 16) & 0xff;
++    int block = arg & 0xffff;
++    if (slot < 0 || slot >= 3)
++      return -1;
++    acquire(&devaudit.lock);
++    if (!devaudit.s.active || devaudit.s.mode != DEV_MODE_QUEUE) {
++      release(&devaudit.lock);
++      return -1;
++    }
++    devaudit.s.pids[slot] = myproc()->pid;
++    devaudit.s.blocks[slot] = block;
++    release(&devaudit.lock);
++    b = bread(ROOTDEV, block);
++    result = b->data[0];
++    brelse(b);
++  } else if (op == DEV_RELEASE) {
++    acquire(&devaudit.lock);
++    if (!devaudit.s.active) {
++      release(&devaudit.lock);
++      return -1;
++    }
++    devaudit.s.controller_hart = cpuid();
++    devaudit.s.release_seq = next_locked();
++    release(&devaudit.lock);
++    result = virtio_disk_audit_release();
++  } else if (op == DEV_RESET) {
++    acquire(&devaudit.lock);
++    devaudit.s.active = 0;
++    devaudit.s.mode = DEV_MODE_NONE;
++    devaudit.s.waiters = 0;
++    release(&devaudit.lock);
++  } else if (op != DEV_SNAPSHOT) {
++    return -1;
++  }
++
++  ledger(out);
++  return result;
++}
++
++void
++devaudit_sleep(int pid, void *chan, int state, int condition_before,
++               int proc_after, int condition_after)
++{
++  acquire(&devaudit.lock);
++  if (!devaudit.s.active) {
++    release(&devaudit.lock);
++    return;
++  }
++  if ((devaudit.s.mode == DEV_MODE_CONSOLE ||
++       devaudit.s.mode == DEV_MODE_DISK) &&
++      devaudit.s.pid == pid && devaudit.s.wait_seq == 0) {
++    devaudit.s.wait_state = state;
++    devaudit.s.wait_chan = (uint64)chan;
++    devaudit.s.wait_seq = next_locked();
++    devaudit.s.sleep_seq = devaudit.s.wait_seq;
++    devaudit.s.waiters = 1;
++    devaudit.s.condition_before = condition_before;
++    devaudit.s.proc_after = proc_after;
++    devaudit.s.condition_after = condition_after;
++    if (condition_before != 1 || proc_after != 1 || condition_after != 0)
++      devaudit.s.lock_errors++;
++  } else if (devaudit.s.mode == DEV_MODE_QUEUE &&
++             devaudit.s.third_pid == pid &&
++             devaudit.s.desc_chan == (uint64)chan &&
++             devaudit.s.wait_seq == 0) {
++    devaudit.s.third_state = state;
++    devaudit.s.third_chan = (uint64)chan;
++    devaudit.s.wait_seq = next_locked();
++    devaudit.s.waiters = 1;
++    devaudit.s.condition_before = condition_before;
++    devaudit.s.proc_after = proc_after;
++    devaudit.s.condition_after = condition_after;
++    if (condition_before != 1 || proc_after != 1 || condition_after != 0)
++      devaudit.s.lock_errors++;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_wakeup(int pid, void *chan, int proc_lock)
++{
++  acquire(&devaudit.lock);
++  if (!devaudit.s.active) {
++    release(&devaudit.lock);
++    return;
++  }
++  if ((devaudit.s.mode == DEV_MODE_CONSOLE ||
++       devaudit.s.mode == DEV_MODE_DISK) &&
++      devaudit.s.pid == pid && devaudit.s.wait_chan == (uint64)chan &&
++      devaudit.s.wake_seq == 0) {
++    devaudit.s.wake_chan = (uint64)chan;
++    devaudit.s.wake_seq = next_locked();
++    devaudit.s.waiters = 0;
++    held_locked(&devaudit.s.wake_proc_lock, proc_lock);
++  } else if (devaudit.s.mode == DEV_MODE_QUEUE &&
++             devaudit.s.third_pid == pid &&
++             devaudit.s.desc_chan == (uint64)chan) {
++    devaudit.s.waiters = 0;
++    held_locked(&devaudit.s.wake_proc_lock, proc_lock);
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_plic_claim(int irq, int hart)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_CONSOLE && irq == UART0_IRQ) {
++    devaudit.s.uart_claims++;
++    devaudit.s.uart_claim_harts |= 1 << hart;
++  } else if (devaudit.s.active &&
++             (devaudit.s.mode == DEV_MODE_DISK ||
++              devaudit.s.mode == DEV_MODE_QUEUE) && irq == VIRTIO0_IRQ) {
++    devaudit.s.virtio_claims++;
++    devaudit.s.virtio_claim_harts |= 1 << hart;
++    if (devaudit.s.mode == DEV_MODE_DISK && devaudit.s.irq_seq == 0)
++      devaudit.s.irq_seq = next_locked();
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_plic_complete(int irq, int hart)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_CONSOLE && irq == UART0_IRQ) {
++    devaudit.s.uart_completes++;
++    devaudit.s.uart_complete_harts |= 1 << hart;
++  } else if (devaudit.s.active &&
++             (devaudit.s.mode == DEV_MODE_DISK ||
++              devaudit.s.mode == DEV_MODE_QUEUE) && irq == VIRTIO0_IRQ) {
++    devaudit.s.virtio_completes++;
++    devaudit.s.virtio_complete_harts |= 1 << hart;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_uart_rx(int c)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_CONSOLE) {
++    if (devaudit.s.rx_count == 0) {
++      devaudit.s.rx_first = c;
++      devaudit.s.rx_seq = next_locked();
++    }
++    devaudit.s.rx_last = c;
++    devaudit.s.rx_count++;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_console_char(int c, uint64 before, uint64 after, int lock_held)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_CONSOLE) {
++    held_locked(&devaudit.s.publish_lock, lock_held);
++    if (devaudit.s.ring_before == 0 && devaudit.s.rx_count == 1)
++      devaudit.s.ring_before = before;
++    if (c == '\n')
++      devaudit.s.ring_after = after;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_console_done(int pid, int n)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_CONSOLE &&
++      devaudit.s.pid == pid) {
++    devaudit.s.read_len = n;
++    devaudit.s.done_seq = next_locked();
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_desc_wait(int pid, void *chan, int free)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_QUEUE &&
++      devaudit.s.third_pid == 0) {
++    devaudit.s.third_pid = pid;
++    devaudit.s.desc_chan = (uint64)chan;
++    devaudit.s.free_held = free;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_disk_begin(int pid, uint block, uint64 sector, int hart,
++                    uint64 desc, uint64 avail, uint64 used, int free,
++                    uint16 avail_idx, uint16 used_idx)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK &&
++      devaudit.s.pid == pid) {
++    devaudit.s.block = block;
++    devaudit.s.sector = sector;
++    devaudit.s.submit_hart = hart;
++    devaudit.s.queue_desc = desc;
++    devaudit.s.queue_avail = avail;
++    devaudit.s.queue_used = used;
++    devaudit.s.free_before = free;
++    devaudit.s.avail_before = avail_idx;
++    devaudit.s.used_before = used_idx;
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_disk_program(int pid, int *idx, struct virtq_desc *desc,
++                      struct buf *b, int free, int lock_held)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active &&
++      (devaudit.s.mode == DEV_MODE_DISK || devaudit.s.mode == DEV_MODE_QUEUE))
++    held_locked(&devaudit.s.program_lock, lock_held);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK &&
++      devaudit.s.pid == pid) {
++    devaudit.s.head = idx[0];
++    devaudit.s.d0 = idx[0];
++    devaudit.s.d1 = idx[1];
++    devaudit.s.d2 = idx[2];
++    devaudit.s.d0_addr = desc[idx[0]].addr;
++    devaudit.s.d0_len = desc[idx[0]].len;
++    devaudit.s.d0_flags = desc[idx[0]].flags;
++    devaudit.s.d0_next = desc[idx[0]].next;
++    devaudit.s.d1_addr = desc[idx[1]].addr;
++    devaudit.s.d1_len = desc[idx[1]].len;
++    devaudit.s.d1_flags = desc[idx[1]].flags;
++    devaudit.s.d1_next = desc[idx[1]].next;
++    devaudit.s.d2_addr = desc[idx[2]].addr;
++    devaudit.s.d2_len = desc[idx[2]].len;
++    devaudit.s.d2_flags = desc[idx[2]].flags;
++    devaudit.s.free_programmed = free;
++    devaudit.s.b_owner = b->disk;
++    devaudit.s.program_seq = next_locked();
++  } else if (devaudit.s.active && devaudit.s.mode == DEV_MODE_QUEUE) {
++    if (devaudit.s.submit0_seq == 0)
++      devaudit.s.submit0_seq = next_locked();
++    else if (devaudit.s.submit1_seq == 0)
++      devaudit.s.submit1_seq = next_locked();
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_disk_publish(uint16 avail, int lock_held)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active &&
++      (devaudit.s.mode == DEV_MODE_DISK || devaudit.s.mode == DEV_MODE_QUEUE))
++    held_locked(&devaudit.s.publish_lock, lock_held);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK) {
++    devaudit.s.avail_after = avail;
++    devaudit.s.publish_seq = next_locked();
++  }
++  release(&devaudit.lock);
++}
++
++void
++devaudit_disk_notify(int lock_held)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active &&
++      (devaudit.s.mode == DEV_MODE_DISK || devaudit.s.mode == DEV_MODE_QUEUE))
++    held_locked(&devaudit.s.notify_lock, lock_held);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK) {
++    devaudit.s.notify = 1;
++    devaudit.s.notify_seq = next_locked();
++  }
++  release(&devaudit.lock);
++}
++
++int
++devaudit_disk_complete(int id, struct buf *b, int status,
++                       uint16 used_before, uint16 used_after, int lock_held)
++{
++  int defer = 0;
++  (void)id;
++  (void)b;
++  acquire(&devaudit.lock);
++  if (devaudit.s.active &&
++      (devaudit.s.mode == DEV_MODE_DISK || devaudit.s.mode == DEV_MODE_QUEUE))
++    held_locked(&devaudit.s.complete_lock, lock_held);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK &&
++      devaudit.s.deferred_held == 0) {
++    devaudit.s.device_status = status;
++    devaudit.s.used_before = used_before;
++    devaudit.s.used_after = used_after;
++    devaudit.s.complete_seq = next_locked();
++    devaudit.s.deferred_held = 1;
++    defer = 1;
++  } else if (devaudit.s.active && devaudit.s.mode == DEV_MODE_QUEUE &&
++             devaudit.s.deferred_held < 2) {
++    if (devaudit.s.deferred_held == 0)
++      devaudit.s.defer0_seq = next_locked();
++    else
++      devaudit.s.defer1_seq = next_locked();
++    devaudit.s.deferred_held++;
++    defer = 1;
++  }
++  release(&devaudit.lock);
++  return defer;
++}
++
++void
++devaudit_disk_reclaim(int pid, int free, int info, uint16 avail, uint16 used,
++                      int lock_held)
++{
++  acquire(&devaudit.lock);
++  if (devaudit.s.active &&
++      (devaudit.s.mode == DEV_MODE_DISK || devaudit.s.mode == DEV_MODE_QUEUE))
++    held_locked(&devaudit.s.reclaim_lock, lock_held);
++  if (devaudit.s.active && devaudit.s.mode == DEV_MODE_DISK &&
++      devaudit.s.pid == pid) {
++    devaudit.s.free_after = free;
++    devaudit.s.info_after = info;
++    devaudit.s.avail_after = avail;
++    devaudit.s.used_after = used;
++    devaudit.s.reclaim_seq = next_locked();
++    devaudit.s.deferred_after = 0;
++  } else if (devaudit.s.active && devaudit.s.mode == DEV_MODE_QUEUE) {
++    devaudit.s.reclaims++;
++    if (devaudit.s.reclaims == 3) {
++      devaudit.s.free_after = free;
++      devaudit.s.info_after = info;
++      devaudit.s.avail_after = avail;
++      devaudit.s.used_after = used;
++      devaudit.s.reclaim_seq = next_locked();
++      devaudit.s.deferred_after = 0;
++    }
++  }
++  release(&devaudit.lock);
++}
+diff --git a/kernel/devaudit.h b/kernel/devaudit.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1aec36643145582a4c0bf55e7be0a3868265e40
+--- /dev/null
++++ b/kernel/devaudit.h
+@@ -0,0 +1,139 @@
++#define DEV_SNAPSHOT      1
++#define DEV_ARM_CONSOLE   2
++#define DEV_DISK_READ     3
++#define DEV_ARM_QUEUE     4
++#define DEV_QUEUE_READ    5
++#define DEV_RELEASE       6
++#define DEV_RESET         7
++
++#define DEV_MODE_NONE     0
++#define DEV_MODE_CONSOLE  1
++#define DEV_MODE_DISK     2
++#define DEV_MODE_QUEUE    3
++
++struct buf;
++struct virtq_desc;
++
++struct devsnapshot {
++  uint64 active;
++  uint64 mode;
++  uint64 generation;
++  uint64 seq;
++
++  uint64 pid;
++  uint64 wait_state;
++  uint64 wait_chan;
++  uint64 wait_seq;
++  uint64 wake_chan;
++  uint64 wake_seq;
++  uint64 waiters;
++  uint64 condition_before;
++  uint64 proc_after;
++  uint64 condition_after;
++  uint64 wake_proc_lock;
++  uint64 publish_lock;
++  uint64 program_lock;
++  uint64 notify_lock;
++  uint64 complete_lock;
++  uint64 reclaim_lock;
++  uint64 lock_errors;
++
++  uint64 uart_claims;
++  uint64 uart_completes;
++  uint64 uart_claim_harts;
++  uint64 uart_complete_harts;
++  uint64 rx_count;
++  uint64 rx_first;
++  uint64 rx_last;
++  uint64 rx_seq;
++  uint64 ring_before;
++  uint64 ring_after;
++  uint64 read_len;
++  uint64 done_seq;
++
++  uint64 block;
++  uint64 sector;
++  uint64 submit_hart;
++  uint64 head;
++  uint64 d0;
++  uint64 d1;
++  uint64 d2;
++  uint64 d0_addr;
++  uint64 d0_len;
++  uint64 d0_flags;
++  uint64 d0_next;
++  uint64 d1_addr;
++  uint64 d1_len;
++  uint64 d1_flags;
++  uint64 d1_next;
++  uint64 d2_addr;
++  uint64 d2_len;
++  uint64 d2_flags;
++  uint64 queue_desc;
++  uint64 queue_avail;
++  uint64 queue_used;
++  uint64 queue_ready;
++  uint64 free_before;
++  uint64 free_programmed;
++  uint64 free_held;
++  uint64 free_after;
++  uint64 avail_before;
++  uint64 avail_after;
++  uint64 used_before;
++  uint64 used_after;
++  uint64 notify;
++  uint64 b_owner;
++  uint64 device_status;
++  uint64 program_seq;
++  uint64 publish_seq;
++  uint64 notify_seq;
++  uint64 sleep_seq;
++  uint64 irq_seq;
++  uint64 complete_seq;
++  uint64 reclaim_seq;
++  uint64 virtio_claims;
++  uint64 virtio_completes;
++  uint64 virtio_claim_harts;
++  uint64 virtio_complete_harts;
++  uint64 info_after;
++  uint64 read_value;
++
++  uint64 pids[3];
++  uint64 blocks[3];
++  uint64 submit0_seq;
++  uint64 submit1_seq;
++  uint64 defer0_seq;
++  uint64 defer1_seq;
++  uint64 deferred_held;
++  uint64 deferred_after;
++  uint64 third_pid;
++  uint64 third_state;
++  uint64 third_chan;
++  uint64 desc_chan;
++  uint64 release_seq;
++  uint64 controller_hart;
++  uint64 reclaims;
++
++  uint64 free_desc;
++  uint64 info_active;
++  uint64 deferred;
++  uint64 buf_refs;
++};
++
++void devauditinit(void);
++int devaudit_command(int, int, struct devsnapshot *);
++void devaudit_sleep(int, void *, int, int, int, int);
++void devaudit_wakeup(int, void *, int);
++void devaudit_plic_claim(int, int);
++void devaudit_plic_complete(int, int);
++void devaudit_uart_rx(int);
++void devaudit_console_char(int, uint64, uint64, int);
++void devaudit_console_done(int, int);
++void devaudit_desc_wait(int, void *, int);
++void devaudit_disk_begin(int, uint, uint64, int, uint64, uint64, uint64,
++                         int, uint16, uint16);
++void devaudit_disk_program(int, int *, struct virtq_desc *, struct buf *, int, int);
++void devaudit_disk_publish(uint16, int);
++void devaudit_disk_notify(int);
++int devaudit_disk_complete(int, struct buf *, int, uint16, uint16, int);
++void devaudit_disk_reclaim(int, int, int, uint16, uint16, int);
+diff --git a/kernel/plic.c b/kernel/plic.c
+index 6230600f2035da4e035586550a974c6d58dc294f..b2199e79d4614f4a9a29598337be58c4823af7fe 100644
+--- a/kernel/plic.c
++++ b/kernel/plic.c
+@@ -3,6 +3,7 @@
+ #include "memlayout.h"
+ #include "riscv.h"
+ #include "defs.h"
++#include "devaudit.h"
+ 
+ //
+ // the riscv Platform Level Interrupt Controller (PLIC).
+@@ -11,6 +12,7 @@
+ void
+ plicinit(void)
+ {
++  devauditinit();
+   // set desired IRQ priorities non-zero (otherwise disabled).
+   *(uint32 *)(PLIC + UART0_IRQ * 4) = 1;
+   *(uint32 *)(PLIC + VIRTIO0_IRQ * 4) = 1;
+@@ -35,6 +37,7 @@ plic_claim(void)
+ {
+   int hart = cpuid();
+   int irq = *(uint32 *)PLIC_SCLAIM(hart);
++  devaudit_plic_claim(irq, hart);
+   return irq;
+ }
+ 
+@@ -44,4 +47,5 @@ plic_complete(int irq)
+ {
+   int hart = cpuid();
+   *(uint32 *)PLIC_SCLAIM(hart) = irq;
++  devaudit_plic_complete(irq, hart);
+ }
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 611e94cb4e84d0120cc26ba898aec6e783a94367..328c335c498eb2c1e06c12ea4185487156b10ece 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "devaudit.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -543,6 +544,7 @@ void
+ sleep(void *chan, struct spinlock *lk)
+ {
+   struct proc *p = myproc();
++  int condition_before = holding(lk);
+ 
+   // Must acquire p->lock in order to
+   // change p->state and then call sched.
+@@ -557,6 +559,8 @@ sleep(void *chan, struct spinlock *lk)
+   // Go to sleep.
+   p->chan = chan;
+   p->state = SLEEPING;
++  devaudit_sleep(p->pid, chan, p->state, condition_before,
++                 holding(&p->lock), holding(lk));
+ 
+   sched();
+ 
+@@ -580,6 +584,7 @@ wakeup(void *chan)
+       acquire(&p->lock);
+       if (p->state == SLEEPING && p->chan == chan) {
+         p->state = RUNNABLE;
++        devaudit_wakeup(p->pid, chan, holding(&p->lock));
+       }
+       release(&p->lock);
+     }
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f2260e09b1885831b3cb6488fe7b560016..26d61d136135deae5f7fd6123e48963457b47ad7 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -102,6 +102,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_devprobe(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -128,6 +129,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_link]    sys_link,
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
++  [SYS_devprobe] sys_devprobe,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4479e64ba193a425db9af0de44bea4464a..e7b29af5ad6461828359c02f4231064db41578c2 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_devprobe 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3a2fca413fcf9d22f3bdc00bda74815825..68ae2939716e5eafe81c742c4256f13682aab228 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -6,6 +6,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "vm.h"
++#include "devaudit.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -107,3 +108,21 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_devprobe(void)
++{
++  int op;
++  int arg;
++  uint64 addr;
++  struct devsnapshot snapshot;
++
++  argint(0, &op);
++  argint(1, &arg);
++  argaddr(2, &addr);
++  int result = devaudit_command(op, arg, &snapshot);
++  if (addr != 0 && copyout(myproc()->pagetable, addr, (char *)&snapshot,
++                           sizeof(snapshot)) < 0)
++    return -1;
++  return result;
++}
+diff --git a/kernel/uart.c b/kernel/uart.c
+index 6699d811c7d6c1e6c600fca7d8de11ef5adeebfc..d1fcf6cbf3c6ad2ddce6cac5812cd09b261cc5d2 100644
+--- a/kernel/uart.c
++++ b/kernel/uart.c
+@@ -9,6 +9,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "devaudit.h"
+ 
+ // the UART control registers are memory-mapped
+ // at address UART0. this macro returns the
+@@ -155,6 +156,7 @@ uartintr(void)
+     int c = uartgetc();
+     if (c == -1)
+       break;
++    devaudit_uart_rx(c);
+     consoleintr(c);
+   }
+ }
+diff --git a/kernel/virtio_disk.c b/kernel/virtio_disk.c
+index da2f1fd19f6064ccd42da1b2d2c54d517999a1b5..ca94bc084d2c460e62ad99e479f4e268323cf1ea 100644
+--- a/kernel/virtio_disk.c
++++ b/kernel/virtio_disk.c
+@@ -15,6 +15,8 @@
+ #include "fs.h"
+ #include "buf.h"
+ #include "virtio.h"
++#include "proc.h"
++#include "devaudit.h"
+ 
+ // the address of virtio mmio register r.
+ #define R(r) ((volatile uint32 *)(VIRTIO0 + (r)))
+@@ -56,8 +58,31 @@ static struct disk {
+ 
+   struct spinlock vdisk_lock;
+ 
++  // Tutorial-only completion gate; never present in the executable baseline.
++  struct buf *deferred[2];
++
+ } disk;
+ 
++static int
++free_count(void)
++{
++  int count = 0;
++  for (int i = 0; i < NUM; i++)
++    if (disk.free[i])
++      count++;
++  return count;
++}
++
++static int
++info_count(void)
++{
++  int count = 0;
++  for (int i = 0; i < NUM; i++)
++    if (disk.info[i].b != 0)
++      count++;
++  return count;
++}
++
+ void
+ virtio_disk_init(void)
+ {
+@@ -218,6 +243,11 @@ virtio_disk_rw(struct buf *b, int write)
+ 
+   acquire(&disk.vdisk_lock);
+ 
++  devaudit_disk_begin(myproc()->pid, b->blockno, sector, cpuid(),
++                      (uint64)disk.desc, (uint64)disk.avail,
++                      (uint64)disk.used, free_count(), disk.avail->idx,
++                      disk.used_idx);
++
+   // the spec's Section 5.2 says that legacy block operations use
+   // three descriptors: one for type/reserved/sector, one for the
+   // data, one for a 1-byte status result.
+@@ -228,6 +258,7 @@ virtio_disk_rw(struct buf *b, int write)
+     if (alloc3_desc(idx) == 0) {
+       break;
+     }
++    devaudit_desc_wait(myproc()->pid, &disk.free[0], free_count());
+     sleep(&disk.free[0], &disk.vdisk_lock);
+   }
+ 
+@@ -266,6 +297,8 @@ virtio_disk_rw(struct buf *b, int write)
+   // record struct buf for virtio_disk_intr().
+   b->disk = 1;
+   disk.info[idx[0]].b = b;
++  devaudit_disk_program(myproc()->pid, idx, disk.desc, b, free_count(),
++                        holding(&disk.vdisk_lock));
+ 
+   // tell the device the first index in our chain of descriptors.
+   disk.avail->ring[disk.avail->idx % NUM] = idx[0];
+@@ -274,10 +307,12 @@ virtio_disk_rw(struct buf *b, int write)
+ 
+   // tell the device another avail ring entry is available.
+   disk.avail->idx += 1; // not % NUM ...
++  devaudit_disk_publish(disk.avail->idx, holding(&disk.vdisk_lock));
+ 
+   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+ 
+   *R(VIRTIO_MMIO_QUEUE_NOTIFY) = 0; // value is queue number
++  devaudit_disk_notify(holding(&disk.vdisk_lock));
+ 
+   // Wait for virtio_disk_intr() to say request has finished.
+   while (b->disk == 1) {
+@@ -287,6 +322,10 @@ virtio_disk_rw(struct buf *b, int write)
+   disk.info[idx[0]].b = 0;
+   free_chain(idx[0]);
+ 
++  devaudit_disk_reclaim(myproc()->pid, free_count(), info_count(),
++                        disk.avail->idx, disk.used_idx,
++                        holding(&disk.vdisk_lock));
++
+   release(&disk.vdisk_lock);
+ }
+ 
+@@ -316,11 +355,67 @@ virtio_disk_intr()
+       panic("virtio_disk_intr status");
+ 
+     struct buf *b = disk.info[id].b;
+-    b->disk = 0; // disk is done with buf
+-    wakeup(b);
++    int defer = devaudit_disk_complete(id, b, disk.info[id].status,
++                                       disk.used_idx, disk.used->idx,
++                                       holding(&disk.vdisk_lock));
++    if (defer) {
++      int stored = 0;
++      for (int i = 0; i < 2; i++) {
++        if (disk.deferred[i] == 0) {
++          disk.deferred[i] = b;
++          stored = 1;
++          break;
++        }
++      }
++      if (!stored)
++        panic("virtio audit deferred");
++    } else {
++      b->disk = 0; // disk is done with buf
++      wakeup(b);
++    }
+ 
+     disk.used_idx += 1;
+   }
+ 
+   release(&disk.vdisk_lock);
+ }
++
++int
++virtio_disk_audit_release(void)
++{
++  int released = 0;
++
++  acquire(&disk.vdisk_lock);
++  for (int i = 0; i < 2; i++) {
++    struct buf *b = disk.deferred[i];
++    if (b != 0) {
++      disk.deferred[i] = 0;
++      b->disk = 0;
++      wakeup(b);
++      released++;
++    }
++  }
++  release(&disk.vdisk_lock);
++  return released;
++}
++
++void
++virtio_disk_audit_ledger(int *free, int *info, int *deferred,
++                         uint16 *avail, uint16 *used, uint64 *desc_addr,
++                         uint64 *avail_addr, uint64 *used_addr, int *ready)
++{
++  acquire(&disk.vdisk_lock);
++  *free = free_count();
++  *info = info_count();
++  *deferred = 0;
++  for (int i = 0; i < 2; i++)
++    if (disk.deferred[i] != 0)
++      (*deferred)++;
++  *avail = disk.avail->idx;
++  *used = disk.used_idx;
++  *desc_addr = (uint64)disk.desc;
++  *avail_addr = (uint64)disk.avail;
++  *used_addr = (uint64)disk.used;
++  *ready = *R(VIRTIO_MMIO_QUEUE_READY);
++  release(&disk.vdisk_lock);
++}
+diff --git a/user/devtrace.c b/user/devtrace.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..144265f2596a295b7318fc3fbd6d84f73f6f7719
+--- /dev/null
++++ b/user/devtrace.c
+@@ -0,0 +1,237 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/devaudit.h"
++#include "user/user.h"
++
++static void
++fail(char *message)
++{
++  printf("DEV FAIL %s\n", message);
++  exit(1);
++}
++
++static void
++snap(struct devsnapshot *s)
++{
++  if (devprobe(DEV_SNAPSHOT, 0, s) < 0)
++    fail("snapshot");
++}
++
++static void
++after(char *phase)
++{
++  static struct devsnapshot s;
++  if (devprobe(DEV_RESET, 0, &s) < 0)
++    fail("reset");
++  printf("DEV AFTER phase=%s active=%ld waiters=%ld deferred=%ld "
++         "free_desc=%ld info=%ld buf_refs=%ld\n",
++         phase, s.active, s.waiters, s.deferred, s.free_desc, s.info_active,
++         s.buf_refs);
++}
++
++static int
++wait_for(int mode, int queue)
++{
++  static struct devsnapshot s;
++  for (int i = 0; i < 300; i++) {
++    snap(&s);
++    if (s.active && s.mode == mode) {
++      if (!queue && s.wait_seq != 0 && s.deferred_held == 1)
++        return 0;
++      if (queue && s.deferred_held == 2 && s.wait_seq != 0 &&
++          s.free_held == 2)
++        return 0;
++    }
++    pause(1);
++  }
++  return -1;
++}
++
++static void
++console_case(void)
++{
++  int pid = fork();
++  if (pid < 0)
++    fail("console fork");
++  if (pid == 0) {
++    static struct devsnapshot s;
++    char input[16];
++    char expected[] = "D14-input\n";
++    if (devprobe(DEV_ARM_CONSOLE, 0, &s) < 0)
++      exit(1);
++    int n = read(0, input, sizeof(input));
++    if (n != 10 || memcmp(input, expected, 10) != 0)
++      exit(1);
++    exit(0);
++  }
++
++  static struct devsnapshot s;
++  for (int i = 0; i < 300; i++) {
++    snap(&s);
++    if (s.active && s.mode == DEV_MODE_CONSOLE && s.pid == pid &&
++        s.wait_seq != 0 && s.wait_state == 2)
++      break;
++    if (i == 299)
++      fail("console wait");
++    pause(1);
++  }
++  printf("DEV CONSOLE_WAIT generation=%ld pid=%ld state=%ld chan=%ld seq=%ld\n",
++         s.generation, s.pid, s.wait_state, s.wait_chan, s.wait_seq);
++
++  int status = -1;
++  if (wait(&status) != pid)
++    fail("console wait pid");
++  pause(2);
++  snap(&s);
++  printf("DEV CONSOLE generation=%ld pid=%ld irq=10 wait_seq=%ld rx_seq=%ld "
++         "wake_seq=%ld done_seq=%ld claims=%ld completes=%ld claim_harts=%ld "
++         "complete_harts=%ld wait_chan=%ld wake_chan=%ld rx=%ld first=%ld "
++         "last=%ld read=%ld ring_before=%ld ring_after=%ld publish_lock=%ld "
++         "condition_before=%ld proc_after=%ld condition_after=%ld "
++         "wake_proc_lock=%ld lock_errors=%ld status=%d cleanup=1\n",
++         s.generation, s.pid, s.wait_seq, s.rx_seq, s.wake_seq, s.done_seq,
++         s.uart_claims, s.uart_completes, s.uart_claim_harts,
++         s.uart_complete_harts, s.wait_chan, s.wake_chan, s.rx_count,
++         s.rx_first, s.rx_last, s.read_len, s.ring_before, s.ring_after,
++         s.publish_lock, s.condition_before, s.proc_after, s.condition_after,
++         s.wake_proc_lock, s.lock_errors, status);
++  after("CONSOLE");
++  if (status != 0)
++    fail("console status");
++}
++
++static void
++disk_case(void)
++{
++  int pid = fork();
++  if (pid < 0)
++    fail("disk fork");
++  if (pid == 0) {
++    static struct devsnapshot s;
++    int value = devprobe(DEV_DISK_READ, 1999, &s);
++    exit(value < 0);
++  }
++  if (wait_for(DEV_MODE_DISK, 0) < 0)
++    fail("disk gate");
++  static struct devsnapshot s;
++  if (devprobe(DEV_RELEASE, 0, &s) != 1)
++    fail("disk release");
++  int status = -1;
++  if (wait(&status) != pid)
++    fail("disk wait pid");
++  snap(&s);
++  printf("DEV DISK generation=%ld pid=%ld block=%ld sector=%ld submit_hart=%ld "
++         "head=%ld d0=%ld d1=%ld d2=%ld d0_addr=%ld d0_len=%ld "
++         "d0_flags=%ld d0_next=%ld d1_addr=%ld d1_len=%ld d1_flags=%ld "
++         "d1_next=%ld d2_addr=%ld d2_len=%ld d2_flags=%ld queue_desc=%ld "
++         "queue_avail=%ld queue_used=%ld queue_ready=%ld free_before=%ld "
++         "free_programmed=%ld free_after=%ld avail_before=%ld avail_after=%ld "
++         "used_before=%ld used_after=%ld notify=%ld b_owner=%ld device_status=%ld "
++         "wait_chan=%ld wake_chan=%ld program_seq=%ld publish_seq=%ld "
++         "notify_seq=%ld sleep_seq=%ld irq_seq=%ld complete_seq=%ld "
++         "wake_seq=%ld reclaim_seq=%ld irq=1 claims=%ld completes=%ld "
++         "claim_harts=%ld complete_harts=%ld info_after=%ld read=%ld "
++         "program_lock=%ld publish_lock=%ld notify_lock=%ld complete_lock=%ld "
++         "reclaim_lock=%ld condition_before=%ld proc_after=%ld "
++         "condition_after=%ld wake_proc_lock=%ld lock_errors=%ld "
++         "status=%d cleanup=1\n",
++         s.generation, s.pid, s.block, s.sector, s.submit_hart, s.head,
++         s.d0, s.d1, s.d2, s.d0_addr, s.d0_len, s.d0_flags, s.d0_next,
++         s.d1_addr, s.d1_len, s.d1_flags, s.d1_next, s.d2_addr, s.d2_len,
++         s.d2_flags, s.queue_desc, s.queue_avail, s.queue_used, s.queue_ready,
++         s.free_before, s.free_programmed, s.free_after, s.avail_before,
++         s.avail_after, s.used_before, s.used_after, s.notify, s.b_owner,
++         s.device_status, s.wait_chan, s.wake_chan, s.program_seq,
++         s.publish_seq, s.notify_seq, s.sleep_seq, s.irq_seq, s.complete_seq,
++         s.wake_seq, s.reclaim_seq, s.virtio_claims, s.virtio_completes,
++         s.virtio_claim_harts, s.virtio_complete_harts, s.info_after,
++         s.read_value, s.program_lock, s.publish_lock, s.notify_lock,
++         s.complete_lock, s.reclaim_lock, s.condition_before, s.proc_after,
++         s.condition_after, s.wake_proc_lock, s.lock_errors, status);
++  after("DISK");
++  if (status != 0)
++    fail("disk status");
++}
++
++static void
++queue_case(void)
++{
++  static struct devsnapshot s;
++  if (devprobe(DEV_ARM_QUEUE, 0, &s) < 0)
++    fail("queue arm");
++  int expected[3];
++  for (int i = 0; i < 3; i++) {
++    int pid = fork();
++    if (pid < 0)
++      fail("queue fork");
++    if (pid == 0) {
++      static struct devsnapshot child;
++      int packed = (i << 16) | (1996 + i);
++      exit(devprobe(DEV_QUEUE_READ, packed, &child) < 0);
++    }
++    expected[i] = pid;
++  }
++  if (wait_for(DEV_MODE_QUEUE, 1) < 0)
++    fail("queue boundary");
++  static struct devsnapshot held;
++  snap(&held);
++  if (devprobe(DEV_RELEASE, 0, &s) != 2)
++    fail("queue release");
++  int statuses[3] = {-1, -1, -1};
++  for (int i = 0; i < 3; i++) {
++    int status = -1;
++    int pid = wait(&status);
++    if (pid < 0)
++      fail("queue wait");
++    for (int j = 0; j < 3; j++)
++      if (expected[j] == pid)
++        statuses[j] = status;
++  }
++  snap(&s);
++  printf("DEV QUEUE generation=%ld p0=%ld p1=%ld p2=%ld block0=%ld "
++         "block1=%ld block2=%ld free_before=%ld free_held=%ld free_after=%ld "
++         "deferred_held=%ld deferred_after=%ld third_pid=%ld third_state=%ld "
++         "third_chan=%ld desc_chan=%ld avail_before=%ld avail_after=%ld "
++         "used_before=%ld used_after=%ld submit0_seq=%ld submit1_seq=%ld "
++         "defer0_seq=%ld defer1_seq=%ld wait_seq=%ld release_seq=%ld "
++         "reclaim_seq=%ld irq=1 claims=%ld completes=%ld claim_harts=%ld "
++         "complete_harts=%ld controller_hart=%ld status0=%d status1=%d "
++         "status2=%d info_after=%ld program_lock=%ld publish_lock=%ld "
++         "notify_lock=%ld complete_lock=%ld reclaim_lock=%ld "
++         "condition_before=%ld proc_after=%ld condition_after=%ld "
++         "wake_proc_lock=%ld lock_errors=%ld cleanup=1\n",
++         s.generation, s.pids[0], s.pids[1], s.pids[2], s.blocks[0],
++         s.blocks[1], s.blocks[2], s.free_before, held.free_held, s.free_after,
++         held.deferred_held, s.deferred_after, held.third_pid, held.third_state,
++         held.third_chan, held.desc_chan, s.avail_before, s.avail_after,
++         s.used_before, s.used_after, s.submit0_seq, s.submit1_seq,
++         held.defer0_seq, held.defer1_seq, held.wait_seq, s.release_seq,
++         s.reclaim_seq, s.virtio_claims, s.virtio_completes,
++         s.virtio_claim_harts, s.virtio_complete_harts, s.controller_hart,
++         statuses[0], statuses[1], statuses[2], s.info_after, s.program_lock,
++         s.publish_lock, s.notify_lock, s.complete_lock, s.reclaim_lock,
++         s.condition_before, s.proc_after, s.condition_after, s.wake_proc_lock,
++         s.lock_errors);
++  after("QUEUE");
++  if (statuses[0] != 0 || statuses[1] != 0 || statuses[2] != 0)
++    fail("queue status");
++  printf("DEV PASS cases=3 cleanup=1\n");
++}
++
++int
++main(int argc, char **argv)
++{
++  if (argc != 2) {
++    fprintf(2, "usage: devtrace console|disk|queue\n");
++    exit(1);
++  }
++  if (strcmp(argv[1], "console") == 0)
++    console_case();
++  else if (strcmp(argv[1], "disk") == 0)
++    disk_case();
++  else if (strcmp(argv[1], "queue") == 0)
++    queue_case();
++  else
++    fail("mode");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921c8f26a96ee75b5d0ac3295e3229dc3596..3f19d040ca35844dc4e986435c5a73bdd161a3d6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,7 @@
+ #define SBRK_ERROR ((char *)-1)
+ 
+ struct stat;
++struct devsnapshot;
+ 
+ // system calls
+ int fork(void);
+@@ -24,6 +25,7 @@ int getpid(void);
+ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
++int devprobe(int, int, struct devsnapshot *);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a750aea5c8f23fca00f89c9c2610408ff8..19e24e9ef42402278629d2b21ec24e5cd17b283d 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("devprobe");

@@ -7,11 +7,11 @@
 object 再拥有缓冲区和端点；它没有单独的 channel 字段，等待身份是 `&nread` 或
 `&nwrite`，存入 sleeping process 的 `p->chan`。`fork()` 复制 descriptor entries，
 `dup()` 复制 entry 而增加 file ref，`close()` 只在最后一个 endpoint 消失时释放
-pipe。控制台把同一 file 接到 `consolewrite/consoleread`，UART 中断负责推进传输；
-VirtIO 设备则以 buffer-cache 和 DMA descriptor 完成磁盘请求。
+pipe。控制台把同一 file 接到 `consolewrite/consoleread`；普通 inode read 则在
+`readi` 进入 buffer/device 边界。边界之后的 UART、PLIC 与 VirtIO 完成属于下一单元。
 
-本单元的唯一出口是一个可独立复核的“通信与设备 I/O 账本报告包”。报告必须把
-descriptor、file、pipe、process、sleep channel 和 device queue 分层，绘制一次 shell
+本单元的唯一出口是一个可独立复核的“通信与 I/O 边界账本报告包”。报告必须把
+descriptor、file、pipe、process、sleep channel 和 console/file 边界分层，绘制一次 shell
 pipeline 的 fork/dup/close/blocked/wakeup/EOF/reclaim 时间线，并用隔离的
 `ioflow` bounded lab 验证正常传输、满/空、断端、被 kill 的等待者和最终清理。
 
@@ -19,7 +19,9 @@ pipeline 的 fork/dup/close/blocked/wakeup/EOF/reclaim 时间线，并用隔离�
 
 硬前置：[Copy-on-Write fork 证据项目](../experiments/copy-on-write.md)。相关单元是
 [进程生命周期与回收](process-and-memory.md)与[调度、同步与等待](scheduling-and-synchronization.md)。
-本单元解除 `console-device-path`，并拥有 descriptor/file/pipe/device ownership。
+本单元解除 `console-device-path`，并拥有 descriptor/file/pipe/console-file ownership；
+`device-interrupt-queue-completion` 仍是明确黑盒，由
+[设备中断与 VirtIO 队列](device-io.md)解除。
 文件系统 inode、日志事务、buffer-cache 的持久化顺序留给后续 `core.persistence`；
 这里只追踪普通 read 的 `fileread -> readi -> bread` 与修改路径的
 `begin_op/end_op` 边界。DMA memory ordering、
@@ -51,21 +53,20 @@ exit -> wait`；ownership 边是 `descriptor -> file ref -> pipe endpoint -> buf
 若 parent 忘记关闭 writer，right child 永远看不到 EOF；若 child 忘记关闭 reader，
 left writer 不能得到 broken-end 结果。
 
-### console、PLIC、UART 与 VirtIO
+### console 与 inode 的 device 边界
 
 `user/init.c:main` 打开 `console` 并通过 `dup` 保证 fd 0/1/2。`sys_read/sys_write`
 经 `argfd` 找到 file object；`fdalloc` 只在 `dup`、`open` 和 `pipe` 等创建新
 descriptor 的路径选择空 slot。`FD_DEVICE` 进入 `devsw[CONSOLE]`，
-`consolewrite` 批量调用 `uartwrite`，`consoleread` 在 `cons.r == cons.w` 时睡在
-`&cons.r`。`uartintr` 既清除 transmit busy 并 wake writer，也把接收字符交给
-`consoleintr`；newline、`^D` 和完整输入缓冲区才唤醒 reader。PLIC 只负责 claim/
-complete 中断源，不拥有用户 descriptor。
+`consolewrite` 与 `consoleread` 是本单元可见的 file/device dispatch 边界；后者在
+`cons.r == cons.w` 时睡在 `&cons.r`。UART 如何推进 ring、PLIC 如何 claim/complete
+中断源，不属于 descriptor 或 file ownership，留给下一设备单元。
 
 磁盘路径是另一条 ownership 链：普通 inode read 从 `fileread -> readi -> bread`
 取得 buffer sleeplock；修改型路径才在相应 syscall 或 `filewrite` 中用
-`begin_op/end_op` 包围事务。`virtio_disk_rw` 把 buffer 挂进 descriptor chain，
-设备完成中断后 `virtio_disk_intr` wake waiter，随后 `brelse` 归还 cache。buffer、
-log、DMA descriptor 都不是 pipe/file object；后续持久化单元才讨论 crash ordering。
+`begin_op/end_op` 包围事务。`bread` 是本单元的 buffer/device handoff 边界；cache miss、
+descriptor chain、设备完成和 buffer 回收由下一设备单元追踪，完整 cache/LRU 与 log
+持久化则由后续持久化单元拥有。
 
 ## 源码追踪计划
 
@@ -76,11 +77,7 @@ rg -n '^pipealloc\(|^pipeclose\(|^pipewrite\(|^piperead\(' kernel/pipe.c
 rg -n '^argfd\(|^fdalloc\(|^sys_read\(|^sys_write\(|^sys_dup\(|^sys_close\(|^sys_pipe\(' kernel/sysfile.c
 rg -n '^runcmd\(|case PIPE|^main\(' user/sh.c user/init.c
 rg -n '^consolewrite\(|^consoleread\(|^consoleintr\(' kernel/console.c
-rg -n '^uartwrite\(|^uartintr\(' kernel/uart.c
-rg -n '^plic_claim\(|^plic_complete\(' kernel/plic.c
-rg -n '^bread\(|^brelse\(' kernel/bio.c
 rg -n '^begin_op\(|^end_op\(' kernel/log.c
-rg -n '^virtio_disk_rw\(|^virtio_disk_intr\(' kernel/virtio_disk.c
 rg -n 'struct io_snapshot|iosnapshot\(|fileaudit\(|pipeaudit\(|procaudit\(|freepagecount\(' \\
   docs/xv6-tutorial/resources/communication-and-io/communication.patch
 ```

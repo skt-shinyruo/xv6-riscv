@@ -32,13 +32,12 @@ fixture 的 parent 通过 `iosnapshot(fd, pid, addr)` 读取原始 snapshot，�
 
 ## IO-05/06
 
-console 的 `cons` 保护输入环形缓冲；UART 的 `tx_lock/tx_busy/tx_chan` 保护发送
-进度；PLIC 只路由中断号。`consoleread` 睡在 `&cons.r`，UART completion 唤醒
-`&tx_chan`，所以 fd、console state 和 UART channel 是三种对象。磁盘 read 会持有
-buffer sleeplock；cache miss 才进入 VirtIO descriptor/interrupt 路径。普通 inode
-read 没有 log reservation，修改路径才进入 `begin_op/end_op`。本单元的动态 marker
-只证明准确 inode read 与清理，console/UART/PLIC/VirtIO completion 的运行时 trace 由
-下一单元建立；这里不宣称 DMA 或持久化 ordering、crash recovery。
+descriptor 指向 `FD_DEVICE` file，`devsw[CONSOLE]` 选择 file/device dispatch，`cons`
+则保护输入 ring；三者不是同一 owner。`consoleread` 睡在 `&cons.r`，但 UART/PLIC 如何
+产生 wakeup 是下一单元的完成路径。普通 inode read 没有 log reservation，修改路径才进入
+`begin_op/end_op`；`readi` 到 `bread` 只是 buffer/device handoff。当前动态 marker 只证明
+准确 inode read 与清理；cache miss、UART/PLIC/VirtIO completion 由下一设备单元建立，
+完整 cache/LRU、log persistence 与 crash recovery 由持久化单元拥有。
 
 ## IO-07/08
 

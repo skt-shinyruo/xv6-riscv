@@ -13,7 +13,7 @@
 7. **FS-07** 为什么 buffer cache 必须保证每个 `(dev, blockno)` 只有一个 buffer？`brelse()` 后继续使用指针会发生什么？
 8. **FS-08** `filewrite()` 为什么可能已经写入并提交一部分数据，最终却仍返回 `-1`？
 9. **FS-09** 日志恢复后为什么还要执行 `ireclaim()`？只重放 redo log 为什么不能回收崩溃前的 orphan inode？
-10. **FS-10** VirtIO 有 8 个 descriptor，每个请求使用 3 个，为什么最多只有两笔请求在途？完成中断为什么不直接释放 descriptor？
+10. **FS-10** 已迁移到[设备中断与 VirtIO 队列问题 `DEVICE-10`](../xv6-tutorial/questions/device-io.md#device-10-为什么-8-个-descriptor-只能支持两笔三段请求在途)。此处只保留兼容入口。
 
 ## 源码入口
 
