@@ -1,0 +1,715 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..7bc9188 100644
+--- a/Makefile
++++ b/Makefile
+@@ -126,6 +126,7 @@ mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+ .PRECIOUS: %.o
+ 
+ UPROGS=\
++	$U/_ioflow\
+ 	$U/_cat\
+ 	$U/_echo\
+ 	$U/_forktest\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..95fe612 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct io_snapshot;
+ 
+ // bio.c
+ void            binit(void);
+@@ -31,6 +32,7 @@ struct file*    filealloc(void);
+ void            fileclose(struct file*);
+ struct file*    filedup(struct file*);
+ void            fileinit(void);
++void            fileaudit(struct io_snapshot*);
+ int             fileread(struct file*, uint64, int n);
+ int             filestat(struct file*, uint64 addr);
+ int             filewrite(struct file*, uint64, int n);
+@@ -60,6 +62,7 @@ void            ireclaim(int);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++int             freepagecount(void);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -72,6 +75,7 @@ int             pipealloc(struct file**, struct file**);
+ void            pipeclose(struct pipe*, int);
+ int             piperead(struct pipe*, uint64, int);
+ int             pipewrite(struct pipe*, uint64, int);
++void            pipeaudit(struct pipe*, int, struct io_snapshot*);
+ 
+ // printk.c
+ int             printk(char*, ...) __attribute__ ((format (printf, 1, 2)));
+@@ -102,6 +106,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            procaudit(int, void*, void*, struct io_snapshot*);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+diff --git a/kernel/file.c b/kernel/file.c
+index 13a4e69..4721a19 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -12,6 +12,7 @@
+ #include "file.h"
+ #include "stat.h"
+ #include "proc.h"
++#include "ioaudit.h"
+ 
+ struct devsw devsw[NDEV];
+ struct {
+@@ -25,6 +26,31 @@ fileinit(void)
+   initlock(&ftable.lock, "ftable");
+ }
+ 
++void
++fileaudit(struct io_snapshot *snapshot)
++{
++  struct pipe *pipes[NFILE];
++  int npipes = 0;
++
++  acquire(&ftable.lock);
++  for (struct file *f = ftable.file; f < ftable.file + NFILE; f++) {
++    if (f->ref == 0)
++      continue;
++    snapshot->active_files++;
++    snapshot->file_refs += f->ref;
++    if (f->type == FD_PIPE) {
++      int seen = 0;
++      for (int i = 0; i < npipes; i++)
++        if (pipes[i] == f->pipe)
++          seen = 1;
++      if (!seen)
++        pipes[npipes++] = f->pipe;
++    }
++  }
++  snapshot->active_pipes = npipes;
++  release(&ftable.lock);
++}
++
+ // Allocate a file structure.
+ struct file *
+ filealloc(void)
+diff --git a/kernel/ioaudit.h b/kernel/ioaudit.h
+new file mode 100644
+index 0000000..d84f0fc
+--- /dev/null
++++ b/kernel/ioaudit.h
+@@ -0,0 +1,28 @@
++#ifndef IOAUDIT_H
++#define IOAUDIT_H
++
++#include "types.h"
++
++#define IO_CHAN_NONE 0
++#define IO_CHAN_READ 1
++#define IO_CHAN_WRITE 2
++#define IO_CHAN_OTHER 3
++#define IO_STATE_UNUSED 0
++#define IO_STATE_SLEEPING 2
++
++struct io_snapshot {
++  int fd_slots;
++  int active_files;
++  int file_refs;
++  int active_pipes;
++  int used_procs;
++  int free_pages;
++  int target_pid;
++  int target_state;
++  int target_chan;
++  int occupancy;
++  int readopen;
++  int writeopen;
++};
++
++#endif
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 2fcec38..b003b04 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,16 @@ kalloc(void)
+     memset((char *)r, 5, PGSIZE); // fill with junk
+   return (void *)r;
+ }
++
++int
++freepagecount(void)
++{
++  int count = 0;
++  struct run *r;
++
++  acquire(&kmem.lock);
++  for (r = kmem.freelist; r != 0; r = r->next)
++    count++;
++  release(&kmem.lock);
++  return count;
++}
+diff --git a/kernel/pipe.c b/kernel/pipe.c
+index 73e8518..c2e96d4 100644
+--- a/kernel/pipe.c
++++ b/kernel/pipe.c
+@@ -7,6 +7,7 @@
+ #include "fs.h"
+ #include "sleeplock.h"
+ #include "file.h"
++#include "ioaudit.h"
+ 
+ #define PIPESIZE 512
+ 
+@@ -132,3 +133,14 @@ piperead(struct pipe *pi, uint64 addr, int n)
+   release(&pi->lock);
+   return i;
+ }
++
++void
++pipeaudit(struct pipe *pi, int pid, struct io_snapshot *snapshot)
++{
++  acquire(&pi->lock);
++  snapshot->occupancy = pi->nwrite - pi->nread;
++  snapshot->readopen = pi->readopen;
++  snapshot->writeopen = pi->writeopen;
++  release(&pi->lock);
++  procaudit(pid, &pi->nread, &pi->nwrite, snapshot);
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 611e94c..8ddf1ad 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -5,6 +5,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "ioaudit.h"
+ 
+ struct cpu cpus[NCPU];
+ 
+@@ -690,3 +691,30 @@ procdump(void)
+     printk("\n");
+   }
+ }
++
++void
++procaudit(int pid, void *read_chan, void *write_chan,
++          struct io_snapshot *snapshot)
++{
++  struct proc *p;
++
++  snapshot->used_procs = 0;
++  snapshot->target_pid = pid;
++  snapshot->target_state = UNUSED;
++  snapshot->target_chan = IO_CHAN_NONE;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state != UNUSED)
++      snapshot->used_procs++;
++    if (p->pid == pid) {
++      snapshot->target_state = p->state;
++      if (read_chan != 0 && p->chan == read_chan)
++        snapshot->target_chan = IO_CHAN_READ;
++      else if (write_chan != 0 && p->chan == write_chan)
++        snapshot->target_chan = IO_CHAN_WRITE;
++      else if (p->chan != 0)
++        snapshot->target_chan = IO_CHAN_OTHER;
++    }
++    release(&p->lock);
++  }
++}
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..91d74b2 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -102,6 +102,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_iosnapshot(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -128,6 +129,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_link]    sys_link,
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
++  [SYS_iosnapshot] sys_iosnapshot,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..239dc48 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_iosnapshot 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..5495243 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -4,8 +4,12 @@
+ #include "param.h"
+ #include "memlayout.h"
+ #include "spinlock.h"
++#include "sleeplock.h"
++#include "fs.h"
+ #include "proc.h"
+ #include "vm.h"
++#include "file.h"
++#include "ioaudit.h"
+ 
+ uint64
+ sys_exit(void)
+@@ -107,3 +111,32 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_iosnapshot(void)
++{
++  int fd, pid;
++  uint64 addr;
++  struct proc *p = myproc();
++  struct io_snapshot snapshot;
++
++  memset(&snapshot, 0, sizeof(snapshot));
++  argint(0, &fd);
++  argint(1, &pid);
++  argaddr(2, &addr);
++  for (int i = 0; i < NOFILE; i++)
++    if (p->ofile[i] != 0)
++      snapshot.fd_slots++;
++  fileaudit(&snapshot);
++  snapshot.free_pages = freepagecount();
++  if (fd >= 0) {
++    if (fd >= NOFILE || p->ofile[fd] == 0 || p->ofile[fd]->type != FD_PIPE)
++      return -1;
++    pipeaudit(p->ofile[fd]->pipe, pid, &snapshot);
++  } else {
++    procaudit(pid, 0, 0, &snapshot);
++  }
++  if (copyout(p->pagetable, addr, (char *)&snapshot, sizeof(snapshot)) < 0)
++    return -1;
++  return 0;
++}
+diff --git a/user/ioflow.c b/user/ioflow.c
+new file mode 100644
+index 0000000..806ef42
+--- /dev/null
++++ b/user/ioflow.c
+@@ -0,0 +1,384 @@
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/fcntl.h"
++#include "kernel/ioaudit.h"
++#include "user/user.h"
++
++static void
++fail(char *what)
++{
++  printf("IO FAIL %s\n", what);
++  exit(1);
++}
++
++static struct io_snapshot
++snapshot(int fd, int pid)
++{
++  struct io_snapshot value;
++  if (iosnapshot(fd, pid, &value) < 0)
++    fail("snapshot");
++  return value;
++}
++
++static void
++same_ledger(struct io_snapshot before, struct io_snapshot after)
++{
++  if (before.fd_slots != after.fd_slots ||
++      before.active_files != after.active_files ||
++      before.file_refs != after.file_refs ||
++      before.active_pipes != after.active_pipes ||
++      before.used_procs != after.used_procs ||
++      before.free_pages != after.free_pages)
++    fail("ledger");
++}
++
++static void
++print_after(char *phase, struct io_snapshot value)
++{
++  printf("IO AFTER phase=%s fd=%d files=%d refs=%d pipes=%d procs=%d free=%d\n",
++         phase, value.fd_slots, value.active_files, value.file_refs,
++         value.active_pipes, value.used_procs, value.free_pages);
++}
++
++static void
++wait_status(int pid, int expected)
++{
++  int status = 0x7fffffff;
++  int got = wait(&status);
++  if (got != pid || status != expected)
++    fail("wait-status");
++}
++
++static void
++read_all(int fd, char *buf, int n)
++{
++  int got = 0;
++  while (got < n) {
++    int r = read(fd, buf + got, n - got);
++    if (r <= 0)
++      fail("short-read");
++    got += r;
++  }
++}
++
++static struct io_snapshot
++wait_for_pipe(int fd, int pid, int chan, int occupancy)
++{
++  struct io_snapshot value;
++  for (int attempt = 0; attempt < 200; attempt++) {
++    value = snapshot(fd, pid);
++    if (value.target_state == IO_STATE_SLEEPING &&
++        value.target_chan == chan && value.occupancy == occupancy)
++      return value;
++    pause(1);
++  }
++  fail("not-blocked");
++  value = snapshot(fd, pid);
++  return value;
++}
++
++static void
++pipeline(struct io_snapshot base)
++{
++  int p[2], left, right, status, got1, got2, status1, status2;
++  char data[641], received[641];
++  int left_fd, right_fd;
++  struct io_snapshot after;
++
++  for (int i = 0; i < sizeof(data); i++)
++    data[i] = (char)(i % 251);
++  if (pipe(p) < 0 || (left = fork()) < 0)
++    fail("pipeline-setup");
++  if (left == 0) {
++    close(p[0]);
++    close(1);
++    left_fd = dup(p[1]);
++    if (left_fd != 1 || write(1, data, sizeof(data)) != sizeof(data))
++      exit(10);
++    close(p[1]);
++    close(1);
++    exit(0);
++  }
++  if ((right = fork()) < 0)
++    fail("pipeline-fork");
++  if (right == 0) {
++    close(p[1]);
++    close(0);
++    right_fd = dup(p[0]);
++    if (right_fd != 0)
++      exit(11);
++    close(p[0]);
++    read_all(0, received, sizeof(received));
++    if (memcmp(received, data, sizeof(data)) != 0 || read(0, received, 1) != 0)
++      exit(12);
++    close(0);
++    exit(0);
++  }
++  close(p[0]);
++  close(p[1]);
++  status = 0;
++  got1 = wait(&status1);
++  got2 = wait(&status2);
++  if (!((got1 == left && status1 == status && got2 == right && status2 == status) ||
++        (got1 == right && status1 == status && got2 == left && status2 == status)))
++    fail("pipeline-wait");
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("PIPELINE", after);
++  printf("IO PIPELINE left=%d right=%d left_fd=1 right_fd=0 bytes=641 eof=0 cleanup=1\n",
++         left, right);
++}
++
++static void
++empty_wakeup(struct io_snapshot base)
++{
++  int p[2], ready[2], child;
++  char byte;
++  struct io_snapshot observed, after;
++
++  if (pipe(p) < 0 || pipe(ready) < 0 || (child = fork()) < 0)
++    fail("empty-setup");
++  if (child == 0) {
++    close(p[1]);
++    close(ready[0]);
++    byte = 0;
++    if (write(ready[1], &byte, 1) != 1)
++      exit(20);
++    close(ready[1]);
++    if (read(p[0], &byte, 1) != 1 || byte != 'E')
++      exit(21);
++    close(p[0]);
++    exit(0);
++  }
++  close(p[0]);
++  close(ready[1]);
++  if (read(ready[0], &byte, 1) != 1)
++    fail("empty-ready");
++  close(ready[0]);
++  observed = wait_for_pipe(p[1], child, IO_CHAN_READ, 0);
++  if (observed.readopen != 1 || observed.writeopen != 1)
++    fail("empty-open");
++  if (write(p[1], "E", 1) != 1)
++    fail("empty-write");
++  close(p[1]);
++  wait_status(child, 0);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("EMPTY", after);
++  printf("IO EMPTY child=%d state=%d chan=%d occupancy=0 wake=1 cleanup=1\n",
++         child, observed.target_state, observed.target_chan);
++}
++
++static void
++full_wakeup(struct io_snapshot base)
++{
++  int p[2], child;
++  char buf[512], byte;
++  struct io_snapshot observed, after;
++
++  memset(buf, 'x', sizeof(buf));
++  if (pipe(p) < 0 || write(p[1], buf, sizeof(buf)) != sizeof(buf) ||
++      (child = fork()) < 0)
++    fail("full-setup");
++  if (child == 0) {
++    close(p[0]);
++    if (write(p[1], "y", 1) != 1)
++      exit(30);
++    close(p[1]);
++    exit(0);
++  }
++  close(p[1]);
++  observed = wait_for_pipe(p[0], child, IO_CHAN_WRITE, 512);
++  if (observed.readopen != 1 || observed.writeopen != 1)
++    fail("full-open");
++  read_all(p[0], buf, sizeof(buf));
++  for (int i = 0; i < sizeof(buf); i++)
++    if (buf[i] != 'x')
++      fail("full-prefix");
++  if (read(p[0], &byte, 1) != 1 || byte != 'y' || read(p[0], &byte, 1) != 0)
++    fail("full-order");
++  close(p[0]);
++  wait_status(child, 0);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("FULL", after);
++  printf("IO FULL child=%d state=%d chan=%d occupancy=512 wake=1 cleanup=1\n",
++         child, observed.target_state, observed.target_chan);
++}
++
++static void
++eof_case(struct io_snapshot base)
++{
++  int p[2];
++  char byte;
++  struct io_snapshot observed, after;
++
++  if (pipe(p) < 0)
++    fail("eof-setup");
++  close(p[1]);
++  observed = snapshot(p[0], 0);
++  if (observed.occupancy != 0 || observed.readopen != 1 || observed.writeopen != 0)
++    fail("eof-state");
++  if (read(p[0], &byte, 1) != 0)
++    fail("eof");
++  close(p[0]);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("EOF", after);
++  printf("IO EOF occupancy=0 read=0 cleanup=1\n");
++}
++
++static void
++broken_case(struct io_snapshot base)
++{
++  int p[2];
++  struct io_snapshot observed, after;
++
++  if (pipe(p) < 0)
++    fail("broken-setup");
++  close(p[0]);
++  observed = snapshot(p[1], 0);
++  if (observed.occupancy != 0 || observed.readopen != 0 || observed.writeopen != 1)
++    fail("broken-state");
++  if (write(p[1], "B", 1) != -1)
++    fail("broken");
++  close(p[1]);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("BROKEN", after);
++  printf("IO BROKEN occupancy=0 write=-1 cleanup=1\n");
++}
++
++static void
++killed_reader(struct io_snapshot base)
++{
++  int p[2], ready[2], child;
++  char byte;
++  struct io_snapshot observed, after;
++
++  if (pipe(p) < 0 || pipe(ready) < 0 || (child = fork()) < 0)
++    fail("kill-read-setup");
++  if (child == 0) {
++    close(p[1]);
++    close(ready[0]);
++    if (write(ready[1], "R", 1) != 1)
++      exit(40);
++    close(ready[1]);
++    read(p[0], &byte, 1);
++    exit(41);
++  }
++  close(p[0]);
++  close(ready[1]);
++  if (read(ready[0], &byte, 1) != 1)
++    fail("kill-read-ready");
++  close(ready[0]);
++  observed = wait_for_pipe(p[1], child, IO_CHAN_READ, 0);
++  if (kill(child) < 0)
++    fail("kill-read");
++  wait_status(child, -1);
++  close(p[1]);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("KILL_READ", after);
++  printf("IO KILL_READ child=%d state=%d chan=%d result=-1 cleanup=1\n",
++         child, observed.target_state, observed.target_chan);
++}
++
++static void
++killed_writer(struct io_snapshot base)
++{
++  int p[2], child;
++  char buf[512], byte;
++  struct io_snapshot observed, after;
++
++  memset(buf, 'w', sizeof(buf));
++  if (pipe(p) < 0 || write(p[1], buf, sizeof(buf)) != sizeof(buf) ||
++      (child = fork()) < 0)
++    fail("kill-write-setup");
++  if (child == 0) {
++    close(p[0]);
++    write(p[1], "W", 1);
++    exit(42);
++  }
++  close(p[1]);
++  observed = wait_for_pipe(p[0], child, IO_CHAN_WRITE, 512);
++  if (kill(child) < 0)
++    fail("kill-write");
++  wait_status(child, -1);
++  read_all(p[0], buf, sizeof(buf));
++  if (read(p[0], &byte, 1) != 0)
++    fail("kill-write-eof");
++  close(p[0]);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("KILL_WRITE", after);
++  printf("IO KILL_WRITE child=%d state=%d chan=%d committed=512 result=-1 cleanup=1\n",
++         child, observed.target_state, observed.target_chan);
++}
++
++static void
++fd_rollback(struct io_snapshot base)
++{
++  int fds[NOFILE], n = 0, p[2];
++  struct io_snapshot before, after;
++
++  while (snapshot(-1, 0).fd_slots < NOFILE) {
++    fds[n] = dup(0);
++    if (fds[n] < 0)
++      fail("fd-fill");
++    n++;
++  }
++  before = snapshot(-1, 0);
++  if (pipe(p) != -1)
++    fail("fd-rollback");
++  after = snapshot(-1, 0);
++  same_ledger(before, after);
++  for (int i = 0; i < n; i++)
++    close(fds[i]);
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("FD_ROLLBACK", after);
++  printf("IO FD_ROLLBACK filled=%d pipe=-1 cleanup=1\n", n);
++}
++
++static void
++device_case(struct io_snapshot base)
++{
++  int fd, n;
++  char buf[16];
++  struct io_snapshot after;
++
++  fd = open("README", O_RDONLY);
++  if (fd < 0)
++    fail("device-open");
++  n = read(fd, buf, sizeof(buf));
++  close(fd);
++  if (n != sizeof(buf) || memcmp(buf, "xv6 is a re-imple", 16) != 0)
++    fail("device-read");
++  after = snapshot(-1, 0);
++  same_ledger(base, after);
++  print_after("DEVICE", after);
++  printf("IO DEVICE read=16 cleanup=1\n");
++}
++
++int
++main(void)
++{
++  struct io_snapshot base = snapshot(-1, 0);
++  printf("IO BASE fd=%d files=%d refs=%d pipes=%d procs=%d free=%d\n",
++         base.fd_slots, base.active_files, base.file_refs, base.active_pipes,
++         base.used_procs, base.free_pages);
++  print_after("BASE", base);
++  pipeline(base);
++  empty_wakeup(base);
++  full_wakeup(base);
++  eof_case(base);
++  broken_case(base);
++  killed_reader(base);
++  killed_writer(base);
++  fd_rollback(base);
++  device_case(base);
++  print_after("PASS", snapshot(-1, 0));
++  printf("IO PASS cleanup=1\n");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921..78188d0 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ int getpid(void);
+ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
++int iosnapshot(int, int, void *);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..fabf6c4 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("iosnapshot");

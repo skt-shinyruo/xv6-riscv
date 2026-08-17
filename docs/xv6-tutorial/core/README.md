@@ -27,7 +27,7 @@
 
 ## 通信与设备 I/O
 
-- 文件描述符、管道、控制台与设备 (`core.communication-and-io`) - `planned`
+- [文件描述符、管道、控制台与设备](communication-and-io.md) - `verified`
 
 ## 文件系统与持久化
 

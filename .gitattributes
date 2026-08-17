@@ -1,0 +1,2 @@
+# This nested fixture diff is validated with git apply --whitespace=error-all.
+docs/xv6-tutorial/resources/communication-and-io/communication.patch -whitespace
