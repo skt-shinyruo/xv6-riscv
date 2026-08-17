@@ -1,0 +1,1367 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..d51bd45 100644
+--- a/Makefile
++++ b/Makefile
+@@ -10,0 +11 @@ OBJS = \
++  $K/cowaudit.o \
+@@ -147,0 +149 @@ UPROGS=\
++	$U/_cowtrace\
+diff --git a/kernel/cowaudit.c b/kernel/cowaudit.c
+new file mode 100644
+index 0000000..378adfe
+--- /dev/null
++++ b/kernel/cowaudit.c
+@@ -0,0 +1,212 @@
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "cowaudit.h"
++
++extern struct proc proc[NPROC];
++
++// The learner supplies this narrow audit adapter. Its implementation may wrap
++// any COW bit and ownership structure chosen by the private candidate.
++extern uint cowproject_ref(uint64);
++extern uint cowproject_active(void);
++extern uint cowproject_total(void);
++extern uint cowproject_errors(void);
++extern int cowproject_free_pages(void);
++extern int cowproject_is_cow(pte_t);
++
++static struct {
++  struct spinlock lock;
++  int active;
++  struct cowaudit_record record;
++} audit;
++
++void
++cowauditinit(void)
++{
++  initlock(&audit.lock, "cowaudit");
++}
++
++static int
++copy_record(uint64 out)
++{
++  struct proc *p = myproc();
++  struct cowaudit_record record;
++
++  acquire(&audit.lock);
++  record = audit.record;
++  audit.active = 0;
++  audit.record.mode = COWAUDIT_MODE_NONE;
++  release(&audit.lock);
++  return copyout(p->pagetable, out, (char *)&record, sizeof(record));
++}
++
++static int
++snapshot_process(int pid, uint64 out)
++{
++  struct proc *caller = myproc();
++  struct cowaudit_snapshot snapshot;
++  struct proc *target = 0;
++  pte_t pte_value = 0;
++  pte_t *pte;
++  uint ref_again, active_again, total_again, errors_again;
++  int cow_again, free_again;
++
++  if (copyin(caller->pagetable, (char *)&snapshot, out, sizeof(snapshot)) < 0)
++    return -1;
++  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->pid == pid && p->state != UNUSED) {
++      target = p;
++      break;
++    }
++    release(&p->lock);
++  }
++  if (target == 0)
++    return -1;
++  snapshot.pid = target->pid;
++  snapshot.state = target->state;
++  snapshot.sz = target->sz;
++  snapshot.va = PGROUNDDOWN(snapshot.va);
++  snapshot.pa = 0;
++  snapshot.flags = 0;
++  snapshot.cow = 0;
++  snapshot.ref = 0;
++  pte = walk(target->pagetable, snapshot.va, 0);
++  if (pte != 0 && (*pte & PTE_V) != 0) {
++    pte_value = *pte;
++    snapshot.pa = PTE2PA(pte_value);
++    snapshot.flags = PTE_FLAGS(pte_value);
++    snapshot.cow = cowproject_is_cow(pte_value);
++    snapshot.ref = cowproject_ref(snapshot.pa);
++  }
++  release(&target->lock);
++  snapshot.free_pages = cowproject_free_pages();
++  snapshot.active_pages = cowproject_active();
++  snapshot.ref_total = cowproject_total();
++  snapshot.ref_errors = cowproject_errors();
++  cow_again = snapshot.pa == 0 ? 0 : cowproject_is_cow(pte_value);
++  ref_again = snapshot.pa == 0 ? 0 : cowproject_ref(snapshot.pa);
++  free_again = cowproject_free_pages();
++  active_again = cowproject_active();
++  total_again = cowproject_total();
++  errors_again = cowproject_errors();
++  if (cow_again != snapshot.cow || ref_again != snapshot.ref ||
++      free_again != snapshot.free_pages || active_again != snapshot.active_pages ||
++      total_again != snapshot.ref_total || errors_again != snapshot.ref_errors)
++    return -1;
++  return copyout(caller->pagetable, out, (char *)&snapshot, sizeof(snapshot));
++}
++
++int
++cowaudit_command(int op, uint64 arg, uint64 out)
++{
++  struct proc *p = myproc();
++  struct cowaudit_record requested;
++
++  if (op == COWAUDIT_RESET) {
++    acquire(&audit.lock);
++    memset(&audit.record, 0, sizeof(audit.record));
++    audit.active = 0;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == COWAUDIT_FREE)
++    return cowproject_free_pages();
++  if (op == COWAUDIT_SNAPSHOT)
++    return snapshot_process((int)arg, out);
++  if (op == COWAUDIT_FETCH)
++    return copy_record(out);
++  if (op == COWAUDIT_ARM_FAIL) {
++    if ((arg >> 32) == 0)
++      return -1;
++    acquire(&audit.lock);
++    memset(&audit.record, 0, sizeof(audit.record));
++    audit.record.generation = arg >> 32;
++    audit.record.mode = COWAUDIT_MODE_FAIL;
++    audit.record.target1 = p->pid;
++    audit.record.fail_at = arg & 0xffffffff;
++    audit.active = 1;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == COWAUDIT_ARM_PAIR) {
++    if (copyin(p->pagetable, (char *)&requested, out, sizeof(requested)) < 0)
++      return -1;
++    if (requested.generation <= 0)
++      return -1;
++    acquire(&audit.lock);
++    memset(&audit.record, 0, sizeof(audit.record));
++    audit.record.generation = requested.generation;
++    audit.record.mode = COWAUDIT_MODE_PAIR;
++    audit.record.target1 = arg >> 32;
++    audit.record.target2 = arg & 0xffffffff;
++    audit.record.hart1 = -1;
++    audit.record.hart2 = -1;
++    audit.active = 1;
++    release(&audit.lock);
++    return 0;
++  }
++  return -1;
++}
++
++int
++cowaudit_kalloc_gate(void)
++{
++  struct proc *p;
++  int bit;
++
++  p = myproc();
++  if (p == 0)
++    return 0;
++  acquire(&audit.lock);
++  if (!audit.active || audit.record.generation <= 0 ||
++      (p->pid != audit.record.target1 && p->pid != audit.record.target2)) {
++    release(&audit.lock);
++    return 0;
++  }
++  if (audit.record.mode == COWAUDIT_MODE_FAIL) {
++    if (audit.record.fired) {
++      release(&audit.lock);
++      return 0;
++    }
++    audit.record.eligible++;
++    if (audit.record.fail_at != 0 &&
++        audit.record.eligible == audit.record.fail_at) {
++      audit.record.fired = 1;
++      release(&audit.lock);
++      return 1;
++    }
++    release(&audit.lock);
++    return 0;
++  }
++  if (audit.record.mode != COWAUDIT_MODE_PAIR || audit.record.gate_open) {
++    release(&audit.lock);
++    return 0;
++  }
++  bit = p->pid == audit.record.target1 ? 1 : 2;
++  if ((audit.record.arrived & bit) == 0) {
++    audit.record.arrived |= bit;
++    audit.record.eligible++;
++    if (bit == 1)
++      audit.record.hart1 = cpuid();
++    else
++      audit.record.hart2 = cpuid();
++  }
++  if (audit.record.arrived == 3)
++    audit.record.gate_open = 1;
++  release(&audit.lock);
++
++  while (1) {
++    int open;
++    acquire(&audit.lock);
++    open = audit.record.gate_open;
++    release(&audit.lock);
++    if (open)
++      break;
++  }
++  return 0;
++}
+diff --git a/kernel/cowaudit.h b/kernel/cowaudit.h
+new file mode 100644
+index 0000000..2a732e0
+--- /dev/null
++++ b/kernel/cowaudit.h
+@@ -0,0 +1,39 @@
++#define COWAUDIT_RESET      1
++#define COWAUDIT_SNAPSHOT   2
++#define COWAUDIT_ARM_FAIL   3
++#define COWAUDIT_ARM_PAIR   4
++#define COWAUDIT_FETCH      5
++#define COWAUDIT_FREE       6
++
++#define COWAUDIT_MODE_NONE  0
++#define COWAUDIT_MODE_FAIL  1
++#define COWAUDIT_MODE_PAIR  2
++
++struct cowaudit_snapshot {
++  int pid;
++  int state;
++  int flags;
++  int cow;
++  int ref;
++  int free_pages;
++  int active_pages;
++  int ref_total;
++  int ref_errors;
++  uint64 va;
++  uint64 pa;
++  uint64 sz;
++};
++
++struct cowaudit_record {
++  int generation;
++  int mode;
++  int target1;
++  int target2;
++  int eligible;
++  int fail_at;
++  int fired;
++  int arrived;
++  int gate_open;
++  int hart1;
++  int hart2;
++};
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index f82d1d5..53eedbe 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -11,0 +12 @@
++extern int cowaudit_kalloc_gate(void);
+@@ -98,0 +100,2 @@ kalloc(void)
++  if (cowaudit_kalloc_gate())
++    return 0;
+diff --git a/kernel/main.c b/kernel/main.c
+index 69e9eb3..822e043 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -6,0 +7 @@
++extern void cowauditinit(void);
+@@ -22,0 +24 @@ main()
++    cowauditinit();     // tutorial-only COW evidence fixture
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..affe019 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,0 +105 @@ extern uint64 sys_close(void);
++extern uint64 sys_cowaudit(void);
+@@ -130,0 +132 @@ static uint64 (*syscalls[])(void) = {
++  [SYS_cowaudit] sys_cowaudit,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..8bc1e87 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,0 +23 @@
++#define SYS_cowaudit 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..0e3d4ab 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -9,0 +10 @@
++extern int cowaudit_command(int, uint64, uint64);
+@@ -109,0 +111,12 @@ sys_uptime(void)
++uint64
++sys_cowaudit(void)
++{
++  int op;
++  uint64 arg;
++  uint64 out;
++
++  argint(0, &op);
++  argaddr(1, &arg);
++  argaddr(2, &out);
++  return cowaudit_command(op, arg, out);
++}
+diff --git a/user/cowtrace.c b/user/cowtrace.c
+new file mode 100644
+index 0000000..f988ebf
+--- /dev/null
++++ b/user/cowtrace.c
+@@ -0,0 +1,1028 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/riscv.h"
++#include "kernel/cowaudit.h"
++#include "user/user.h"
++
++#define LEAF_MASK (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U)
++
++static char exec_bigarg[3001];
++
++static void
++fail(const char *why)
++{
++  printf("COW FAIL %s\n", why);
++  exit(1);
++}
++
++static void
++must_pipe(int fd[2])
++{
++  if (pipe(fd) < 0)
++    fail("pipe");
++}
++
++static void
++put_byte(int fd, int value)
++{
++  uchar byte = value;
++  if (write(fd, &byte, 1) != 1)
++    fail("write-byte");
++}
++
++static int
++get_byte(int fd)
++{
++  uchar byte;
++  if (read(fd, &byte, 1) != 1)
++    fail("read-byte");
++  return byte;
++}
++
++static void
++close_pair(int fd[2])
++{
++  close(fd[0]);
++  close(fd[1]);
++}
++
++static void
++wait_for(int pid, int expected)
++{
++  int status = 0x7777;
++  if (wait(&status) != pid || status != expected)
++    fail("wait-status");
++}
++
++static struct cowaudit_snapshot
++snapshot(int pid, uint64 va)
++{
++  struct cowaudit_snapshot result;
++  memset(&result, 0, sizeof(result));
++  result.va = va;
++  if (cowaudit(COWAUDIT_SNAPSHOT, pid, &result) < 0)
++    fail("snapshot");
++  return result;
++}
++
++static struct cowaudit_record
++fetch_record(void)
++{
++  struct cowaudit_record result;
++  memset(&result, 0, sizeof(result));
++  if (cowaudit(COWAUDIT_FETCH, 0, &result) < 0)
++    fail("fetch-record");
++  return result;
++}
++
++static struct cowaudit_snapshot
++ledger_snapshot(void)
++{
++  return snapshot(getpid(), 0);
++}
++
++static void
++arm_fail(int generation, int fail_at)
++{
++  uint64 arg = ((uint64)generation << 32) | (uint)fail_at;
++  if (cowaudit(COWAUDIT_ARM_FAIL, arg, 0) < 0)
++    fail("arm-fail");
++}
++
++static char *
++alloc_pages(int pages, int lazy, int *amount)
++{
++  uint64 top = (uint64)sbrk(0);
++  int pad = (PGSIZE - (top % PGSIZE)) % PGSIZE;
++  char *result;
++
++  if (pad != 0 && sbrk(pad) == SBRK_ERROR)
++    fail("align-sbrk");
++  result = lazy ? sbrklazy(pages * PGSIZE) : sbrk(pages * PGSIZE);
++  if (result == SBRK_ERROR)
++    fail("alloc-pages");
++  *amount = pad + pages * PGSIZE;
++  return result;
++}
++
++static void
++release_pages(int amount)
++{
++  if (sbrk(-amount) == SBRK_ERROR)
++    fail("release-pages");
++}
++
++static void
++require_cow(struct cowaudit_snapshot *s, int ref)
++{
++  if (s->pa == 0 || s->ref != ref || s->cow != 1 ||
++      (s->flags & LEAF_MASK) != (PTE_V | PTE_R | PTE_U))
++    fail("cow-snapshot");
++}
++
++static void
++require_private(struct cowaudit_snapshot *s, int ref)
++{
++  if (s->pa == 0 || s->ref != ref || s->cow != 0 ||
++      (s->flags & (PTE_V | PTE_R | PTE_W | PTE_U)) !=
++          (PTE_V | PTE_R | PTE_W | PTE_U))
++    fail("private-snapshot");
++}
++
++static void
++case_share_and_fast(void)
++{
++  int ready[2], go[2], result[2], amount, pid, base;
++  int parent_value;
++  char *p;
++  struct cowaudit_snapshot before_parent, before_child, after_parent, after_child;
++  struct cowaudit_record parent_record;
++  struct {
++    int value;
++    struct cowaudit_record record;
++    struct cowaudit_snapshot snapshot;
++  } child_result;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  p[0] = 0x11;
++  must_pipe(ready);
++  must_pipe(go);
++  must_pipe(result);
++  pid = fork();
++  if (pid < 0)
++    fail("share-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    arm_fail(1, 0);
++    p[0] = 0x33;
++    child_result.record = fetch_record();
++    child_result.value = p[0];
++    child_result.snapshot = snapshot(getpid(), (uint64)p);
++    require_private(&child_result.snapshot, 1);
++    if (child_result.snapshot.pa == 0)
++      exit(2);
++    if (write(result[1], &child_result, sizeof(child_result)) !=
++        sizeof(child_result))
++      exit(2);
++    exit(0);
++  }
++  get_byte(ready[0]);
++  before_parent = snapshot(getpid(), (uint64)p);
++  before_child = snapshot(pid, (uint64)p);
++  require_cow(&before_parent, 2);
++  require_cow(&before_child, 2);
++  if (before_parent.pa != before_child.pa)
++    fail("share-pa");
++  arm_fail(1, 0);
++  p[0] = 0x22;
++  parent_record = fetch_record();
++  after_parent = snapshot(getpid(), (uint64)p);
++  after_child = snapshot(pid, (uint64)p);
++  require_private(&after_parent, 1);
++  require_cow(&after_child, 1);
++  if (after_parent.pa == after_child.pa || p[0] != 0x22 ||
++      parent_record.eligible != 1)
++    fail("share-parent-split");
++  put_byte(go[1], 1);
++  if (read(result[0], &child_result, sizeof(child_result)) !=
++      sizeof(child_result))
++    fail("share-result");
++  wait_for(pid, 0);
++  if (child_result.value != 0x33 || child_result.record.eligible != 0 ||
++      child_result.record.fired != 0)
++    fail("share-fast-path");
++  parent_value = p[0];
++  close_pair(ready);
++  close_pair(go);
++  close_pair(result);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("share-ledger");
++  printf("COW SHARE pa=0x%lx parent_new=0x%lx child_old=0x%lx "
++         "before_flags=0x%x/0x%x before_refs=%d/%d before_cows=%d/%d "
++         "after_flags=0x%x/0x%x after_refs=%d/%d after_cows=%d/%d "
++         "fast_flags=0x%x fast_ref=%d fast_cow=%d "
++         "parent_alloc=%d child_alloc=%d values=%d/%d\n",
++         before_parent.pa, after_parent.pa, after_child.pa,
++         before_parent.flags, before_child.flags, before_parent.ref,
++         before_child.ref, before_parent.cow, before_child.cow,
++         after_parent.flags, after_child.flags, after_parent.ref,
++         after_child.ref, after_parent.cow, after_child.cow,
++         child_result.snapshot.flags, child_result.snapshot.ref,
++         child_result.snapshot.cow, parent_record.eligible,
++         child_result.record.eligible, parent_value, child_result.value);
++}
++
++static void
++case_multigeneration(void)
++{
++  int ready[2], grand_go[2], child_go[2], finish[2], result[2];
++  int amount, pid, first, second, grand, base;
++  int first_result[2], second_result[2];
++  char *p;
++  struct cowaudit_snapshot before_root, before_child, before_grand;
++  struct cowaudit_snapshot after_root;
++  struct {
++    int pid;
++    int value;
++    struct cowaudit_snapshot snapshot;
++  } writer, observer;
++  int before_root_value, before_child_value, before_grand_value;
++  int after_root_value;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  p[0] = 0x21;
++  must_pipe(ready);
++  must_pipe(grand_go);
++  must_pipe(child_go);
++  must_pipe(finish);
++  must_pipe(result);
++  pid = fork();
++  if (pid < 0)
++    fail("multi-fork1");
++  if (pid == 0) {
++    int grand = fork();
++    if (grand < 0)
++      exit(2);
++    if (grand == 0) {
++      int observed[2] = {getpid(), (uchar)p[0]};
++      if (write(ready[1], observed, sizeof(observed)) != sizeof(observed))
++        exit(3);
++      get_byte(grand_go[0]);
++      p[0] = 0x2a;
++      writer.pid = getpid();
++      writer.value = (uchar)p[0];
++      writer.snapshot = snapshot(getpid(), (uint64)p);
++      if (write(result[1], &writer, sizeof(writer)) != sizeof(writer))
++        exit(4);
++      get_byte(finish[0]);
++      exit(0);
++    }
++    {
++      int observed[2] = {getpid(), (uchar)p[0]};
++      int status;
++      if (write(ready[1], observed, sizeof(observed)) != sizeof(observed))
++        exit(5);
++      get_byte(child_go[0]);
++      observer.pid = getpid();
++      observer.value = (uchar)p[0];
++      observer.snapshot = snapshot(getpid(), (uint64)p);
++      if (write(result[1], &observer, sizeof(observer)) != sizeof(observer))
++        exit(6);
++      get_byte(finish[0]);
++      if (wait(&status) != grand || status != 0)
++        exit(7);
++      exit(0);
++    }
++  }
++  if (read(ready[0], first_result, sizeof(first_result)) != sizeof(first_result) ||
++      read(ready[0], second_result, sizeof(second_result)) != sizeof(second_result))
++    fail("multi-ready");
++  first = first_result[0];
++  second = second_result[0];
++  if (first != pid && second != pid)
++    fail("multi-child-pid");
++  grand = first == pid ? second : first;
++  before_root = snapshot(getpid(), (uint64)p);
++  before_child = snapshot(pid, (uint64)p);
++  before_grand = snapshot(grand, (uint64)p);
++  require_cow(&before_root, 3);
++  require_cow(&before_child, 3);
++  require_cow(&before_grand, 3);
++  if (before_root.pa != before_child.pa || before_root.pa != before_grand.pa)
++    fail("multi-pa");
++  before_root_value = (uchar)p[0];
++  before_child_value = first == pid ? first_result[1] : second_result[1];
++  before_grand_value = first == pid ? second_result[1] : first_result[1];
++  put_byte(grand_go[1], 1);
++  if (read(result[0], &writer, sizeof(writer)) != sizeof(writer) ||
++      writer.pid != grand)
++    fail("multi-writer");
++  put_byte(child_go[1], 1);
++  if (read(result[0], &observer, sizeof(observer)) != sizeof(observer) ||
++      observer.pid != pid)
++    fail("multi-observer");
++  after_root = snapshot(getpid(), (uint64)p);
++  require_cow(&after_root, 2);
++  require_cow(&observer.snapshot, 2);
++  require_private(&writer.snapshot, 1);
++  if (after_root.pa != observer.snapshot.pa ||
++      after_root.pa != before_root.pa || after_root.pa == writer.snapshot.pa ||
++      p[0] != 0x21 || observer.value != 0x21 || writer.value != 0x2a)
++    fail("multi-write-isolation");
++  after_root_value = (uchar)p[0];
++  put_byte(finish[1], 1);
++  put_byte(finish[1], 1);
++  wait_for(pid, 0);
++  close_pair(ready);
++  close_pair(grand_go);
++  close_pair(child_go);
++  close_pair(finish);
++  close_pair(result);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("multi-ledger");
++  printf("COW MULTI root=%d child=%d grandchild=%d shared_pa=0x%lx "
++         "before_flags=0x%x/0x%x/0x%x before_refs=%d/%d/%d "
++         "before_cows=%d/%d/%d after_pa=0x%lx/0x%lx/0x%lx "
++         "after_flags=0x%x/0x%x/0x%x after_refs=%d/%d/%d "
++         "after_cows=%d/%d/%d before_values=%d/%d/%d "
++         "after_values=%d/%d/%d\n",
++         getpid(), pid, grand, before_root.pa, before_root.flags,
++         before_child.flags, before_grand.flags, before_root.ref,
++         before_child.ref, before_grand.ref, before_root.cow, before_child.cow,
++         before_grand.cow, after_root.pa, observer.snapshot.pa,
++         writer.snapshot.pa, after_root.flags, observer.snapshot.flags,
++         writer.snapshot.flags, after_root.ref, observer.snapshot.ref,
++         writer.snapshot.ref, after_root.cow, observer.snapshot.cow,
++         writer.snapshot.cow, before_root_value, before_child_value,
++         before_grand_value, after_root_value, observer.value, writer.value);
++}
++
++static void
++case_lazy_hole(void)
++{
++  int ready[2], go[2], done[2], finish[2], amount, pid, base;
++  char *p;
++  struct cowaudit_snapshot root_before, child_before, root_after, child_after;
++  int parent_value, child_value;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 1, &amount);
++  must_pipe(ready);
++  must_pipe(go);
++  must_pipe(done);
++  must_pipe(finish);
++  pid = fork();
++  if (pid < 0)
++    fail("lazy-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    if (p[0] != 0)
++      exit(2);
++    p[0] = 0x55;
++    put_byte(done[1], p[0]);
++    get_byte(finish[0]);
++    exit(0);
++  }
++  get_byte(ready[0]);
++  root_before = snapshot(getpid(), (uint64)p);
++  child_before = snapshot(pid, (uint64)p);
++  if (root_before.pa != 0 || child_before.pa != 0)
++    fail("lazy-not-hole");
++  put_byte(go[1], 1);
++  child_value = get_byte(done[0]);
++  child_after = snapshot(pid, (uint64)p);
++  root_before = snapshot(getpid(), (uint64)p);
++  require_private(&child_after, 1);
++  if (root_before.pa != 0 || p[0] != 0)
++    fail("lazy-parent-zero");
++  p[0] = 0x66;
++  parent_value = p[0];
++  root_after = snapshot(getpid(), (uint64)p);
++  require_private(&root_after, 1);
++  if (root_after.pa == child_after.pa)
++    fail("lazy-independent");
++  put_byte(finish[1], 1);
++  wait_for(pid, 0);
++  close_pair(ready);
++  close_pair(go);
++  close_pair(done);
++  close_pair(finish);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("lazy-ledger");
++  printf("COW LAZY before=0/0 before_flags=0x%x/0x%x "
++         "parent_pa=0x%lx child_pa=0x%lx after_flags=0x%x/0x%x "
++         "after_refs=%d/%d after_cows=%d/%d values=%d/%d\n",
++         root_before.flags, child_before.flags, root_after.pa, child_after.pa,
++         root_after.flags, child_after.flags, root_after.ref, child_after.ref,
++         root_after.cow, child_after.cow, parent_value, child_value);
++}
++
++static void
++case_copyout(void)
++{
++  int ready[2], go[2], data[2], done[2], finish[2], result[2];
++  int amount, pid, base, parent_value;
++  char *p;
++  uchar pattern[4] = {0x61, 0x62, 0x63, 0x64};
++  uchar observed[4];
++  struct cowaudit_snapshot parent, child;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  memset(p, 0x44, 4);
++  must_pipe(ready);
++  must_pipe(go);
++  must_pipe(data);
++  must_pipe(done);
++  must_pipe(finish);
++  must_pipe(result);
++  pid = fork();
++  if (pid < 0)
++    fail("copyout-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    if (read(data[0], p, 4) != 4 || write(result[1], p, 4) != 4)
++      exit(2);
++    put_byte(done[1], 1);
++    get_byte(finish[0]);
++    exit(0);
++  }
++  get_byte(ready[0]);
++  if (write(data[1], pattern, 4) != 4)
++    fail("copyout-data");
++  put_byte(go[1], 1);
++  get_byte(done[0]);
++  if (read(result[0], observed, 4) != 4)
++    fail("copyout-result");
++  parent = snapshot(getpid(), (uint64)p);
++  child = snapshot(pid, (uint64)p);
++  require_cow(&parent, 1);
++  require_private(&child, 1);
++  if (parent.pa == child.pa || memcmp(observed, pattern, 4) != 0 ||
++      p[0] != 0x44)
++    fail("copyout-isolation");
++  parent_value = (uchar)p[0];
++  put_byte(finish[1], 1);
++  wait_for(pid, 0);
++  close_pair(ready);
++  close_pair(go);
++  close_pair(data);
++  close_pair(done);
++  close_pair(finish);
++  close_pair(result);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("copyout-ledger");
++  printf("COW COPYOUT parent_pa=0x%lx child_pa=0x%lx "
++         "flags=0x%x/0x%x refs=%d/%d cows=%d/%d "
++         "parent=%d child=%d/%d/%d/%d\n",
++         parent.pa, child.pa, parent.flags, child.flags, parent.ref, child.ref,
++         parent.cow, child.cow, parent_value, observed[0], observed[1],
++         observed[2], observed[3]);
++}
++
++static void
++case_copyout_partial_oom(void)
++{
++  int ready[2], go[2], data[2], done[2], finish[2], result[2];
++  int amount, pid, base;
++  char *p;
++  uchar pattern[32];
++  struct cowaudit_record record;
++  struct cowaudit_snapshot parent1, parent2, child1, child2;
++  int first, second, child_first, child_second, parent_first, parent_second;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(2, 0, &amount);
++  memset(p, 0x41, 2 * PGSIZE);
++  for (int i = 0; i < 32; i++)
++    pattern[i] = 0x20 + i;
++  must_pipe(ready);
++  must_pipe(go);
++  must_pipe(data);
++  must_pipe(done);
++  must_pipe(finish);
++  must_pipe(result);
++  pid = fork();
++  if (pid < 0)
++    fail("partial-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    arm_fail(5, 2);
++    first = read(data[0], p + PGSIZE - 16, 32);
++    record = fetch_record();
++    second = read(data[0], p + PGSIZE, 16);
++    child_first = p[PGSIZE - 16];
++    child_second = p[PGSIZE];
++    if (first != 16 || second != 16 ||
++        memcmp(p + PGSIZE - 16, pattern, 32) != 0)
++      exit(2);
++    if (write(result[1], &record, sizeof(record)) != sizeof(record) ||
++        write(result[1], &first, sizeof(first)) != sizeof(first) ||
++        write(result[1], &second, sizeof(second)) != sizeof(second) ||
++        write(result[1], &child_first, sizeof(child_first)) != sizeof(child_first) ||
++        write(result[1], &child_second, sizeof(child_second)) != sizeof(child_second))
++      exit(3);
++    put_byte(done[1], 1);
++    get_byte(finish[0]);
++    exit(0);
++  }
++  get_byte(ready[0]);
++  if (write(data[1], pattern, sizeof(pattern)) != sizeof(pattern))
++    fail("partial-data");
++  put_byte(go[1], 1);
++  get_byte(done[0]);
++  if (read(result[0], &record, sizeof(record)) != sizeof(record) ||
++      read(result[0], &first, sizeof(first)) != sizeof(first) ||
++      read(result[0], &second, sizeof(second)) != sizeof(second) ||
++      read(result[0], &child_first, sizeof(child_first)) != sizeof(child_first) ||
++      read(result[0], &child_second, sizeof(child_second)) != sizeof(child_second))
++    fail("partial-record");
++  parent1 = snapshot(getpid(), (uint64)(p + PGSIZE - 16));
++  parent2 = snapshot(getpid(), (uint64)(p + PGSIZE));
++  child1 = snapshot(pid, (uint64)(p + PGSIZE - 16));
++  child2 = snapshot(pid, (uint64)(p + PGSIZE));
++  require_cow(&parent1, 1);
++  require_cow(&parent2, 1);
++  require_private(&child1, 1);
++  require_private(&child2, 1);
++  if (parent1.pa == child1.pa || parent2.pa == child2.pa ||
++      record.generation != 5 ||
++      record.eligible != 2 || record.fail_at != 2 || record.fired != 1 ||
++      p[PGSIZE - 16] != 0x41 || p[PGSIZE] != 0x41)
++    fail("partial-oracle");
++  parent_first = (uchar)p[PGSIZE - 16];
++  parent_second = (uchar)p[PGSIZE];
++  put_byte(finish[1], 1);
++  wait_for(pid, 0);
++  close_pair(ready);
++  close_pair(go);
++  close_pair(data);
++  close_pair(done);
++  close_pair(finish);
++  close_pair(result);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("partial-ledger");
++  printf("COW PARTIAL generation=%d eligible=%d first=%d retry=%d "
++         "fail_at=%d fired=%d "
++         "parent=0x%lx/0x%lx child=0x%lx/0x%lx "
++         "parent_flags=0x%x/0x%x child_flags=0x%x/0x%x "
++         "parent_refs=%d/%d child_refs=%d/%d "
++         "parent_cows=%d/%d child_cows=%d/%d parent_values=%d/%d "
++         "child_values=%d/%d\n",
++         record.generation, record.eligible, first, second, record.fail_at,
++         record.fired,
++         parent1.pa, parent2.pa, child1.pa, child2.pa,
++         parent1.flags, parent2.flags, child1.flags, child2.flags,
++         parent1.ref, parent2.ref, child1.ref, child2.ref,
++         parent1.cow, parent2.cow, child1.cow, child2.cow,
++         parent_first, parent_second, child_first, child_second);
++}
++
++static void
++case_store_oom(void)
++{
++  int amount, pid, status, base, fast_value;
++  char *p;
++  struct cowaudit_record failed, fast;
++  struct cowaudit_snapshot parent;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  p[0] = 0x31;
++  pid = fork();
++  if (pid < 0)
++    fail("oom-fork");
++  if (pid == 0) {
++    arm_fail(6, 1);
++    p[0] = 0x32;
++    exit(9);
++  }
++  if (wait(&status) != pid || status != -1)
++    fail("oom-status");
++  failed = fetch_record();
++  parent = snapshot(getpid(), (uint64)p);
++  require_cow(&parent, 1);
++  if (failed.generation != 6 || failed.eligible != 1 || failed.fired != 1 ||
++      p[0] != 0x31)
++    fail("oom-preserve");
++  arm_fail(6, 0);
++  p[0] = 0x33;
++  fast = fetch_record();
++  if (fast.eligible != 0 || p[0] != 0x33)
++    fail("oom-fast");
++  fast_value = (uchar)p[0];
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("oom-ledger");
++  printf("COW OOM generation=%d eligible=%d status=%d fail_at=%d fired=%d "
++         "old_pa=0x%lx "
++         "old_flags=0x%x old_ref=%d old_cow=%d fast_alloc=%d value=%d\n",
++         failed.generation, failed.eligible, status, failed.fail_at,
++         failed.fired, parent.pa, parent.flags,
++         parent.ref, parent.cow, fast.eligible, fast_value);
++}
++
++static void
++case_fork_rollback(void)
++{
++  int ready[2], go[2], amount, holder, failed, setup, after_fork, growth;
++  int low_value, high_value, fast_value;
++  char *low;
++  uint64 top;
++  char *high = (char *)0x200000;
++  struct cowaudit_record record, fast;
++  struct cowaudit_snapshot low_before, low_after, high_after, low_fast;
++
++  low = alloc_pages(1, 0, &amount);
++  low[0] = 0x41;
++  must_pipe(ready);
++  must_pipe(go);
++  holder = fork();
++  if (holder < 0)
++    fail("rollback-holder");
++  if (holder == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    exit(low[0] == 0x41 ? 0 : 2);
++  }
++  get_byte(ready[0]);
++  top = (uint64)sbrk(0);
++  if (top >= (uint64)high)
++    fail("rollback-layout");
++  growth = (uint64)high + PGSIZE - top;
++  if (sbrklazy(growth) == SBRK_ERROR)
++    fail("rollback-grow");
++  high[0] = 0x52;
++  low_before = snapshot(getpid(), (uint64)low);
++  require_cow(&low_before, 2);
++  /* The high lazy mapping may leave empty intermediate tables until exit. */
++  setup = cowaudit(COWAUDIT_FREE, 0, 0);
++  arm_fail(7, 8);
++  failed = fork();
++  record = fetch_record();
++  if (failed != -1 || record.generation != 7 || record.fired != 1 ||
++      record.eligible != 8)
++    fail("rollback-trigger");
++  low_after = snapshot(getpid(), (uint64)low);
++  high_after = snapshot(getpid(), (uint64)high);
++  require_cow(&low_after, 2);
++  require_private(&high_after, 1);
++  if (low_after.pa != low_before.pa || low[0] != 0x41 || high[0] != 0x52)
++    fail("rollback-state");
++  after_fork = cowaudit(COWAUDIT_FREE, 0, 0);
++  if (after_fork != setup)
++    fail("rollback-fork-ledger");
++  low_value = (uchar)low[0];
++  high_value = (uchar)high[0];
++  put_byte(go[1], 1);
++  wait_for(holder, 0);
++  arm_fail(7, 0);
++  low[0] = 0x43;
++  fast = fetch_record();
++  low_fast = snapshot(getpid(), (uint64)low);
++  require_private(&low_fast, 1);
++  if (fast.eligible != 0 || low[0] != 0x43 || low_fast.pa != low_after.pa)
++    fail("rollback-preexisting");
++  fast_value = (uchar)low[0];
++  if (sbrk(-growth) == SBRK_ERROR)
++    fail("rollback-shrink-high");
++  close_pair(ready);
++  close_pair(go);
++  release_pages(amount);
++  printf("COW ROLLBACK generation=%d fork=%d fail_at=%d fired=%d eligible=%d "
++         "preexisting_pa=0x%lx "
++         "preexisting_flags=0x%x preexisting_ref=%d preexisting_cow=%d "
++         "new_parent_flags=0x%x new_parent_ref=%d new_parent_cow=%d "
++         "fast_flags=0x%x fast_ref=%d fast_cow=%d "
++         "fast_alloc=%d setup_free=%d after_fork_free=%d values=%d/%d/%d\n",
++         record.generation, failed, record.fail_at, record.fired,
++         record.eligible,
++         low_after.pa, low_after.flags, low_after.ref, low_after.cow,
++         high_after.flags, high_after.ref, high_after.cow, low_fast.flags,
++         low_fast.ref, low_fast.cow, fast.eligible, setup, after_fork,
++         low_value, high_value, fast_value);
++}
++
++static void
++case_pair(void)
++{
++  int ready[2], go[2], done[2], finish0[2], finish1[2];
++  int amount, pids[2], base;
++  int child_values[2];
++  char *p;
++  struct cowaudit_record request, record;
++  struct cowaudit_snapshot root, one, two;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  p[0] = 0x71;
++  must_pipe(ready);
++  must_pipe(go);
++  must_pipe(done);
++  must_pipe(finish0);
++  must_pipe(finish1);
++  for (int i = 0; i < 2; i++) {
++    pids[i] = fork();
++    if (pids[i] < 0)
++      fail("pair-fork");
++    if (pids[i] == 0) {
++      put_byte(ready[1], 1);
++      get_byte(go[0]);
++      p[0] = 0x72 + i;
++      put_byte(done[1], p[0]);
++      get_byte(i == 0 ? finish0[0] : finish1[0]);
++      exit(0);
++    }
++  }
++  get_byte(ready[0]);
++  get_byte(ready[0]);
++  root = snapshot(getpid(), (uint64)p);
++  one = snapshot(pids[0], (uint64)p);
++  two = snapshot(pids[1], (uint64)p);
++  require_cow(&root, 3);
++  require_cow(&one, 3);
++  require_cow(&two, 3);
++  memset(&request, 0, sizeof(request));
++  request.generation = 8;
++  if (cowaudit(COWAUDIT_ARM_PAIR,
++               ((uint64)(uint)pids[0] << 32) | (uint)pids[1], &request) < 0)
++    fail("pair-arm");
++  put_byte(go[1], 1);
++  put_byte(go[1], 1);
++  child_values[0] = get_byte(done[0]);
++  child_values[1] = get_byte(done[0]);
++  root = snapshot(getpid(), (uint64)p);
++  one = snapshot(pids[0], (uint64)p);
++  two = snapshot(pids[1], (uint64)p);
++  record = fetch_record();
++  require_cow(&root, 1);
++  require_private(&one, 1);
++  require_private(&two, 1);
++  if (root.pa == one.pa || root.pa == two.pa || one.pa == two.pa ||
++      record.generation != 8 || record.arrived != 3 ||
++      record.gate_open != 1 || record.eligible != 2 ||
++      record.hart1 == record.hart2 || record.hart1 < 0 || record.hart2 < 0)
++    fail("pair-oracle");
++  put_byte(finish0[1], 1);
++  wait_for(pids[0], 0);
++  put_byte(finish1[1], 1);
++  wait_for(pids[1], 0);
++  close_pair(ready);
++  close_pair(go);
++  close_pair(done);
++  close_pair(finish0);
++  close_pair(finish1);
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("pair-ledger");
++  printf("COW PAIR generation=%d pids=%d/%d harts=%d/%d "
++         "arrived=%d gate_open=%d "
++         "eligible=%d old=0x%lx "
++         "new=0x%lx/0x%lx flags=0x%x/0x%x/0x%x refs=%d/%d/%d "
++         "cows=%d/%d/%d values=%d/%d\n", record.generation, pids[0],
++         pids[1], record.hart1, record.hart2, record.arrived,
++         record.gate_open, record.eligible,
++         root.pa, one.pa, two.pa, root.flags, one.flags, two.flags, root.ref,
++         one.ref, two.ref, root.cow, one.cow, two.cow, child_values[0],
++         child_values[1]);
++}
++
++static void
++case_boundaries(void)
++{
++  int ready[2], go[2], amount, pid, status, base;
++  int guard_status, text_status, tail_status;
++  char *tail;
++  uint64 sp;
++  uint64 guard;
++  struct cowaudit_snapshot text_parent, text_child, guard_parent, guard_child;
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  asm volatile("mv %0, sp" : "=r"(sp));
++  guard = PGROUNDDOWN(sp) - PGSIZE;
++  must_pipe(ready);
++  must_pipe(go);
++  pid = fork();
++  if (pid < 0)
++    fail("boundary-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    get_byte(go[0]);
++    *(volatile uchar *)guard = 0x7a;
++    exit(2);
++  }
++  get_byte(ready[0]);
++  text_parent = snapshot(getpid(), (uint64)&case_boundaries);
++  text_child = snapshot(pid, (uint64)&case_boundaries);
++  guard_parent = snapshot(getpid(), guard);
++  guard_child = snapshot(pid, guard);
++  if (text_parent.pa == 0 || text_parent.pa != text_child.pa ||
++      text_parent.ref < 2 || text_parent.ref != text_child.ref ||
++      (text_parent.flags & (PTE_R | PTE_X | PTE_U)) !=
++          (PTE_R | PTE_X | PTE_U) ||
++      (text_parent.flags & PTE_W) != 0 || text_parent.cow != 0 ||
++      guard_parent.pa == 0 || guard_child.pa == 0 ||
++      guard_parent.pa == guard_child.pa ||
++      (guard_parent.flags & PTE_U) != 0 || guard_parent.cow != 0 ||
++      (guard_child.flags & PTE_U) != 0 || guard_child.cow != 0)
++    fail("boundary-flags");
++  put_byte(go[1], 1);
++  if (wait(&status) != pid || status != -1)
++    fail("boundary-guard-kill");
++  guard_status = status;
++  close_pair(ready);
++  close_pair(go);
++
++  pid = fork();
++  if (pid < 0)
++    fail("boundary-text-fork");
++  if (pid == 0) {
++    *(volatile uint32 *)(uint64)&case_boundaries = 0;
++    exit(2);
++  }
++  if (wait(&status) != pid || status != -1)
++    fail("boundary-text-kill");
++  text_status = status;
++
++  tail = alloc_pages(1, 0, &amount);
++  tail[0] = 0x11;
++  if (sbrk(-(PGSIZE - 1)) == SBRK_ERROR)
++    fail("tail-shrink");
++  pid = fork();
++  if (pid < 0)
++    fail("tail-fork");
++  if (pid == 0) {
++    tail[PGSIZE - 1] = 0x22;
++    exit(tail[PGSIZE - 1] == 0x22 ? 0 : 2);
++  }
++  if (wait(&status) != pid || status != 0)
++    fail("boundary-tail-status");
++  tail_status = status;
++  if (sbrk(-(amount - (PGSIZE - 1))) == SBRK_ERROR)
++    fail("tail-release");
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("boundary-ledger");
++  printf("COW BOUNDARY text_pa=0x%lx text_flags=0x%x text_ref=%d "
++         "text_cow=%d guard_parent_pa=0x%lx guard_child_pa=0x%lx "
++         "guard_flags=0x%x/0x%x guard_cows=%d/%d "
++         "guard_status=%d text_status=%d tail_status=%d\n",
++         text_parent.pa, text_parent.flags, text_parent.ref, text_parent.cow,
++         guard_parent.pa, guard_child.pa, guard_parent.flags,
++         guard_child.flags, guard_parent.cow, guard_child.cow, guard_status,
++         text_status, tail_status);
++}
++
++static void
++case_teardown(void)
++{
++  int ready[2], done[2], finish[2], bad_pipe[2], amount, pid, base;
++  int shrink_status, exec_status;
++  char *p;
++  struct cowaudit_snapshot parent, child;
++  struct {
++    int result;
++    int value;
++    struct cowaudit_snapshot before;
++    struct cowaudit_snapshot after;
++  } bad;
++  char *argv[] = {"echo", 0};
++  char *bad_argv[] = {"echo", exec_bigarg, exec_bigarg, 0};
++
++  base = cowaudit(COWAUDIT_FREE, 0, 0);
++  p = alloc_pages(1, 0, &amount);
++  p[0] = 0x19;
++  must_pipe(ready);
++  must_pipe(done);
++  must_pipe(finish);
++  pid = fork();
++  if (pid < 0)
++    fail("teardown-fork");
++  if (pid == 0) {
++    put_byte(ready[1], 1);
++    if (sbrk(-PGSIZE) == SBRK_ERROR)
++      exit(2);
++    put_byte(done[1], 1);
++    get_byte(finish[0]);
++    exit(0);
++  }
++  get_byte(ready[0]);
++  get_byte(done[0]);
++  parent = snapshot(getpid(), (uint64)p);
++  child = snapshot(pid, (uint64)p);
++  if (parent.pa == 0 || parent.ref != 1 || child.pa != 0)
++    fail("teardown-shrink");
++  put_byte(finish[1], 1);
++  if (wait(&shrink_status) != pid || shrink_status != 0)
++    fail("teardown-shrink-status");
++  close_pair(ready);
++  close_pair(done);
++  close_pair(finish);
++  must_pipe(bad_pipe);
++  pid = fork();
++  if (pid < 0)
++    fail("teardown-bad-exec-fork");
++  if (pid == 0) {
++    bad.before = snapshot(getpid(), (uint64)p);
++    bad.result = exec("echo", bad_argv);
++    bad.after = snapshot(getpid(), (uint64)p);
++    bad.value = (uchar)p[0];
++    if (write(bad_pipe[1], &bad, sizeof(bad)) != sizeof(bad))
++      exit(4);
++    exit(0);
++  }
++  if (read(bad_pipe[0], &bad, sizeof(bad)) != sizeof(bad))
++    fail("teardown-bad-exec-result");
++  wait_for(pid, 0);
++  close_pair(bad_pipe);
++  if (bad.result != -1 || bad.before.pa == 0 ||
++      bad.before.pa != bad.after.pa || bad.before.flags != bad.after.flags ||
++      bad.before.ref != 2 || bad.after.ref != 2 ||
++      bad.before.cow != 1 || bad.after.cow != 1 || bad.value != 0x19)
++    fail("teardown-bad-exec-preserve");
++  pid = fork();
++  if (pid < 0)
++    fail("teardown-exec-fork");
++  if (pid == 0) {
++    exec("echo", argv);
++    exit(3);
++  }
++  if (wait(&exec_status) != pid || exec_status != 0)
++    fail("teardown-exec-status");
++  parent = snapshot(getpid(), (uint64)p);
++  if (parent.ref != 1 || parent.ref_errors != 0)
++    fail("teardown-exec");
++  release_pages(amount);
++  if (cowaudit(COWAUDIT_FREE, 0, 0) != base)
++    fail("teardown-ledger");
++  printf("COW TEARDOWN shrink_leaf=%d child_pa=0x%lx parent_pa=0x%lx "
++         "parent_flags=0x%x parent_ref=%d parent_cow=%d "
++         "exec_bad=%d bad_before_pa=0x%lx bad_after_pa=0x%lx "
++         "bad_flags=0x%x/0x%x bad_refs=%d/%d bad_cows=%d/%d bad_value=%d "
++         "exec_status=%d errors=%d\n",
++         child.pa != 0, child.pa, parent.pa, parent.flags, parent.ref,
++         parent.cow, bad.result, bad.before.pa, bad.after.pa,
++         bad.before.flags, bad.after.flags, bad.before.ref, bad.after.ref,
++         bad.before.cow, bad.after.cow, bad.value, exec_status,
++         parent.ref_errors);
++}
++
++static int
++run_cases(void)
++{
++  int completed = 0;
++  volatile char warm[256];
++  for (int i = 0; i < (int)sizeof(warm); i++)
++    warm[i] = (char)i;
++  if (warm[sizeof(warm) - 1] == 0x7f)
++    fail("warmup");
++  case_share_and_fast();
++  completed++;
++  case_multigeneration();
++  completed++;
++  case_lazy_hole();
++  completed++;
++  case_copyout();
++  completed++;
++  case_copyout_partial_oom();
++  completed++;
++  case_store_oom();
++  completed++;
++  case_fork_rollback();
++  completed++;
++  case_pair();
++  completed++;
++  case_boundaries();
++  completed++;
++  case_teardown();
++  completed++;
++  if (snapshot(getpid(), 0).ref_errors != 0)
++    fail("ref-errors");
++  return completed;
++}
++
++int
++main(void)
++{
++  int worker, status, base, after, errors;
++  struct cowaudit_snapshot before, after_snapshot;
++
++  if (cowaudit(COWAUDIT_RESET, 0, 0) < 0)
++    fail("reset");
++  memset(exec_bigarg, 'x', sizeof(exec_bigarg) - 1);
++  exec_bigarg[sizeof(exec_bigarg) - 1] = 0;
++  before = ledger_snapshot();
++  base = before.free_pages;
++  worker = fork();
++  if (worker < 0)
++    fail("worker-fork");
++  if (worker == 0) {
++    int cases = run_cases();
++    printf("COW PASS cases=%d\n", cases);
++    exit(0);
++  }
++  if (wait(&status) != worker || status != 0)
++    fail("worker-status");
++  after_snapshot = ledger_snapshot();
++  after = after_snapshot.free_pages;
++  errors = after_snapshot.ref_errors;
++  if (after != base || errors != 0 ||
++      after_snapshot.active_pages != before.active_pages ||
++      after_snapshot.ref_total != before.ref_total)
++    fail("cleanup-ledger");
++  printf("COW CLEAN base=%d after=%d errors=%d "
++         "active_before=%d active_after=%d refs_before=%d refs_after=%d\n",
++         base, after, errors, before.active_pages, after_snapshot.active_pages,
++         before.ref_total, after_snapshot.ref_total);
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921..1f827b1 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -26,0 +27 @@ int uptime(void);
++int cowaudit(int, uint64, void *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..e5540c9 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,0 +45 @@ entry("uptime");
++entry("cowaudit");

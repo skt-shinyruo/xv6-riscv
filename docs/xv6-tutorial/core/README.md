@@ -23,7 +23,7 @@
 - [进程生命周期与回收](process-and-memory.md) - `verified`
 - [调度、同步与等待](scheduling-and-synchronization.md) - `verified`
 - [虚拟内存、映射与 fault](virtual-memory.md) - `verified`
-- 证据项目：Copy-on-Write fork (`project.copy-on-write`) - `planned`
+- [证据项目：Copy-on-Write fork](../experiments/copy-on-write.md) - `verified`
 
 ## 通信与设备 I/O
 
