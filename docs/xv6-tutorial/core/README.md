@@ -33,7 +33,7 @@
 ## 文件系统与持久化
 
 - [文件系统命名、inode 与数据路径](filesystem.md) - `verified`
-- Buffer cache、日志与事务 (`core.persistence`) - `planned`
+- [Buffer cache、日志与事务](persistence.md) - `verified`
 
 ## 证据、失败与综合
 

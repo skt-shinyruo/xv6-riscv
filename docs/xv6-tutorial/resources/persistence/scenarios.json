@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "event_schema_version": 1,
+  "defaults": {
+    "image": "private-copy",
+    "event_budget": 512,
+    "watchdog_seconds": 45,
+    "cleanup": "required"
+  },
+  "point_capabilities": {
+    "CACHE_GET_ENTER": "sleep-ok",
+    "CACHE_SELECTED": "observe-only",
+    "CACHE_LOCKED": "sleep-ok-with-buffer-sleeplock",
+    "CACHE_PARTITION_HELD": "spin-2cpu-ok",
+    "CACHE_RELEASED": "observe-only",
+    "LOG_APPENDED": "sleep-ok",
+    "LOG_ABSORBED": "observe-only",
+    "BEGIN_ADMITTED": "sleep-ok",
+    "BEGIN_WAIT_SPACE": "observe-only",
+    "IO_SUBMIT": "observe-only",
+    "IO_COMPLETE": "observe-only",
+    "HEADER_COMMIT_COMPLETE": "observe-only",
+    "HOME_INSTALL_COMPLETE": "observe-only",
+    "HEADER_CLEAR_COMPLETE": "observe-only"
+  },
+  "cases": [
+    {
+      "id": "transaction-flow",
+      "cpus": 1,
+      "actors": [
+        {
+          "id": "writer",
+          "actions": [
+            "select-stable-home-block",
+            "begin-op",
+            "write-same-home-block-twice",
+            "end-op",
+            "orderly-stop"
+          ]
+        }
+      ],
+      "gates": [],
+      "oracle": "transaction-state-machine",
+      "evidence": ["F", "R"]
+    },
+    {
+      "id": "log-capacity-empty",
+      "cpus": 2,
+      "actors": [
+        {"id": "a", "actions": ["begin-op", "hold", "end-op"]},
+        {"id": "b", "actions": ["begin-op", "hold", "end-op"]},
+        {"id": "c", "actions": ["begin-op", "hold", "end-op"]},
+        {"id": "d", "actions": ["begin-op", "end-op"]}
+      ],
+      "gates": [
+        {
+          "id": "hold-three-admitted",
+          "mode": "hold-until-event",
+          "point": "BEGIN_ADMITTED",
+          "actors": ["a", "b", "c"],
+          "release_after": {"point": "BEGIN_WAIT_SPACE", "actor": "d"}
+        }
+      ],
+      "oracle": "empty-log-admission-bound",
+      "evidence": ["B", "C"]
+    },
+    {
+      "id": "log-capacity-used",
+      "cpus": 2,
+      "actors": [
+        {"id": "a", "actions": ["begin-op", "append-one-block", "hold", "end-op"]},
+        {"id": "b", "actions": ["begin-op", "hold", "end-op"]},
+        {"id": "c", "actions": ["begin-op", "end-op"]}
+      ],
+      "gates": [
+        {
+          "id": "hold-one-log-entry",
+          "mode": "hold-until-event",
+          "point": "LOG_APPENDED",
+          "actors": ["a"],
+          "release_after": {"point": "BEGIN_WAIT_SPACE", "actor": "c"}
+        },
+        {
+          "id": "hold-second-operation",
+          "mode": "hold-until-event",
+          "point": "BEGIN_ADMITTED",
+          "actors": ["b"],
+          "release_after": {"point": "BEGIN_WAIT_SPACE", "actor": "c"}
+        }
+      ],
+      "oracle": "used-log-admission-bound",
+      "evidence": ["B", "C"]
+    },
+    {
+      "id": "cache-same-block",
+      "cpus": 2,
+      "actors": [
+        {"id": "a", "actions": ["read-uncached-target", "hold", "release"]},
+        {"id": "b", "actions": ["read-uncached-target", "release"]}
+      ],
+      "gates": [
+        {
+          "id": "hold-first-buffer",
+          "mode": "hold-until-event",
+          "point": "CACHE_LOCKED",
+          "actors": ["a"],
+          "release_after": {"point": "CACHE_SELECTED", "actor": "b"}
+        }
+      ],
+      "oracle": "one-buffer-per-block",
+      "evidence": ["C"]
+    },
+    {
+      "id": "cache-collision",
+      "cpus": 2,
+      "discovery": "two-distinct-blocks-same-partition",
+      "actors": [
+        {"id": "a", "actions": ["read-discovered-left", "hold", "release"]},
+        {"id": "b", "actions": ["read-discovered-right", "hold", "release"]}
+      ],
+      "gates": [
+        {
+          "id": "collision-coexist",
+          "mode": "rendezvous-sleep",
+          "point": "CACHE_LOCKED",
+          "actors": ["a", "b"]
+        }
+      ],
+      "oracle": "collision-keeps-distinct-identities",
+      "evidence": ["C"]
+    },
+    {
+      "id": "cache-parallel",
+      "cpus": 2,
+      "discovery": "two-blocks-different-partitions",
+      "actors": [
+        {"id": "a", "actions": ["read-discovered-left", "release"]},
+        {"id": "b", "actions": ["read-discovered-right", "release"]}
+      ],
+      "gates": [
+        {
+          "id": "parallel-critical-sections",
+          "mode": "rendezvous-spin",
+          "point": "CACHE_PARTITION_HELD",
+          "actors": ["a", "b"],
+          "iteration_budget": 10000000
+        }
+      ],
+      "oracle": "different-partitions-overlap",
+      "evidence": ["C"]
+    },
+    {
+      "id": "cache-full",
+      "cpus": 1,
+      "isolated_panic_run": true,
+      "actors": [
+        {
+          "id": "holder",
+          "actions": [
+            "hold-nbuf-distinct-read-only-buffers",
+            "request-one-more-buffer"
+          ]
+        }
+      ],
+      "gates": [],
+      "oracle": "exact-no-buffer-panic",
+      "evidence": ["B"]
+    }
+  ]
+}

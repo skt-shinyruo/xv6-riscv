@@ -1,0 +1,1033 @@
+diff --git a/Makefile b/Makefile
+index 95604e73b37d484ab1b58541d709d394403999d7..a2b72ed99c4d77bcadd1c52bdddcb6f0e8a6de5e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,0 +22 @@ OBJS = \
++  $K/persistenceaudit.o \
+@@ -147,0 +149 @@ UPROGS=\
++	$U/_persisttrace\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91a3d62b50e89ecfea2ca3f9f091f0cddfe..140a79b164fcaeb9a69338fbf7283d2e6ff7db38 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -19,0 +20,12 @@ void            bunpin(struct buf*);
++int             cacheproject_partition(uint, uint);
++struct cacheproject_view;
++int             cacheproject_snapshot(int, struct cacheproject_view*);
++int             cacheproject_snapshot_buffer(struct buf*, struct cacheproject_view*);
++
++// persistenceaudit.c
++void            persistenceaudit_init(void);
++int             persistenceaudit_command(int, uint64, uint64, uint64, uint64, uint64);
++void            persistenceaudit_cache_event(int, int, int, uint, uint, uint64, int);
++void            persistenceaudit_cache_gate(int, int, uint, uint);
++void            persistenceaudit_log_event(int, uint, int, int, int, int);
++void            persistenceaudit_io_event(int, struct buf*, int);
+diff --git a/kernel/log.c b/kernel/log.c
+index 52f6e7ebdf9c2926fc82775550c3e065f036744f..87d7d60a277b59b6fbaf62bf3cdd48e3ea65b8b2 100644
+--- a/kernel/log.c
++++ b/kernel/log.c
+@@ -8,0 +9 @@
++#include "persistenceaudit.h"
+@@ -78,0 +80,2 @@ install_trans(int recovering)
++    persistenceaudit_log_event(PA_LOG_HOME, log.lh.block[tail], log.lh.n,
++                               log.outstanding, log.committing, tail);
+@@ -113,0 +117,3 @@ write_head(void)
++  persistenceaudit_log_event(log.lh.n == 0 ? PA_LOG_CLEAR : PA_LOG_HEADER,
++                             log.start, log.lh.n, log.outstanding,
++                             log.committing, log.lh.n);
+@@ -132,0 +139,2 @@ begin_op(void)
++      persistenceaudit_log_event(PA_LOG_WAIT_COMMIT, 0, log.lh.n,
++                                 log.outstanding, log.committing, 0);
+@@ -135,0 +144,2 @@ begin_op(void)
++      persistenceaudit_log_event(PA_LOG_WAIT_SPACE, 0, log.lh.n,
++                                 log.outstanding, log.committing, 0);
+@@ -138,0 +149,2 @@ begin_op(void)
++      persistenceaudit_log_event(PA_LOG_ADMIT, 0, log.lh.n,
++                                 log.outstanding, log.committing, 0);
+@@ -164,0 +177,2 @@ end_op(void)
++  persistenceaudit_log_event(PA_LOG_END, 0, log.lh.n, log.outstanding,
++                             log.committing, do_commit);
+@@ -172,0 +187,2 @@ end_op(void)
++    persistenceaudit_log_event(PA_LOG_COMMIT_DONE, 0, log.lh.n,
++                               log.outstanding, log.committing, 0);
+@@ -188,0 +205,2 @@ write_log(void)
++    persistenceaudit_log_event(PA_LOG_PAYLOAD, log.lh.block[tail], log.lh.n,
++                               log.outstanding, log.committing, tail);
+@@ -233,0 +252,5 @@ log_write(struct buf *b)
++    persistenceaudit_log_event(PA_LOG_APPEND, b->blockno, log.lh.n,
++                               log.outstanding, log.committing, i);
++  } else {
++    persistenceaudit_log_event(PA_LOG_ABSORB, b->blockno, log.lh.n,
++                               log.outstanding, log.committing, i);
+diff --git a/kernel/main.c b/kernel/main.c
+index 69e9eb38a1979b25cb2d6236c2caf3f313a3b5bd..005497fea8a9f1cbca6594b832f44aba3d08fef8 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -27,0 +28 @@ main()
++    persistenceaudit_init();
+diff --git a/kernel/persistenceaudit.c b/kernel/persistenceaudit.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f2ab83ee514c08a965194ede449d314658e453e
+--- /dev/null
++++ b/kernel/persistenceaudit.c
+@@ -0,0 +1,416 @@
++#include "types.h"
++#include "param.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "proc.h"
++#include "defs.h"
++#include "fs.h"
++#include "buf.h"
++#include "persistenceaudit.h"
++
++extern int cacheproject_partition(uint, uint);
++struct pa_holder {
++  int active;
++  int pid;
++  int released;
++};
++
++static struct {
++  struct spinlock lock;
++  int active;
++  int capture_cache;
++  int capture_log;
++  uint64 generation;
++  uint64 next_seq;
++  int count;
++  int error;
++  int pair;
++  int target1;
++  int target2;
++  int domain1;
++  int domain2;
++  int arrived;
++  int gate_open;
++  int log_n;
++  int outstanding;
++  int committing;
++  struct pa_holder holder[PA_MAX_HOLDERS];
++  struct pa_record record[PA_MAX_RECORDS];
++} audit;
++
++void
++persistenceaudit_init(void)
++{
++  initlock(&audit.lock, "persistenceaudit");
++}
++
++static void
++reset_locked(uint64 generation)
++{
++  memset(audit.record, 0, sizeof(audit.record));
++  memset(audit.holder, 0, sizeof(audit.holder));
++  audit.active = generation != 0;
++  audit.capture_cache = 0;
++  audit.capture_log = 0;
++  audit.generation = generation;
++  audit.next_seq = 1;
++  audit.count = 0;
++  audit.error = 0;
++  audit.pair = 0;
++  audit.target1 = 0;
++  audit.target2 = 0;
++  audit.domain1 = -1;
++  audit.domain2 = -1;
++  audit.arrived = 0;
++  audit.gate_open = 0;
++  audit.log_n = 0;
++  audit.outstanding = 0;
++  audit.committing = 0;
++}
++
++static int
++target_locked(int pid)
++{
++  if (!audit.pair)
++    return 1;
++  return pid == audit.target1 || pid == audit.target2;
++}
++
++static void
++record_locked(int point, int domain, int slot, uint dev, uint blockno,
++              uint64 buffer_generation, int refcnt, int log_n,
++              int outstanding, int committing, int aux)
++{
++  struct pa_record *r;
++  struct proc *p;
++
++  if (!audit.active)
++    return;
++  if (audit.count >= PA_MAX_RECORDS) {
++    audit.error = 1;
++    audit.gate_open = 1;
++    return;
++  }
++  r = &audit.record[audit.count++];
++  p = myproc();
++  r->generation = audit.generation;
++  r->seq = audit.next_seq++;
++  r->point = point;
++  r->pid = p ? p->pid : 0;
++  r->hart = cpuid();
++  r->domain = domain;
++  r->slot = slot;
++  r->refcnt = refcnt;
++  r->dev = dev;
++  r->blockno = blockno;
++  r->buffer_generation = buffer_generation;
++  r->log_n = log_n;
++  r->outstanding = outstanding;
++  r->committing = committing;
++  r->aux = aux;
++}
++
++void
++persistenceaudit_cache_event(int point, int domain, int slot, uint dev,
++                             uint blockno, uint64 buffer_generation, int refcnt)
++{
++  struct proc *p = myproc();
++
++  acquire(&audit.lock);
++  if (audit.active && audit.capture_cache && p != 0 && target_locked(p->pid))
++    record_locked(point, domain, slot, dev, blockno, buffer_generation,
++                  refcnt, audit.log_n, audit.outstanding, audit.committing, 0);
++  release(&audit.lock);
++}
++
++void
++persistenceaudit_cache_gate(int point, int domain, uint dev, uint blockno)
++{
++  struct proc *p = myproc();
++  int expected_point;
++  int bit = 0;
++  uint64 spins = 0;
++
++  acquire(&audit.lock);
++  expected_point = audit.domain1 == audit.domain2 ? PA_CACHE_SLEEP
++                                                  : PA_CACHE_GUARD;
++  if (audit.active && audit.capture_cache && audit.pair &&
++      point == expected_point && p != 0) {
++    if (p->pid == audit.target1 && domain == audit.domain1)
++      bit = 1;
++    else if (p->pid == audit.target2 && domain == audit.domain2)
++      bit = 2;
++    if (bit != 0 && (audit.arrived & bit) == 0) {
++      audit.arrived |= bit;
++      if (audit.arrived == 3) {
++        audit.gate_open = 1;
++        wakeup(&audit);
++      }
++    }
++  }
++  if (bit == 0) {
++    release(&audit.lock);
++    return;
++  }
++  if (expected_point == PA_CACHE_SLEEP) {
++    while (!audit.gate_open && !audit.error && audit.active)
++      sleep(&audit, &audit.lock);
++    release(&audit.lock);
++    return;
++  }
++  release(&audit.lock);
++  for (;;) {
++    int open;
++    acquire(&audit.lock);
++    if (++spins == 10000000 && !audit.gate_open) {
++      audit.error = 2;
++      audit.gate_open = 1;
++    }
++    open = audit.gate_open || audit.error || !audit.active;
++    release(&audit.lock);
++    if (open)
++      break;
++  }
++}
++
++void
++persistenceaudit_log_event(int point, uint blockno, int log_n,
++                           int outstanding, int committing, int aux)
++{
++  acquire(&audit.lock);
++  audit.log_n = log_n;
++  audit.outstanding = outstanding;
++  audit.committing = committing;
++  if (audit.active && audit.capture_log)
++    record_locked(point, -1, -1, ROOTDEV, blockno, 0, -1, log_n,
++                  outstanding, committing, aux);
++  release(&audit.lock);
++}
++
++void
++persistenceaudit_io_event(int point, struct buf *b, int write)
++{
++  struct cacheproject_view view;
++
++  if (cacheproject_snapshot_buffer(b, &view) < 0) {
++    acquire(&audit.lock);
++    if (audit.active)
++      audit.error = 3;
++    release(&audit.lock);
++    return;
++  }
++  acquire(&audit.lock);
++  if (audit.active && (audit.capture_cache || audit.capture_log))
++    record_locked(point, view.partition, view.slot, view.dev, view.blockno,
++                  view.generation, view.refcnt, audit.log_n,
++                  audit.outstanding, audit.committing, write);
++  release(&audit.lock);
++}
++
++static int
++holder_wait(int transaction, uint blockno)
++{
++  struct pa_holder *h = 0;
++  struct buf *b = 0;
++  int i, value = 0;
++
++  if (transaction) {
++    begin_op();
++    if (blockno != 0) {
++      b = bread(ROOTDEV, blockno);
++      b->data[0] ^= 1;
++      log_write(b);
++      brelse(b);
++      b = 0;
++    }
++  } else
++    b = bread(ROOTDEV, blockno);
++  if (b != 0)
++    value = (uchar)b->data[0];
++  acquire(&audit.lock);
++  for (i = 0; i < PA_MAX_HOLDERS; i++) {
++    if (!audit.holder[i].active) {
++      h = &audit.holder[i];
++      h->active = 1;
++      h->pid = myproc()->pid;
++      h->released = 0;
++      break;
++    }
++  }
++  if (h == 0) {
++    release(&audit.lock);
++    if (transaction)
++      end_op();
++    else
++      brelse(b);
++    return -1;
++  }
++  while (!h->released)
++    sleep(h, &audit.lock);
++  h->active = 0;
++  release(&audit.lock);
++  if (transaction)
++    end_op();
++  else
++    brelse(b);
++  return transaction ? 0 : value;
++}
++
++static void
++release_holders(int pid)
++{
++  int i;
++
++  for (i = 0; i < PA_MAX_HOLDERS; i++) {
++    if (audit.holder[i].active && (pid == 0 || audit.holder[i].pid == pid)) {
++      audit.holder[i].released = 1;
++      wakeup(&audit.holder[i]);
++    }
++  }
++}
++
++static int
++copy_status(uint64 out)
++{
++  struct pa_status status;
++  int i;
++
++  acquire(&audit.lock);
++  memset(&status, 0, sizeof(status));
++  status.generation = audit.generation;
++  status.count = audit.count;
++  status.error = audit.error;
++  status.arrived = audit.arrived;
++  status.gate_open = audit.gate_open;
++  status.log_n = audit.log_n;
++  status.outstanding = audit.outstanding;
++  status.committing = audit.committing;
++  for (i = 0; i < PA_MAX_HOLDERS; i++)
++    status.holders += audit.holder[i].active;
++  release(&audit.lock);
++  return copyout(myproc()->pagetable, out, (char *)&status, sizeof(status));
++}
++
++static int
++copy_records(int cursor, uint64 out, int max)
++{
++  struct pa_record local[16];
++  int count, i;
++
++  if (cursor < 0 || max < 0 || max > 16)
++    return -1;
++  acquire(&audit.lock);
++  count = audit.count - cursor;
++  if (count < 0)
++    count = 0;
++  if (count > max)
++    count = max;
++  for (i = 0; i < count; i++)
++    local[i] = audit.record[cursor + i];
++  release(&audit.lock);
++  if (count > 0 && copyout(myproc()->pagetable, out, (char *)local,
++                           count * sizeof(local[0])) < 0)
++    return -1;
++  return count;
++}
++
++static int
++copy_cache(uint64 out)
++{
++  struct cacheproject_view view[NBUF];
++  int i;
++
++  for (i = 0; i < NBUF; i++) {
++    if (cacheproject_snapshot(i, &view[i]) < 0)
++      return -1;
++  }
++  return copyout(myproc()->pagetable, out, (char *)view, sizeof(view));
++}
++
++int
++persistenceaudit_command(int op, uint64 a, uint64 b, uint64 c, uint64 d,
++                         uint64 e)
++{
++  struct buf *bp;
++  int i;
++
++  if (op == PA_RESET) {
++    acquire(&audit.lock);
++    for (i = 0; i < PA_MAX_HOLDERS; i++) {
++      if (audit.holder[i].active) {
++        release(&audit.lock);
++        return -1;
++      }
++    }
++    reset_locked(0);
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == PA_ARM) {
++    if (a == 0 || b < 1 || b > 3)
++      return -1;
++    acquire(&audit.lock);
++    reset_locked(a);
++    audit.capture_cache = b & 1;
++    audit.capture_log = b & 2;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == PA_ARM_PAIR) {
++    if (a == 0 || b == 0 || c == 0)
++      return -1;
++    acquire(&audit.lock);
++    reset_locked(a);
++    audit.pair = 1;
++    audit.target1 = b;
++    audit.target2 = c;
++    audit.domain1 = d;
++    audit.domain2 = e;
++    audit.capture_cache = 1;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == PA_READ_BLOCK) {
++    if (a >= FSSIZE)
++      return -1;
++    bp = bread(ROOTDEV, a);
++    int value = (uchar)bp->data[0];
++    brelse(bp);
++    return value;
++  }
++  if (op == PA_HOLD_BLOCK)
++    return a < FSSIZE ? holder_wait(0, a) : -1;
++  if (op == PA_HOLD_TXN)
++    return holder_wait(1, 0);
++  if (op == PA_HOLD_TXN_BLOCK)
++    return a > 0 && a < FSSIZE ? holder_wait(1, a) : -1;
++  if (op == PA_RELEASE_PID || op == PA_RELEASE_ALL) {
++    acquire(&audit.lock);
++    release_holders(op == PA_RELEASE_PID ? (int)a : 0);
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == PA_STATUS)
++    return copy_status(a);
++  if (op == PA_FETCH)
++    return copy_records(a, b, c);
++  if (op == PA_CACHE_SNAPSHOT)
++    return copy_cache(a);
++  if (op == PA_LOG_TWICE) {
++    if (a >= FSSIZE)
++      return -1;
++    begin_op();
++    bp = bread(ROOTDEV, a);
++    bp->data[0] = 0x51;
++    log_write(bp);
++    bp->data[1] = 0x52;
++    log_write(bp);
++    brelse(bp);
++    end_op();
++    return 0;
++  }
++  if (op == PA_PARTITION)
++    return a < FSSIZE ? cacheproject_partition(ROOTDEV, a) : -1;
++  return -1;
++}
+diff --git a/kernel/persistenceaudit.h b/kernel/persistenceaudit.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b966b2f5a4f3df904d8225c7595e83ead4e3d8ff
+--- /dev/null
++++ b/kernel/persistenceaudit.h
+@@ -0,0 +1,88 @@
++#define PA_ABI 1
++#define PA_MAX_RECORDS 512
++#define PA_MAX_HOLDERS NBUF
++
++#define PA_RESET          1
++#define PA_ARM            2
++#define PA_ARM_PAIR       3
++#define PA_READ_BLOCK     4
++#define PA_HOLD_BLOCK     5
++#define PA_HOLD_TXN       6
++#define PA_RELEASE_PID    7
++#define PA_RELEASE_ALL    8
++#define PA_STATUS         9
++#define PA_FETCH          10
++#define PA_CACHE_SNAPSHOT 11
++#define PA_LOG_TWICE      12
++#define PA_PARTITION      13
++#define PA_HOLD_TXN_BLOCK 14
++
++#define PA_CACHE_LOOKUP  1
++#define PA_CACHE_GUARD   2
++#define PA_CACHE_HIT     3
++#define PA_CACHE_PUBLISH 4
++#define PA_CACHE_SLEEP   5
++#define PA_CACHE_RELEASE 6
++#define PA_CACHE_PIN     7
++#define PA_CACHE_UNPIN   8
++
++#define PA_LOG_WAIT_COMMIT 20
++#define PA_LOG_WAIT_SPACE  21
++#define PA_LOG_ADMIT       22
++#define PA_LOG_END         23
++#define PA_LOG_APPEND      24
++#define PA_LOG_ABSORB      25
++#define PA_LOG_PAYLOAD     26
++#define PA_LOG_HEADER      27
++#define PA_LOG_HOME        28
++#define PA_LOG_CLEAR       29
++#define PA_LOG_COMMIT_DONE 30
++
++#define PA_IO_SUBMIT   40
++#define PA_IO_COMPLETE 41
++
++struct pa_record {
++  uint64 generation;
++  uint64 seq;
++  int point;
++  int pid;
++  int hart;
++  int domain;
++  int slot;
++  int refcnt;
++  uint dev;
++  uint blockno;
++  uint64 buffer_generation;
++  int log_n;
++  int outstanding;
++  int committing;
++  int aux;
++};
++
++struct pa_status {
++  uint64 generation;
++  int count;
++  int error;
++  int arrived;
++  int gate_open;
++  int holders;
++  int log_n;
++  int outstanding;
++  int committing;
++};
++
++struct cacheproject_view {
++  int slot;
++  int partition;
++  int named;
++  int refcnt;
++  int valid;
++  int disk;
++  int locked;
++  uint dev;
++  uint blockno;
++  uint64 generation;
++};
++
++void persistenceaudit_cache_event(int, int, int, uint, uint, uint64, int);
++void persistenceaudit_cache_gate(int, int, uint, uint);
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f2260e09b1885831b3cb6488fe7b560016..16cff07f9885514854be047cc49ee35b9dbc8d19 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,0 +105 @@ extern uint64 sys_close(void);
++extern uint64 sys_persistenceaudit(void);
+@@ -130,0 +132 @@ static uint64 (*syscalls[])(void) = {
++  [SYS_persistenceaudit] sys_persistenceaudit,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4479e64ba193a425db9af0de44bea4464a..d3dfbebbf785ce6943d6071d8cb88f5f6bfc14cd 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,0 +23 @@
++#define SYS_persistenceaudit 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3a2fca413fcf9d22f3bdc00bda74815825..76cd38f4ec67dcf37a85b7231ef868af7102b5ad 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -109,0 +110,15 @@ sys_uptime(void)
++
++uint64
++sys_persistenceaudit(void)
++{
++  int op;
++  uint64 a, b, c, d, e;
++
++  argint(0, &op);
++  argaddr(1, &a);
++  argaddr(2, &b);
++  argaddr(3, &c);
++  argaddr(4, &d);
++  argaddr(5, &e);
++  return persistenceaudit_command(op, a, b, c, d, e);
++}
+diff --git a/kernel/virtio_disk.c b/kernel/virtio_disk.c
+index da2f1fd19f6064ccd42da1b2d2c54d517999a1b5..fb2c46ecb13db9e3e06034e33d87ee22c9700d7f 100644
+--- a/kernel/virtio_disk.c
++++ b/kernel/virtio_disk.c
+@@ -17,0 +18 @@
++#include "persistenceaudit.h"
+@@ -269,0 +271 @@ virtio_disk_rw(struct buf *b, int write)
++  persistenceaudit_io_event(PA_IO_SUBMIT, b, write);
+@@ -319,0 +323,2 @@ virtio_disk_intr()
++    persistenceaudit_io_event(PA_IO_COMPLETE, b,
++                              disk.ops[id].type == VIRTIO_BLK_T_OUT);
+diff --git a/user/persisttrace.c b/user/persisttrace.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c66b6c5c24445e27492aa5d9c59e1a26ac9c5ee1
+--- /dev/null
++++ b/user/persisttrace.c
+@@ -0,0 +1,386 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/param.h"
++#include "kernel/persistenceaudit.h"
++#include "user/user.h"
++
++static void
++fail(char *message)
++{
++  printf("PERSIST FAIL reason=%s\n", message);
++  exit(1);
++}
++
++static void
++status(struct pa_status *s)
++{
++  if (persistenceaudit(PA_STATUS, (uint64)s, 0, 0, 0, 0) < 0)
++    fail("status");
++}
++
++static void
++wait_holders(int expected)
++{
++  struct pa_status s;
++  int i;
++
++  for (i = 0; i < 500; i++) {
++    status(&s);
++    if (s.error)
++      fail("audit-error");
++    if (s.holders == expected)
++      return;
++    pause(1);
++  }
++  fail("holders-watchdog");
++}
++
++static int
++have_event(int pid, int point, int refcnt)
++{
++  struct pa_status s;
++  struct pa_record r[16];
++  int cursor = 0, n, i;
++
++  status(&s);
++  while (cursor < s.count) {
++    n = persistenceaudit(PA_FETCH, cursor, (uint64)r, 16, 0, 0);
++    if (n < 0)
++      fail("fetch");
++    for (i = 0; i < n; i++) {
++      if ((pid == 0 || r[i].pid == pid) && r[i].point == point &&
++          (refcnt < 0 || r[i].refcnt == refcnt))
++        return 1;
++    }
++    cursor += n;
++  }
++  return 0;
++}
++
++static void
++wait_event(int pid, int point, int refcnt)
++{
++  int i;
++
++  for (i = 0; i < 500; i++) {
++    if (have_event(pid, point, refcnt))
++      return;
++    pause(1);
++  }
++  fail("event-watchdog");
++}
++
++static void
++print_evidence(char *name, uint64 generation)
++{
++  struct pa_status s;
++  struct pa_record r[16];
++  struct cacheproject_view view[NBUF];
++  int cursor = 0, n, i, refs = 0, locks = 0, disk = 0;
++
++  status(&s);
++  printf("PERSIST META case=%s abi=%d generation=%ld count=%d error=%d arrived=%d gate=%d holders=%d\n",
++         name, PA_ABI, generation, s.count, s.error, s.arrived, s.gate_open,
++         s.holders);
++  while (cursor < s.count) {
++    n = persistenceaudit(PA_FETCH, cursor, (uint64)r, 16, 0, 0);
++    if (n <= 0)
++      fail("print-fetch");
++    for (i = 0; i < n; i++) {
++      printf("PERSIST EVENT generation=%ld seq=%ld point=%d pid=%d hart=%d domain=%d slot=%d ref=%d dev=%u block=%u buffer_generation=%ld log_n=%d outstanding=%d committing=%d aux=%d\n",
++             r[i].generation, r[i].seq, r[i].point, r[i].pid, r[i].hart,
++             r[i].domain, r[i].slot, r[i].refcnt, r[i].dev, r[i].blockno,
++             r[i].buffer_generation, r[i].log_n, r[i].outstanding,
++             r[i].committing, r[i].aux);
++    }
++    cursor += n;
++  }
++  if (persistenceaudit(PA_CACHE_SNAPSHOT, (uint64)view, 0, 0, 0, 0) < 0)
++    fail("cache-snapshot");
++  for (i = 0; i < NBUF; i++) {
++    printf("PERSIST BUFFER generation=%ld slot=%d domain=%d named=%d ref=%d valid=%d disk=%d locked=%d dev=%u block=%u buffer_generation=%ld\n",
++           generation, view[i].slot, view[i].partition, view[i].named,
++           view[i].refcnt, view[i].valid, view[i].disk, view[i].locked,
++           view[i].dev, view[i].blockno, view[i].generation);
++    refs += view[i].refcnt;
++    locks += view[i].locked;
++    disk += view[i].disk;
++  }
++  printf("PERSIST LEDGER case=%s generation=%ld refs=%d locks=%d disk=%d log_n=%d outstanding=%d committing=%d error=%d\n",
++         name, generation, refs, locks, disk, s.log_n, s.outstanding,
++         s.committing, s.error);
++}
++
++static int
++spawn_reader(int block, int hold, int startfd, int resultfd)
++{
++  int pid = fork();
++  if (pid < 0)
++    fail("fork");
++  if (pid == 0) {
++    char c;
++    int result;
++    if (startfd >= 0 && read(startfd, &c, 1) != 1)
++      exit(2);
++    result = persistenceaudit(hold ? PA_HOLD_BLOCK : PA_READ_BLOCK,
++                              block, 0, 0, 0, 0);
++    if (resultfd >= 0 && write(resultfd, &result, sizeof(result)) != sizeof(result))
++      exit(3);
++    exit(result < 0 ? 4 : 0);
++  }
++  return pid;
++}
++
++static void
++wait_ok(int count)
++{
++  int i, status_value;
++  for (i = 0; i < count; i++) {
++    if (wait(&status_value) < 0 || status_value != 0)
++      fail("child-status");
++  }
++}
++
++static void
++run_log(void)
++{
++  if (persistenceaudit(PA_ARM, 1, 3, 0, 0, 0) < 0)
++    fail("arm-log");
++  if (persistenceaudit(PA_LOG_TWICE, 1990, 0, 0, 0, 0) < 0)
++    fail("log-twice");
++  print_evidence("tx", 1);
++}
++
++static void
++run_admission_empty(void)
++{
++  struct pa_status s;
++  int pids[4], i, status_value;
++
++  if (persistenceaudit(PA_ARM, 2, 2, 0, 0, 0) < 0)
++    fail("arm-admission");
++  for (i = 0; i < 3; i++) {
++    pids[i] = fork();
++    if (pids[i] == 0)
++      exit(persistenceaudit(PA_HOLD_TXN, 0, 0, 0, 0, 0) < 0);
++    if (pids[i] < 0)
++      fail("fork-admission");
++  }
++  wait_holders(3);
++  pids[3] = fork();
++  if (pids[3] == 0)
++    exit(persistenceaudit(PA_HOLD_TXN, 0, 0, 0, 0, 0) < 0);
++  if (pids[3] < 0)
++    fail("fork-fourth");
++  wait_event(pids[3], PA_LOG_WAIT_SPACE, -1);
++  if (persistenceaudit(PA_RELEASE_PID, pids[0], 0, 0, 0, 0) < 0)
++    fail("release-one");
++  if (wait(&status_value) != pids[0] || status_value != 0)
++    fail("wait-first");
++  wait_holders(3);
++  wait_event(pids[3], PA_LOG_ADMIT, -1);
++  if (persistenceaudit(PA_RELEASE_ALL, 0, 0, 0, 0, 0) < 0)
++    fail("release-all");
++  wait_ok(3);
++  status(&s);
++  if (s.holders != 0 || s.outstanding != 0 || s.committing != 0)
++    fail("admission-cleanup");
++  print_evidence("admission-empty", 2);
++}
++
++static int
++spawn_transaction(int block)
++{
++  int pid = fork();
++
++  if (pid < 0)
++    fail("fork-transaction");
++  if (pid == 0) {
++    int op = block == 0 ? PA_HOLD_TXN : PA_HOLD_TXN_BLOCK;
++    exit(persistenceaudit(op, block, 0, 0, 0, 0) < 0);
++  }
++  return pid;
++}
++
++static void
++run_admission_used(void)
++{
++  struct pa_status s;
++  int pids[3], status_value;
++
++  if (persistenceaudit(PA_ARM, 3, 2, 0, 0, 0) < 0)
++    fail("arm-admission-used");
++  pids[0] = spawn_transaction(1988);
++  wait_holders(1);
++  status(&s);
++  if (s.log_n != 1 || s.outstanding != 1)
++    fail("used-first-state");
++  pids[1] = spawn_transaction(0);
++  wait_holders(2);
++  status(&s);
++  if (s.log_n != 1 || s.outstanding != 2)
++    fail("used-second-state");
++  pids[2] = spawn_transaction(0);
++  wait_event(pids[2], PA_LOG_WAIT_SPACE, -1);
++  status(&s);
++  if (s.log_n != 1 || s.outstanding != 2 || s.holders != 2)
++    fail("used-wait-state");
++  if (persistenceaudit(PA_RELEASE_PID, pids[1], 0, 0, 0, 0) < 0)
++    fail("used-release-one");
++  if (wait(&status_value) != pids[1] || status_value != 0)
++    fail("used-wait-one");
++  wait_holders(2);
++  wait_event(pids[2], PA_LOG_ADMIT, -1);
++  status(&s);
++  if (s.log_n != 1 || s.outstanding != 2)
++    fail("used-admit-state");
++  if (persistenceaudit(PA_RELEASE_ALL, 0, 0, 0, 0, 0) < 0)
++    fail("used-release-all");
++  wait_ok(2);
++  status(&s);
++  if (s.holders != 0 || s.log_n != 0 || s.outstanding != 0 ||
++      s.committing != 0)
++    fail("used-cleanup");
++  print_evidence("admission-used", 3);
++}
++
++static void
++run_same(void)
++{
++  int a, b, gota, gotb, resa[2], resb[2];
++
++  if (pipe(resa) < 0 || pipe(resb) < 0)
++    fail("same-pipes");
++  if (persistenceaudit(PA_ARM, 4, 1, 0, 0, 0) < 0)
++    fail("arm-same");
++  a = spawn_reader(1989, 1, -1, resa[1]);
++  wait_holders(1);
++  b = spawn_reader(1989, 0, -1, resb[1]);
++  wait_event(b, PA_CACHE_HIT, 2);
++  if (persistenceaudit(PA_RELEASE_PID, a, 0, 0, 0, 0) < 0)
++    fail("same-release");
++  wait_ok(2);
++  close(resa[1]);
++  close(resb[1]);
++  if (read(resa[0], &gota, sizeof(gota)) != sizeof(gota) ||
++      read(resb[0], &gotb, sizeof(gotb)) != sizeof(gotb))
++    fail("same-results");
++  close(resa[0]);
++  close(resb[0]);
++  printf("PERSIST RESULT case=same block1=1989 block2=1989 pid1=%d pid2=%d domain1=%d domain2=%d expected1=%d expected2=%d value1=%d value2=%d\n",
++         a, b, persistenceaudit(PA_PARTITION, 1989, 0, 0, 0, 0),
++         persistenceaudit(PA_PARTITION, 1989, 0, 0, 0, 0), gota, gotb,
++         gota, gotb);
++  print_evidence("same", 4);
++}
++
++static void
++find_pair(int same_domain, int *one, int *two, int *vone, int *vtwo)
++{
++  int a, b, da, db, va, vb;
++
++  for (a = 2; a < 80; a++) {
++    da = persistenceaudit(PA_PARTITION, a, 0, 0, 0, 0);
++    va = persistenceaudit(PA_READ_BLOCK, a, 0, 0, 0, 0);
++    for (b = a + 1; b < 100; b++) {
++      db = persistenceaudit(PA_PARTITION, b, 0, 0, 0, 0);
++      if ((da == db) != same_domain)
++        continue;
++      vb = persistenceaudit(PA_READ_BLOCK, b, 0, 0, 0, 0);
++      if (va != vb) {
++        *one = a;
++        *two = b;
++        *vone = va;
++        *vtwo = vb;
++        return;
++      }
++    }
++  }
++  fail("pair-discovery");
++}
++
++static void
++run_pair(int parallel)
++{
++  int start[2], result1[2], result2[2], one, two, vone, vtwo;
++  int got1, got2, p1, p2, d1, d2;
++  char bytes[2] = {'a', 'b'};
++  char *name = parallel ? "parallel" : "collision";
++  uint64 generation = parallel ? 6 : 5;
++
++  persistenceaudit(PA_RESET, 0, 0, 0, 0, 0);
++  find_pair(!parallel, &one, &two, &vone, &vtwo);
++  d1 = persistenceaudit(PA_PARTITION, one, 0, 0, 0, 0);
++  d2 = persistenceaudit(PA_PARTITION, two, 0, 0, 0, 0);
++  if (pipe(start) < 0 || pipe(result1) < 0 || pipe(result2) < 0)
++    fail("pipe");
++  p1 = spawn_reader(one, 0, start[0], result1[1]);
++  p2 = spawn_reader(two, 0, start[0], result2[1]);
++  if (persistenceaudit(PA_ARM_PAIR, generation, p1, p2, d1, d2) < 0)
++    fail("arm-pair");
++  if (write(start[1], bytes, 2) != 2)
++    fail("start-write");
++  close(start[0]);
++  close(start[1]);
++  wait_ok(2);
++  close(result1[1]);
++  close(result2[1]);
++  if (read(result1[0], &got1, sizeof(got1)) != sizeof(got1) ||
++      read(result2[0], &got2, sizeof(got2)) != sizeof(got2))
++    fail("pair-results");
++  close(result1[0]);
++  close(result2[0]);
++  printf("PERSIST RESULT case=%s block1=%d block2=%d pid1=%d pid2=%d domain1=%d domain2=%d expected1=%d expected2=%d value1=%d value2=%d\n",
++         name, one, two, p1, p2, d1, d2, vone, vtwo, got1, got2);
++  print_evidence(name, generation);
++}
++
++static void
++run_full(void)
++{
++  struct pa_status s;
++  int pid, i;
++
++  if (persistenceaudit(PA_ARM, 7, 1, 0, 0, 0) < 0)
++    fail("arm-full");
++  for (i = 0; i < NBUF; i++) {
++    pid = spawn_reader(1000 + i, 1, -1, -1);
++    if (pid <= 0)
++      fail("full-fork");
++    wait_holders(i + 1);
++  }
++  status(&s);
++  if (s.holders != NBUF)
++    fail("full-holders");
++  print_evidence("cache-full", 7);
++  printf("PERSIST FULL generation=7 holders=%d next=%d\n", s.holders,
++         1000 + NBUF);
++  persistenceaudit(PA_READ_BLOCK, 1000 + NBUF, 0, 0, 0, 0);
++  fail("full-no-panic");
++}
++
++int
++main(int argc, char **argv)
++{
++  if (argc != 2)
++    fail("usage");
++  if (strcmp(argv[1], "log") == 0)
++    run_log();
++  else if (strcmp(argv[1], "admission-empty") == 0)
++    run_admission_empty();
++  else if (strcmp(argv[1], "admission-used") == 0)
++    run_admission_used();
++  else if (strcmp(argv[1], "same") == 0)
++    run_same();
++  else if (strcmp(argv[1], "collision") == 0)
++    run_pair(0);
++  else if (strcmp(argv[1], "parallel") == 0)
++    run_pair(1);
++  else if (strcmp(argv[1], "cache-full") == 0)
++    run_full();
++  else
++    fail("unknown-case");
++  printf("PERSIST PASS case=%s\n",
++         strcmp(argv[1], "log") == 0 ? "tx" : argv[1]);
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921c8f26a96ee75b5d0ac3295e3229dc3596..0fb8052a2dd53553b9a924a610d7e63bdc6c47b6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -26,0 +27 @@ int uptime(void);
++int persistenceaudit(int, uint64, uint64, uint64, uint64, uint64);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a750aea5c8f23fca00f89c9c2610408ff8..66ccf2ca237d411880f44eb9d2290ffd09850923 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,0 +45 @@ entry("uptime");
++entry("persistenceaudit");

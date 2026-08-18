@@ -1,0 +1,205 @@
+diff --git a/kernel/bio.c b/kernel/bio.c
+index de86039..6945f56 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -21,10 +21,17 @@
+ #include "defs.h"
+ #include "fs.h"
+ #include "buf.h"
++#include "persistenceaudit.h"
++
++struct cachemeta {
++  int named;
++  uint64 generation;
++};
+
+ struct {
+   struct spinlock lock;
+   struct buf buf[NBUF];
++  struct cachemeta meta[NBUF];
+
+   // Linked list of all buffers, through prev/next.
+   // Sorted by how recently the buffer was used.
+@@ -32,10 +39,25 @@ struct {
+   struct buf head;
+ } bcache;
+
++static int
++bufslot(struct buf *b)
++{
++  return b - bcache.buf;
++}
++
++int
++cacheproject_partition(uint dev, uint blockno)
++{
++  (void)dev;
++  (void)blockno;
++  return 0;
++}
++
+ void
+ binit(void)
+ {
+   struct buf *b;
++  int slot;
+
+   initlock(&bcache.lock, "bcache");
+
+@@ -43,6 +65,9 @@ binit(void)
+   bcache.head.prev = &bcache.head;
+   bcache.head.next = &bcache.head;
+   for (b = bcache.buf; b < bcache.buf + NBUF; b++) {
++    slot = bufslot(b);
++    bcache.meta[slot].named = 0;
++    bcache.meta[slot].generation = 0;
+     b->next = bcache.head.next;
+     b->prev = &bcache.head;
+     initsleeplock(&b->lock, "buffer");
+@@ -58,15 +83,34 @@ static struct buf *
+ bget(uint dev, uint blockno)
+ {
+   struct buf *b;
++  int partition, slot;
++
++  partition = cacheproject_partition(dev, blockno);
++  persistenceaudit_cache_event(PA_CACHE_LOOKUP, partition, -1, dev, blockno,
++                               0, 0);
++  persistenceaudit_cache_gate(PA_CACHE_LOOKUP, partition, dev, blockno);
+
+   acquire(&bcache.lock);
++  persistenceaudit_cache_event(PA_CACHE_GUARD, partition, -1, dev, blockno,
++                               0, 0);
++  persistenceaudit_cache_gate(PA_CACHE_GUARD, partition, dev, blockno);
+
+   // Is the block already cached?
+   for (b = bcache.head.next; b != &bcache.head; b = b->next) {
+-    if (b->dev == dev && b->blockno == blockno) {
++    slot = bufslot(b);
++    if (bcache.meta[slot].named && b->dev == dev && b->blockno == blockno) {
+       b->refcnt++;
++      persistenceaudit_cache_event(PA_CACHE_HIT, partition, slot, dev,
++                                   blockno, bcache.meta[slot].generation,
++                                   b->refcnt);
+       release(&bcache.lock);
+       acquiresleep(&b->lock);
++      acquire(&bcache.lock);
++      persistenceaudit_cache_event(PA_CACHE_SLEEP, partition, slot, dev,
++                                   blockno, bcache.meta[slot].generation,
++                                   b->refcnt);
++      release(&bcache.lock);
++      persistenceaudit_cache_gate(PA_CACHE_SLEEP, partition, dev, blockno);
+       return b;
+     }
+   }
+@@ -75,12 +119,24 @@ bget(uint dev, uint blockno)
+   // Recycle the least recently used (LRU) unused buffer.
+   for (b = bcache.head.prev; b != &bcache.head; b = b->prev) {
+     if (b->refcnt == 0) {
++      slot = bufslot(b);
++      bcache.meta[slot].named = 1;
++      bcache.meta[slot].generation++;
+       b->dev = dev;
+       b->blockno = blockno;
+       b->valid = 0;
+       b->refcnt = 1;
++      persistenceaudit_cache_event(PA_CACHE_PUBLISH, partition, slot, dev,
++                                   blockno, bcache.meta[slot].generation,
++                                   b->refcnt);
+       release(&bcache.lock);
+       acquiresleep(&b->lock);
++      acquire(&bcache.lock);
++      persistenceaudit_cache_event(PA_CACHE_SLEEP, partition, slot, dev,
++                                   blockno, bcache.meta[slot].generation,
++                                   b->refcnt);
++      release(&bcache.lock);
++      persistenceaudit_cache_gate(PA_CACHE_SLEEP, partition, dev, blockno);
+       return b;
+     }
+   }
+@@ -115,12 +171,15 @@ bwrite(struct buf *b)
+ void
+ brelse(struct buf *b)
+ {
++  int slot;
++
+   if (!holdingsleep(&b->lock))
+     panic("brelse");
+
+-  releasesleep(&b->lock);
++  slot = bufslot(b);
+
+   acquire(&bcache.lock);
++  releasesleep(&b->lock);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+@@ -132,21 +191,68 @@ brelse(struct buf *b)
+     bcache.head.next = b;
+   }
+
++  persistenceaudit_cache_event(PA_CACHE_RELEASE, 0, slot, b->dev,
++                               b->blockno, bcache.meta[slot].generation,
++                               b->refcnt);
++
+   release(&bcache.lock);
+ }
+
+ void
+ bpin(struct buf *b)
+ {
++  int slot = bufslot(b);
++
+   acquire(&bcache.lock);
+   b->refcnt++;
++  persistenceaudit_cache_event(PA_CACHE_PIN, 0, slot, b->dev, b->blockno,
++                               bcache.meta[slot].generation, b->refcnt);
+   release(&bcache.lock);
+ }
+
+ void
+ bunpin(struct buf *b)
+ {
++  int slot = bufslot(b);
++
+   acquire(&bcache.lock);
+   b->refcnt--;
++  persistenceaudit_cache_event(PA_CACHE_UNPIN, 0, slot, b->dev, b->blockno,
++                               bcache.meta[slot].generation, b->refcnt);
+   release(&bcache.lock);
+ }
++
++int
++cacheproject_snapshot(int slot, struct cacheproject_view *view)
++{
++  struct buf *b;
++
++  if (slot < 0 || slot >= NBUF || view == 0)
++    return -1;
++  acquire(&bcache.lock);
++  b = &bcache.buf[slot];
++  view->slot = slot;
++  view->partition = 0;
++  view->named = bcache.meta[slot].named;
++  view->refcnt = b->refcnt;
++  view->valid = b->valid;
++  view->disk = b->disk;
++  acquire(&b->lock.lk);
++  view->locked = b->lock.locked;
++  release(&b->lock.lk);
++  view->dev = b->dev;
++  view->blockno = b->blockno;
++  view->generation = bcache.meta[slot].generation;
++  release(&bcache.lock);
++  return 0;
++}
++
++int
++cacheproject_snapshot_buffer(struct buf *b, struct cacheproject_view *view)
++{
++  int slot = bufslot(b);
++
++  if (slot < 0 || slot >= NBUF)
++    return -1;
++  return cacheproject_snapshot(slot, view);
++}
