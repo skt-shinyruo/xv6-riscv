@@ -1,0 +1,1032 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..4dc5d44 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,6 +18,7 @@ OBJS = \
+   $K/trap.o \
+   $K/syscall.o \
+   $K/sysproc.o \
++  $K/fsaudit.o \
+   $K/bio.o \
+   $K/fs.o \
+   $K/log.o \
+@@ -145,6 +146,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_fstrace\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/bio.c b/kernel/bio.c
+index de86039..ced9657 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -21,6 +21,7 @@
+ #include "defs.h"
+ #include "fs.h"
+ #include "buf.h"
++#include "fsaudit.h"
+ 
+ struct {
+   struct spinlock lock;
+@@ -150,3 +151,15 @@ bunpin(struct buf *b)
+   b->refcnt--;
+   release(&bcache.lock);
+ }
++
++void
++bio_audit_counts(struct fs_audit_snapshot *result)
++{
++  struct buf *b;
++
++  result->buf_refs = 0;
++  acquire(&bcache.lock);
++  for (b = bcache.head.next; b != &bcache.head; b = b->next)
++    result->buf_refs += b->refcnt;
++  release(&bcache.lock);
++}
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..6a848ed 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct fs_audit_snapshot;
+ 
+ // bio.c
+ void            binit(void);
+@@ -17,6 +18,7 @@ void            brelse(struct buf*);
+ void            bwrite(struct buf*);
+ void            bpin(struct buf*);
+ void            bunpin(struct buf*);
++void            bio_audit_counts(struct fs_audit_snapshot*);
+ 
+ // console.c
+ void            consoleinit(void);
+@@ -34,6 +36,7 @@ void            fileinit(void);
+ int             fileread(struct file*, uint64, int n);
+ int             filestat(struct file*, uint64 addr);
+ int             filewrite(struct file*, uint64, int n);
++void            file_audit_counts(struct fs_audit_snapshot*);
+ 
+ // fs.c
+ void            fsinit(int);
+@@ -55,6 +58,17 @@ void            stati(struct inode*, struct stat*);
+ int             writei(struct inode*, int, uint64, uint, uint);
+ void            itrunc(struct inode*);
+ void            ireclaim(int);
++void            fs_audit_counts(struct fs_audit_snapshot*);
++void            fs_audit_inode(struct inode*, struct fs_audit_snapshot*);
++
++// fsaudit.c (tutorial-only fixture)
++void            fsauditinit(void);
++int             fsaudit_command(int, int, uint64);
++void            fsaudit_path_step(void);
++void            fsaudit_open(struct inode*);
++void            fsaudit_event(int, struct inode*, uint, struct buf*);
++int             fsaudit_balloc_fail(void);
++int             fsaudit_dirlink_fail(void);
+ 
+ // kalloc.c
+ void*           kalloc(void);
+diff --git a/kernel/file.c b/kernel/file.c
+index 13a4e69..7eae56a 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -10,6 +10,7 @@
+ #include "spinlock.h"
+ #include "sleeplock.h"
+ #include "file.h"
++#include "fsaudit.h"
+ #include "stat.h"
+ #include "proc.h"
+ 
+@@ -118,6 +119,7 @@ fileread(struct file *f, uint64 addr, int n)
+       return -1;
+     r = devsw[f->major].read(1, addr, n);
+   } else if (f->type == FD_INODE) {
++    fsaudit_event(FSE_FILE_READ, f->ip, 0, 0);
+     ilock(f->ip);
+     if ((r = readi(f->ip, 1, addr, f->off, n)) > 0)
+       f->off += r;
+@@ -146,6 +148,7 @@ filewrite(struct file *f, uint64 addr, int n)
+       return -1;
+     ret = devsw[f->major].write(1, addr, n);
+   } else if (f->type == FD_INODE) {
++    fsaudit_event(FSE_FILE_WRITE, f->ip, 0, 0);
+     // write a few blocks at a time to avoid exceeding
+     // the maximum log transaction size, including
+     // i-node, indirect block, allocation blocks,
+@@ -177,3 +180,17 @@ filewrite(struct file *f, uint64 addr, int n)
+ 
+   return ret;
+ }
++
++void
++file_audit_counts(struct fs_audit_snapshot *result)
++{
++  result->file_objects = 0;
++  result->file_refs = 0;
++  acquire(&ftable.lock);
++  for (int i = 0; i < NFILE; i++) {
++    if (ftable.file[i].ref > 0)
++      result->file_objects++;
++    result->file_refs += ftable.file[i].ref;
++  }
++  release(&ftable.lock);
++}
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 2ad1b0a..ef13eba 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -20,6 +20,7 @@
+ #include "fs.h"
+ #include "buf.h"
+ #include "file.h"
++#include "fsaudit.h"
+ 
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ // there should be one superblock per disk device, but we run with
+@@ -70,6 +71,8 @@ balloc(uint dev)
+   int b, bi, m;
+   struct buf *bp;
+ 
++  if (fsaudit_balloc_fail())
++    return 0;
+   bp = 0;
+   for (b = 0; b < sb.size; b += BPB) {
+     bp = bread(dev, BBLOCK(b, sb));
+@@ -416,6 +419,8 @@ bmap(struct inode *ip, uint bn)
+         return 0;
+       ip->addrs[bn] = addr;
+     }
++    if (bn == 0)
++      fsaudit_event(FSE_DIRECT, ip, addr, 0);
+     return addr;
+   }
+   bn -= NDIRECT;
+@@ -438,6 +443,8 @@ bmap(struct inode *ip, uint bn)
+       }
+     }
+     brelse(bp);
++    if (bn == 0)
++      fsaudit_event(FSE_INDIRECT, ip, addr, 0);
+     return addr;
+   }
+ 
+@@ -498,6 +505,7 @@ readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
+   uint tot, m;
+   struct buf *bp;
+ 
++  fsaudit_event(FSE_INODE_READ, ip, 0, 0);
+   if (off > ip->size || off + n < off)
+     return 0;
+   if (off + n > ip->size)
+@@ -532,6 +540,7 @@ writei(struct inode *ip, int user_src, uint64 src, uint off, uint n)
+   uint tot, m;
+   struct buf *bp;
+ 
++  fsaudit_event(FSE_INODE_WRITE, ip, 0, 0);
+   if (off > ip->size || off + n < off)
+     return -1;
+   if (off + n > MAXFILE * BSIZE)
+@@ -542,6 +551,7 @@ writei(struct inode *ip, int user_src, uint64 src, uint off, uint n)
+     if (addr == 0)
+       break;
+     bp = bread(ip->dev, addr);
++    fsaudit_event(FSE_BUFFER, ip, addr, bp);
+     m = min(n - tot, BSIZE - off % BSIZE);
+     if (either_copyin(bp->data + (off % BSIZE), user_src, src, m) == -1) {
+       brelse(bp);
+@@ -623,6 +633,8 @@ dirlink(struct inode *dp, char *name, uint inum)
+ 
+   strncpy(de.name, name, DIRSIZ);
+   de.inum = inum;
++  if (fsaudit_dirlink_fail())
++    return -1;
+   if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+     return -1;
+ 
+@@ -683,6 +695,7 @@ namex(char *path, int nameiparent, char *name)
+     ip = idup(myproc()->cwd);
+ 
+   while ((path = skipelem(path, name)) != 0) {
++    fsaudit_path_step();
+     ilock(ip);
+     if (ip->type != T_DIR) {
+       iunlockput(ip);
+@@ -719,3 +732,65 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++void
++fs_audit_inode(struct inode *ip, struct fs_audit_snapshot *result)
++{
++  struct buf *bp;
++  uint *entries;
++  int i;
++
++  result->inspect_inum = ip->inum;
++  result->inspect_type = ip->type;
++  result->inspect_nlink = ip->nlink;
++  result->inspect_size = ip->size;
++  result->inspect_direct0 = ip->addrs[0];
++  result->inspect_direct11 = ip->addrs[NDIRECT - 1];
++  result->inspect_indirect = ip->addrs[NDIRECT];
++  for (i = 0; i < NDIRECT; i++)
++    if (ip->addrs[i])
++      result->inspect_data_blocks++;
++  if (ip->addrs[NDIRECT]) {
++    bp = bread(ip->dev, ip->addrs[NDIRECT]);
++    entries = (uint *)bp->data;
++    result->inspect_indirect0 = entries[0];
++    for (i = 0; i < NINDIRECT; i++)
++      if (entries[i])
++        result->inspect_data_blocks++;
++    brelse(bp);
++  }
++}
++
++void
++fs_audit_counts(struct fs_audit_snapshot *result)
++{
++  struct buf *bp;
++  struct dinode *dip;
++  int b, bi, inum;
++
++  result->blocks = 0;
++  for (b = 0; b < sb.size; b += BPB) {
++    bp = bread(ROOTDEV, BBLOCK(b, sb));
++    for (bi = 0; bi < BPB && b + bi < sb.size; bi++)
++      if (bp->data[bi / 8] & (1 << (bi % 8)))
++        result->blocks++;
++    brelse(bp);
++  }
++  result->inodes = 0;
++  for (inum = 1; inum < sb.ninodes; inum++) {
++    bp = bread(ROOTDEV, IBLOCK(inum, sb));
++    dip = (struct dinode *)bp->data + inum % IPB;
++    if (dip->type != 0)
++      result->inodes++;
++    brelse(bp);
++  }
++  result->itable_active = 0;
++  result->itable_refs = 0;
++  acquire(&itable.lock);
++  for (int i = 0; i < NINODE; i++) {
++    if (itable.inode[i].ref > 0)
++      result->itable_active++;
++    result->itable_refs += itable.inode[i].ref;
++  }
++  release(&itable.lock);
++}
+diff --git a/kernel/fsaudit.c b/kernel/fsaudit.c
+new file mode 100644
+index 0000000..222d233
+--- /dev/null
++++ b/kernel/fsaudit.c
+@@ -0,0 +1,228 @@
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "param.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "proc.h"
++#include "fs.h"
++#include "buf.h"
++#include "file.h"
++#include "fsaudit.h"
++
++enum {
++  AUDIT_NONE,
++  AUDIT_BALLOC,
++  AUDIT_DIRLINK,
++};
++
++static struct {
++  struct spinlock lock;
++  int active;
++  int pid;
++  int mode;
++  int fail_at;
++  int seq;
++  int path_steps;
++  uint target_inum;
++  struct fs_audit_snapshot record;
++} audit;
++
++void
++fsauditinit(void)
++{
++  initlock(&audit.lock, "fsaudit");
++}
++
++static int
++ours(void)
++{
++  return audit.active && audit.pid == myproc()->pid;
++}
++
++void
++fsaudit_path_step(void)
++{
++  acquire(&audit.lock);
++  if (ours())
++    audit.path_steps++;
++  release(&audit.lock);
++}
++
++void
++fsaudit_open(struct inode *ip)
++{
++  acquire(&audit.lock);
++  if (ours() && audit.record.generation == 1 && audit.target_inum == 0) {
++    audit.target_inum = ip->inum;
++    audit.seq = 0;
++    audit.record.path_steps = audit.path_steps;
++    audit.record.open_seq = ++audit.seq;
++  }
++  release(&audit.lock);
++}
++
++void
++fsaudit_event(int event, struct inode *ip, uint block, struct buf *bp)
++{
++  int *slot = 0;
++
++  acquire(&audit.lock);
++  if (!ours() || audit.record.generation != 1 ||
++      audit.target_inum == 0 || ip == 0 || ip->inum != audit.target_inum) {
++    release(&audit.lock);
++    return;
++  }
++  switch (event) {
++  case FSE_FILE_WRITE:
++    slot = &audit.record.file_write_seq;
++    break;
++  case FSE_INODE_WRITE:
++    slot = &audit.record.inode_write_seq;
++    break;
++  case FSE_DIRECT:
++    slot = &audit.record.direct_seq;
++    break;
++  case FSE_BUFFER:
++    slot = &audit.record.buffer_seq;
++    break;
++  case FSE_INDIRECT:
++    slot = &audit.record.indirect_seq;
++    break;
++  case FSE_FILE_READ:
++    slot = &audit.record.file_read_seq;
++    break;
++  case FSE_INODE_READ:
++    slot = &audit.record.inode_read_seq;
++    break;
++  }
++  if (slot && *slot == 0)
++    *slot = ++audit.seq;
++  if (event == FSE_BUFFER && audit.record.buffer_block == 0 && bp) {
++    audit.record.buffer_block = block;
++    audit.record.buffer_valid = bp->valid;
++    audit.record.buffer_ref = bp->refcnt;
++    audit.record.buffer_locked = holdingsleep(&bp->lock);
++  }
++  release(&audit.lock);
++}
++
++int
++fsaudit_balloc_fail(void)
++{
++  int fail = 0;
++
++  acquire(&audit.lock);
++  if (ours() && audit.mode == AUDIT_BALLOC) {
++    audit.record.eligible++;
++    if (audit.record.eligible == audit.fail_at) {
++      audit.record.fired = 1;
++      fail = 1;
++    }
++  }
++  release(&audit.lock);
++  return fail;
++}
++
++int
++fsaudit_dirlink_fail(void)
++{
++  int fail = 0;
++
++  acquire(&audit.lock);
++  if (ours() && audit.mode == AUDIT_DIRLINK) {
++    audit.record.eligible++;
++    if (audit.record.eligible == audit.fail_at) {
++      audit.record.fired = 1;
++      fail = 1;
++    }
++  }
++  release(&audit.lock);
++  return fail;
++}
++
++static void
++arm(int generation, int mode, int fail_at)
++{
++  memset(&audit.record, 0, sizeof(audit.record));
++  audit.active = 1;
++  audit.pid = myproc()->pid;
++  audit.mode = mode;
++  audit.fail_at = fail_at;
++  audit.seq = 0;
++  audit.path_steps = 0;
++  audit.target_inum = 0;
++  audit.record.generation = generation;
++}
++
++static int
++inspect_fd(int fd)
++{
++  struct file *f;
++  struct fs_audit_snapshot inspected;
++
++  if (fd < 0 || fd >= NOFILE || (f = myproc()->ofile[fd]) == 0 ||
++      f->type != FD_INODE)
++    return -1;
++  memset(&inspected, 0, sizeof(inspected));
++  ilock(f->ip);
++  fs_audit_inode(f->ip, &inspected);
++  iunlock(f->ip);
++  acquire(&audit.lock);
++  audit.record.inspect_inum = inspected.inspect_inum;
++  audit.record.inspect_type = inspected.inspect_type;
++  audit.record.inspect_nlink = inspected.inspect_nlink;
++  audit.record.inspect_size = inspected.inspect_size;
++  audit.record.inspect_data_blocks = inspected.inspect_data_blocks;
++  audit.record.inspect_direct0 = inspected.inspect_direct0;
++  audit.record.inspect_direct11 = inspected.inspect_direct11;
++  audit.record.inspect_indirect = inspected.inspect_indirect;
++  audit.record.inspect_indirect0 = inspected.inspect_indirect0;
++  release(&audit.lock);
++  return 0;
++}
++
++int
++fsaudit_command(int op, int arg, uint64 out)
++{
++  struct fs_audit_snapshot result;
++
++  if (op == FSAUDIT_RESET) {
++    acquire(&audit.lock);
++    arm(arg, AUDIT_NONE, 0);
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == FSAUDIT_ARM_BALLOC || op == FSAUDIT_ARM_DIRLINK) {
++    acquire(&audit.lock);
++    audit.active = 1;
++    audit.pid = myproc()->pid;
++    audit.mode = op == FSAUDIT_ARM_BALLOC ? AUDIT_BALLOC : AUDIT_DIRLINK;
++    audit.fail_at = arg;
++    audit.record.eligible = 0;
++    audit.record.fired = 0;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == FSAUDIT_DISARM) {
++    acquire(&audit.lock);
++    audit.active = 0;
++    audit.mode = AUDIT_NONE;
++    release(&audit.lock);
++    return 0;
++  }
++  if (op == FSAUDIT_INSPECT_FD)
++    return inspect_fd(arg);
++  if (op != FSAUDIT_FETCH || out == 0)
++    return -1;
++
++  acquire(&audit.lock);
++  result = audit.record;
++  release(&audit.lock);
++  fs_audit_counts(&result);
++  file_audit_counts(&result);
++  bio_audit_counts(&result);
++  if (copyout(myproc()->pagetable, out, (char *)&result, sizeof(result)) < 0)
++    return -1;
++  return 0;
++}
+diff --git a/kernel/fsaudit.h b/kernel/fsaudit.h
+new file mode 100644
+index 0000000..dc65c7d
+--- /dev/null
++++ b/kernel/fsaudit.h
+@@ -0,0 +1,52 @@
++#define FSAUDIT_RESET        1
++#define FSAUDIT_FETCH        2
++#define FSAUDIT_ARM_BALLOC   3
++#define FSAUDIT_ARM_DIRLINK  4
++#define FSAUDIT_DISARM       5
++#define FSAUDIT_INSPECT_FD   6
++
++#define FSE_OPEN         1
++#define FSE_FILE_WRITE   2
++#define FSE_INODE_WRITE  3
++#define FSE_DIRECT       4
++#define FSE_BUFFER       5
++#define FSE_INDIRECT     6
++#define FSE_FILE_READ    7
++#define FSE_INODE_READ   8
++
++struct fs_audit_snapshot {
++  int generation;
++  int eligible;
++  int fired;
++  int path_steps;
++  int open_seq;
++  int file_write_seq;
++  int inode_write_seq;
++  int direct_seq;
++  int buffer_seq;
++  int indirect_seq;
++  int file_read_seq;
++  int inode_read_seq;
++  uint buffer_block;
++  int buffer_valid;
++  int buffer_ref;
++  int buffer_locked;
++
++  uint inspect_inum;
++  int inspect_type;
++  int inspect_nlink;
++  uint inspect_size;
++  int inspect_data_blocks;
++  uint inspect_direct0;
++  uint inspect_direct11;
++  uint inspect_indirect;
++  uint inspect_indirect0;
++
++  int blocks;
++  int inodes;
++  int itable_active;
++  int itable_refs;
++  int file_objects;
++  int file_refs;
++  int buf_refs;
++};
+diff --git a/kernel/main.c b/kernel/main.c
+index 69e9eb3..f616422 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -27,6 +27,7 @@ main()
+     binit();            // buffer cache
+     iinit();            // inode table
+     fileinit();         // file table
++    fsauditinit();      // tutorial-only file-system audit state
+     virtio_disk_init(); // emulated hard disk
+     userinit();         // first user process
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..93d8a9e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -102,6 +102,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_fsaudit(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -128,6 +129,7 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_link]    sys_link,
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
++  [SYS_fsaudit] sys_fsaudit,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..1dd403e 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_fsaudit 22
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index a6299e9..5bb05f3 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -15,6 +15,7 @@
+ #include "sleeplock.h"
+ #include "file.h"
+ #include "fcntl.h"
++#include "fsaudit.h"
+ 
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+@@ -366,6 +367,7 @@ sys_open(void)
+ 
+   iunlock(ip);
+   end_op();
++  fsaudit_open(ip);
+ 
+   return fd;
+ }
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..7867f5f 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,15 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_fsaudit(void)
++{
++  int op, arg;
++  uint64 out;
++
++  argint(0, &op);
++  argint(1, &arg);
++  argaddr(2, &out);
++  return fsaudit_command(op, arg, out);
++}
+diff --git a/user/fstrace.c b/user/fstrace.c
+new file mode 100644
+index 0000000..aed010d
+--- /dev/null
++++ b/user/fstrace.c
+@@ -0,0 +1,346 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
++#include "kernel/fs.h"
++#include "kernel/param.h"
++#include "kernel/fsaudit.h"
++#include "user/user.h"
++
++static struct fs_audit_snapshot base;
++static struct fs_audit_snapshot snap;
++static struct fs_audit_snapshot before;
++static struct stat st0;
++static struct stat st1;
++static char block[BSIZE];
++
++static void
++fail(int code)
++{
++  printf("FS FAIL code=%d\n", code);
++  exit(1);
++}
++
++static void
++fetch(struct fs_audit_snapshot *out)
++{
++  if (fsaudit(FSAUDIT_FETCH, 0, out) < 0)
++    fail(90);
++}
++
++static int
++same_ledger(struct fs_audit_snapshot *a, struct fs_audit_snapshot *b)
++{
++  return a->blocks == b->blocks && a->inodes == b->inodes &&
++         a->itable_active == b->itable_active &&
++         a->itable_refs == b->itable_refs &&
++         a->file_objects == b->file_objects &&
++         a->file_refs == b->file_refs && a->buf_refs == b->buf_refs;
++}
++
++static void
++print_after(char *phase)
++{
++  fetch(&snap);
++  if (!same_ledger(&base, &snap))
++    fail(91);
++  printf("FS AFTER phase=%s blocks=%d inodes=%d itable_active=%d "
++         "itable_refs=%d file_objects=%d file_refs=%d buf_refs=%d\n",
++         phase, snap.blocks, snap.inodes, snap.itable_active,
++         snap.itable_refs, snap.file_objects, snap.file_refs, snap.buf_refs);
++}
++
++static void
++fill(char value)
++{
++  memset(block, value, sizeof(block));
++}
++
++static void
++cleanup_names(void)
++{
++  unlink("fsd/data");
++  unlink("fsd");
++  unlink("fslink");
++  unlink("fsalias");
++  unlink("fstrunc");
++  unlink("fsfd");
++  unlink("fssrc");
++  unlink("fsbadlink");
++  unlink("fsalloc");
++}
++
++static void
++case_rw(void)
++{
++  int fd, i, n, total, checksum, written = 0;
++
++  if (mkdir("fsd") < 0)
++    fail(1);
++  if (fsaudit(FSAUDIT_RESET, 1, 0) < 0)
++    fail(2);
++  fd = open("fsd/data", O_CREATE | O_RDWR);
++  if (fd < 0)
++    fail(3);
++  for (i = 0; i < NDIRECT; i++) {
++    fill('A' + i);
++    n = write(fd, block, BSIZE);
++    if (n != BSIZE)
++      fail(4);
++    written += n;
++  }
++  fill('Z');
++  n = write(fd, block, 17);
++  if (n != 17)
++    fail(5);
++  written += n;
++  if (fstat(fd, &st0) < 0 || fsaudit(FSAUDIT_INSPECT_FD, fd, 0) < 0)
++    fail(6);
++  close(fd);
++
++  fd = open("fsd/data", O_RDONLY);
++  if (fd < 0)
++    fail(7);
++  total = 0;
++  checksum = 0;
++  while ((n = read(fd, block, sizeof(block))) > 0) {
++    total += n;
++    for (i = 0; i < n; i++)
++      checksum += (uchar)block[i];
++  }
++  if (n < 0 || total != NDIRECT * BSIZE + 17 || checksum != 867834)
++    fail(8);
++  fetch(&snap);
++  close(fd);
++  printf("FS RW generation=%d path_steps=%d inum=%d type=%d nlink=%d "
++         "size=%d write=%d read=%d checksum=%d direct0=%d direct11=%d "
++         "indirect=%d indirect0=%d data_blocks=%d open_seq=%d "
++         "file_write_seq=%d inode_write_seq=%d direct_seq=%d buffer_seq=%d "
++         "indirect_seq=%d file_read_seq=%d inode_read_seq=%d buffer_block=%d "
++         "buffer_valid=%d buffer_ref=%d buffer_locked=%d status=0 cleanup=1\n",
++         snap.generation, snap.path_steps, snap.inspect_inum, snap.inspect_type,
++         snap.inspect_nlink, snap.inspect_size, written, total,
++         checksum, snap.inspect_direct0, snap.inspect_direct11,
++         snap.inspect_indirect, snap.inspect_indirect0, snap.inspect_data_blocks,
++         snap.open_seq, snap.file_write_seq, snap.inode_write_seq,
++         snap.direct_seq, snap.buffer_seq, snap.indirect_seq,
++         snap.file_read_seq, snap.inode_read_seq, snap.buffer_block,
++         snap.buffer_valid, snap.buffer_ref, snap.buffer_locked);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  if (unlink("fsd/data") < 0 || unlink("fsd") < 0)
++    fail(9);
++  print_after("RW");
++}
++
++static void
++case_link(void)
++{
++  int fd, old_path, alias_path, got;
++  char data[5];
++  int n0, n1, n2, n3, inum;
++
++  fsaudit(FSAUDIT_RESET, 2, 0);
++  fd = open("fslink", O_CREATE | O_RDWR);
++  if (fd < 0 || write(fd, "hello", 5) != 5)
++    fail(10);
++  close(fd);
++  fd = open("fslink", O_RDWR);
++  if (fd < 0 || fstat(fd, &st0) < 0)
++    fail(11);
++  inum = st0.ino;
++  n0 = st0.nlink;
++  if (link("fslink", "fsalias") < 0 || fstat(fd, &st0) < 0)
++    fail(12);
++  n1 = st0.nlink;
++  if (unlink("fslink") < 0 || fstat(fd, &st0) < 0)
++    fail(13);
++  n2 = st0.nlink;
++  if (unlink("fsalias") < 0 || fstat(fd, &st0) < 0)
++    fail(14);
++  n3 = st0.nlink;
++  old_path = open("fslink", O_RDONLY);
++  alias_path = open("fsalias", O_RDONLY);
++  if (old_path >= 0 || alias_path >= 0)
++    fail(15);
++  got = read(fd, data, sizeof(data));
++  fetch(&snap);
++  if (got != 5 || data[0] != 'h' || data[4] != 'o' ||
++      snap.inodes != base.inodes + 1 || snap.blocks != base.blocks + 1)
++    fail(16);
++  printf("FS LINK generation=2 inum=%d nlink0=%d nlink1=%d nlink2=%d "
++         "nlink3=%d path_old=%d path_alias=%d read=%d first=%d last=%d "
++         "open_fd=%d blocks_held=%d inodes_held=%d status=0 cleanup=1\n",
++         inum, n0, n1, n2, n3, old_path, alias_path, got, data[0], data[4],
++         fd, snap.blocks, snap.inodes);
++  close(fd);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  print_after("LINK");
++}
++
++static void
++case_trunc(void)
++{
++  int fd0, fd1, before_blocks, after_blocks, rewrite;
++
++  fsaudit(FSAUDIT_RESET, 3, 0);
++  fd0 = open("fstrunc", O_CREATE | O_RDWR);
++  fill('T');
++  if (fd0 < 0 || write(fd0, block, BSIZE) != BSIZE ||
++      write(fd0, block, BSIZE) != BSIZE)
++    fail(20);
++  close(fd0);
++  fd0 = open("fstrunc", O_RDWR);
++  if (fd0 < 0 || fstat(fd0, &st0) < 0 ||
++      fsaudit(FSAUDIT_INSPECT_FD, fd0, 0) < 0)
++    fail(21);
++  fetch(&before);
++  before_blocks = before.inspect_data_blocks;
++  fd1 = open("fstrunc", O_TRUNC | O_RDWR);
++  if (fd1 < 0 || fstat(fd0, &st0) < 0 || fstat(fd1, &st1) < 0 ||
++      fsaudit(FSAUDIT_INSPECT_FD, fd0, 0) < 0)
++    fail(22);
++  fetch(&snap);
++  after_blocks = snap.inspect_data_blocks;
++  rewrite = write(fd0, "new", 3);
++  if (rewrite != 3 || fstat(fd1, &st1) < 0)
++    fail(23);
++  printf("FS TRUNC generation=3 inum_fd0=%d inum_fd1=%d "
++         "before_size=%d before_blocks=%d "
++         "after_size=%d after_blocks=%d peer_size=%d rewrite=%d final_size=%d "
++         "status=0 cleanup=1\n",
++         st0.ino, st1.ino, before.inspect_size, before_blocks,
++         snap.inspect_size, after_blocks, (int)st0.size, rewrite,
++         (int)st1.size);
++  close(fd0);
++  close(fd1);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  if (unlink("fstrunc") < 0)
++    fail(24);
++  print_after("TRUNC");
++}
++
++static void
++case_fdfail(void)
++{
++  int fd, created, check, filled = 0;
++  int dups[NOFILE];
++
++  fsaudit(FSAUDIT_RESET, 4, 0);
++  fd = open("README", O_RDONLY);
++  if (fd < 0)
++    fail(30);
++  while (filled < NOFILE && (dups[filled] = dup(fd)) >= 0)
++    filled++;
++  created = open("fsfd", O_CREATE | O_RDWR);
++  if (created >= 0 || filled == 0)
++    fail(31);
++  close(dups[filled - 1]);
++  check = open("fsfd", O_RDONLY);
++  if (check < 0 || fstat(check, &st0) < 0)
++    fail(32);
++  fetch(&snap);
++  printf("FS FDFAIL generation=4 filled=%d create=%d check_fd=%d nlink=%d "
++         "size=%d blocks_held=%d inodes_held=%d status=0 cleanup=1\n",
++         filled, created, check, st0.nlink, (int)st0.size, snap.blocks,
++         snap.inodes);
++  close(check);
++  for (int i = 0; i < filled - 1; i++)
++    close(dups[i]);
++  close(fd);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  if (unlink("fsfd") < 0)
++    fail(33);
++  print_after("FDFAIL");
++}
++
++static void
++case_linkfail(void)
++{
++  int fd, result, target, nlink_before, nlink_after;
++
++  fsaudit(FSAUDIT_RESET, 5, 0);
++  fd = open("fssrc", O_CREATE | O_RDWR);
++  if (fd < 0 || fstat(fd, &st0) < 0)
++    fail(40);
++  nlink_before = st0.nlink;
++  close(fd);
++  fetch(&before);
++  if (fsaudit(FSAUDIT_ARM_DIRLINK, 1, 0) < 0)
++    fail(41);
++  result = link("fssrc", "fsbadlink");
++  target = open("fsbadlink", O_RDONLY);
++  fd = open("fssrc", O_RDONLY);
++  if (result != -1 || target >= 0 || fd < 0 || fstat(fd, &st0) < 0)
++    fail(42);
++  nlink_after = st0.nlink;
++  close(fd);
++  fetch(&snap);
++  printf("FS LINKFAIL generation=5 fail_at=1 eligible=%d fired=%d link=%d "
++         "target=%d nlink_before=%d nlink_after=%d blocks_before=%d "
++         "blocks_after=%d inodes_before=%d inodes_after=%d "
++         "status=0 cleanup=1\n", snap.eligible, snap.fired, result, target,
++         nlink_before, nlink_after, before.blocks, snap.blocks, before.inodes,
++         snap.inodes);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  if (unlink("fssrc") < 0)
++    fail(43);
++  print_after("LINKFAIL");
++}
++
++static void
++case_allocfail(void)
++{
++  int fd, result;
++
++  fsaudit(FSAUDIT_RESET, 6, 0);
++  fd = open("fsalloc", O_CREATE | O_RDWR);
++  if (fd < 0)
++    fail(50);
++  fill('Q');
++  for (int i = 0; i < NDIRECT; i++)
++    if (write(fd, block, BSIZE) != BSIZE)
++      fail(51);
++  if (fsaudit(FSAUDIT_INSPECT_FD, fd, 0) < 0)
++    fail(52);
++  fetch(&before);
++  if (fsaudit(FSAUDIT_ARM_BALLOC, 2, 0) < 0)
++    fail(53);
++  result = write(fd, block, BSIZE);
++  if (fsaudit(FSAUDIT_INSPECT_FD, fd, 0) < 0)
++    fail(54);
++  fetch(&snap);
++  printf("FS ALLOCFAIL generation=6 fail_at=2 eligible=%d fired=%d write=%d "
++         "size_before=%d size_after=%d indirect_before=%d indirect_after=%d "
++         "indirect_data=%d blocks_before=%d blocks_after=%d "
++         "inodes_before=%d inodes_after=%d status=0 cleanup=1\n",
++         snap.eligible, snap.fired, result, before.inspect_size,
++         snap.inspect_size, before.inspect_indirect, snap.inspect_indirect,
++         snap.inspect_indirect0, before.blocks, snap.blocks, before.inodes,
++         snap.inodes);
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  close(fd);
++  if (unlink("fsalloc") < 0)
++    fail(55);
++  print_after("ALLOCFAIL");
++}
++
++int
++main(void)
++{
++  cleanup_names();
++  fsaudit(FSAUDIT_DISARM, 0, 0);
++  fetch(&base);
++  if (base.buf_refs != 0)
++    fail(99);
++  printf("FS BASE blocks=%d inodes=%d itable_active=%d itable_refs=%d "
++         "file_objects=%d file_refs=%d buf_refs=%d\n", base.blocks,
++         base.inodes, base.itable_active, base.itable_refs,
++         base.file_objects, base.file_refs, base.buf_refs);
++  case_rw();
++  case_link();
++  case_trunc();
++  case_fdfail();
++  case_linkfail();
++  case_allocfail();
++  printf("FS PASS cases=6 cleanup=1\n");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921..ff648ff 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,7 @@ int getpid(void);
+ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
++int fsaudit(int, int, void *);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..f54796a 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("fsaudit");

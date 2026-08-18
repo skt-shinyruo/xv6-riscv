@@ -32,7 +32,8 @@
 
 ## 文件系统与持久化
 
-- 文件系统、日志与崩溃恢复 (`core.persistence`) - `planned`
+- [文件系统命名、inode 与数据路径](filesystem.md) - `verified`
+- Buffer cache、日志与事务 (`core.persistence`) - `planned`
 
 ## 证据、失败与综合
 

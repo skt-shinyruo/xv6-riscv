@@ -22,8 +22,9 @@ pipeline 的 fork/dup/close/blocked/wakeup/EOF/reclaim 时间线，并用隔离�
 本单元解除 `console-device-path`，并拥有 descriptor/file/pipe/console-file ownership；
 `device-interrupt-queue-completion` 仍是明确黑盒，由
 [设备中断与 VirtIO 队列](device-io.md)解除。
-文件系统 inode、日志事务、buffer-cache 的持久化顺序留给后续 `core.persistence`；
-这里只追踪普通 read 的 `fileread -> readi -> bread` 与修改路径的
+文件系统 namespace、inode 与 data mapping 留给后续[文件系统命名、inode 与数据路径](filesystem.md)；
+buffer-cache 和日志事务再由 `core.persistence` 接手。这里只追踪普通 read 的
+`fileread -> readi -> bread` 与修改路径的
 `begin_op/end_op` 边界。DMA memory ordering、
 调度公平性和所有 possible interleavings 不是本单元的结论。
 
@@ -141,5 +142,6 @@ console read 和 device completion 的动态 trace 由后续“设备中断与�
 报告包应包含 pipeline ownership 图、每阶段原始 marker 与 BASE/after 账本、
 `ioflow` 两次 transcript、focused/quick/full 回归、patch/runner digest、cleanup 和
 `C/R` 局限。下一张设备 I/O ticket 接手外部 console/disk event 的 runtime completion trace；
-后续 `core.persistence` 接手 inode、buffer、log 和 crash/recovery，不重复本单元的
-descriptor/pipe 解释。
+下一步[文件系统命名、inode 与数据路径](filesystem.md)接手 namespace、inode 和 data
+mapping；再后的 `core.persistence` 接手 buffer cache、log 和 transaction/recovery。两者都不
+重复本单元的 descriptor/pipe 解释。

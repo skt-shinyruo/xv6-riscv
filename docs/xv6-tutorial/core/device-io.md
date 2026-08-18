@@ -161,6 +161,7 @@ hart mask 不证明中断 affinity；seq_cst fence 加 raw address 只支持当�
 tracked review record 在外部记录该 digest、author/non-author 签名和修正结论。rubric 与报告
 模板位于同名 resource 目录。
 
-下一单元进入文件系统与持久化：从本单元已经完成并回收的 buffer 开始，解释 inode、log、
-transaction、disk write、crash tear 与 recovery；不要把本单元的 interrupt completion 误写成
-持久化完成。
+下一单元进入[文件系统命名、inode 与数据路径](filesystem.md)：从本单元已经完成并回收的
+buffer 开始，解释 image、pathname、inode 和 direct/indirect data mapping，但仍不声称
+持久化完成。再后的 `core.persistence` 才接手 buffer cache、log、transaction、disk write、
+crash tear 与 recovery；不要把本单元的 interrupt completion 误写成 commit。
