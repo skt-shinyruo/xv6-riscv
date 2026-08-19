@@ -38,4 +38,6 @@
 
 ## 证据、失败与综合
 
-- 全局不变量、故障与证据综合 (`core.evidence-synthesis`) - `planned`
+- [全局不变量与资源边界](global-invariants.md) - `verified`
+- 故障注入与源码测试追踪 (`core.fault-injection-and-traceability`) - `planned`
+- 可扩展性与证据综合 (`core.evidence-synthesis`) - `planned`
