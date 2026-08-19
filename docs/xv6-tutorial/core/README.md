@@ -40,4 +40,4 @@
 
 - [全局不变量与资源边界](global-invariants.md) - `verified`
 - [故障注入与源码测试追踪](fault-injection-and-traceability.md) - `verified`
-- 可扩展性与证据综合 (`core.evidence-synthesis`) - `planned`
+- [可扩展性与证据综合](evidence-synthesis.md) - `verified`
