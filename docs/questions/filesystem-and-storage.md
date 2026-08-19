@@ -12,7 +12,7 @@
 6. **FS-06** 已迁移到[持久化问题 `PERSIST-06`](../xv6-tutorial/questions/persistence.md#persist-06-ordinary-refwaitersleeplockpin-和-disk-owner-为什么不能合并)与[`PERSIST-09`](../xv6-tutorial/questions/persistence.md#persist-09-log_write-的-absorption-与-pinning-怎样协作)。此处只保留兼容入口。
 7. **FS-07** 已迁移到[持久化问题 `PERSIST-04`](../xv6-tutorial/questions/persistence.md#persist-04-one-buffer-per-block-在-bget-的哪段原子成立)与[`PERSIST-05`](../xv6-tutorial/questions/persistence.md#persist-05-brelse-的顺序怎样限制-use-after-release-与-eviction)。此处只保留兼容入口。
 8. **FS-08** 已迁移到[文件系统问题 `FILESYS-08`](../xv6-tutorial/questions/filesystem.md#filesys-08-readi-与-writei-在-partial-result-上有什么不同边界)。此处只保留兼容入口。
-9. **FS-09** 日志恢复后为什么还要执行 `ireclaim()`？只重放 redo log 为什么不能回收崩溃前的 orphan inode？
+9. **FS-09** 已迁移到[恢复问题 `RECOVERY-09`](../xv6-tutorial/questions/recovery.md#recovery-09-日志恢复后为什么还要执行-ireclaim)。此处只保留兼容入口。
 10. **FS-10** 已迁移到[设备中断与 VirtIO 队列问题 `DEVICE-10`](../xv6-tutorial/questions/device-io.md#device-10-为什么-8-个-descriptor-只能支持两笔三段请求在途)。此处只保留兼容入口。
 
 ## 源码入口

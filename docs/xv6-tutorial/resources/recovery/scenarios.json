@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "abi": 1,
+  "home_blocks": [1990, 1991],
+  "crash_points": [
+    {
+      "id": "log-data",
+      "logical_id": 10,
+      "point": "LOG_DATA_COMPLETE",
+      "phase": "precommit",
+      "crash_header_n": 0,
+      "crash_home": "before",
+      "recovery_seen_n": 0,
+      "recovery_home": "before"
+    },
+    {
+      "id": "commit-header",
+      "logical_id": 20,
+      "point": "COMMIT_HEADER_COMPLETE",
+      "phase": "postcommit",
+      "crash_header_n": 2,
+      "crash_home": "before",
+      "recovery_seen_n": 2,
+      "recovery_home": "after"
+    },
+    {
+      "id": "home-install",
+      "logical_id": 30,
+      "point": "HOME_INSTALL_COMPLETE",
+      "phase": "postcommit",
+      "crash_header_n": 2,
+      "crash_home": "after",
+      "recovery_seen_n": 2,
+      "recovery_home": "after"
+    },
+    {
+      "id": "header-clear",
+      "logical_id": 40,
+      "point": "HEADER_CLEAR_COMPLETE",
+      "phase": "postcommit",
+      "crash_header_n": 0,
+      "crash_home": "after",
+      "recovery_seen_n": 0,
+      "recovery_home": "after"
+    }
+  ],
+  "synthetic_tears": [
+    {
+      "id": "header-zero",
+      "source_point": "COMMIT_HEADER_COMPLETE",
+      "operation": "set-header-count-zero",
+      "expected": "reject-postcommit-before"
+    },
+    {
+      "id": "payload-half",
+      "source_point": "COMMIT_HEADER_COMPLETE",
+      "operation": "replace-half-log-payload-with-before",
+      "expected": "reject-mixed-home"
+    },
+    {
+      "id": "home-half",
+      "source_point": "HOME_INSTALL_COMPLETE",
+      "operation": "replace-half-home-with-before",
+      "expected": "recover-after"
+    },
+    {
+      "id": "header-restore",
+      "source_point": "HEADER_CLEAR_COMPLETE",
+      "operation": "restore-committed-header",
+      "expected": "recover-after-idempotent"
+    },
+    {
+      "id": "invalid-count",
+      "source_point": "COMMIT_HEADER_COMPLETE",
+      "operation": "set-header-count-out-of-range",
+      "expected": "reject-E_LOG_COUNT"
+    },
+    {
+      "id": "invalid-target",
+      "source_point": "COMMIT_HEADER_COMPLETE",
+      "operation": "set-first-target-to-log-region",
+      "expected": "reject-E_LOG_TARGET"
+    }
+  ]
+}

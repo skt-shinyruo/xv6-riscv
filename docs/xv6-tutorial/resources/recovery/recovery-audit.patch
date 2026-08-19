@@ -1,0 +1,209 @@
+diff --git a/Makefile b/Makefile
+index 95604e7..df95b99 100644
+--- a/Makefile
++++ b/Makefile
+@@ -31 +31,2 @@ OBJS = \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/recoveryaudit.o
+@@ -147,0 +149 @@ UPROGS=\
++	$U/_recoverycase\
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..627d815 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -183,0 +184,6 @@ void            virtio_disk_intr(void);
++// recoveryaudit.c
++int             recoveryaudit_case(int, int);
++int             recoveryaudit_armed(void);
++void            recoveryaudit_hit(int, int);
++void            recoveryaudit_replay(int, int);
++
+diff --git a/kernel/log.c b/kernel/log.c
+index 52f6e7e..9555349 100644
+--- a/kernel/log.c
++++ b/kernel/log.c
+@@ -8,0 +9 @@
++#include "recoveryaudit.h"
+@@ -119,0 +121,2 @@ recover_from_log(void)
++  int seen;
++
+@@ -120,0 +124 @@ recover_from_log(void)
++  seen = log.lh.n;
+@@ -123,0 +128 @@ recover_from_log(void)
++  recoveryaudit_replay(seen, seen);
+diff --git a/kernel/recoveryaudit.c b/kernel/recoveryaudit.c
+new file mode 100644
+index 0000000..0c16b44
+--- /dev/null
++++ b/kernel/recoveryaudit.c
+@@ -0,0 +1,74 @@
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "param.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "fs.h"
++#include "buf.h"
++#include "recoveryaudit.h"
++
++static struct {
++  int armed;
++  int fired;
++  int point;
++  int epoch;
++} audit;
++
++static void
++write_pattern(int after, int epoch)
++{
++  uint blocks[RC_HOME_COUNT] = {RC_HOME0, RC_HOME1};
++
++  begin_op();
++  for (int i = 0; i < RC_HOME_COUNT; i++) {
++    struct buf *b = bread(ROOTDEV, blocks[i]);
++    memset(b->data, (after ? 0xa0 : 0x50) + i, BSIZE);
++    ((uint *)b->data)[0] = epoch;
++    ((uint *)b->data)[1] = after;
++    ((uint *)b->data)[2] = i;
++    log_write(b);
++    brelse(b);
++  }
++  end_op();
++}
++
++int
++recoveryaudit_case(int point, int epoch)
++{
++  if (point != RC_LOG_DATA_COMPLETE &&
++      point != RC_COMMIT_HEADER_COMPLETE &&
++      point != RC_HOME_INSTALL_COMPLETE &&
++      point != RC_HEADER_CLEAR_COMPLETE)
++    return -1;
++  if (epoch <= 0 || audit.armed)
++    return -1;
++
++  write_pattern(0, epoch);
++  audit.point = point;
++  audit.epoch = epoch;
++  audit.fired = 0;
++  audit.armed = 1;
++  write_pattern(1, epoch);
++  return -1;
++}
++
++int
++recoveryaudit_armed(void)
++{
++  return audit.armed;
++}
++
++void
++recoveryaudit_hit(int point, int count)
++{
++  (void)point;
++  (void)count;
++}
++
++void
++recoveryaudit_replay(int seen, int installed)
++{
++  printk("RECOVERY REPLAY abi=1 seen_n=%d installed=%d cleared=1 left=%d right=%d\n",
++         seen, installed, RC_HOME0, RC_HOME1);
++}
+diff --git a/kernel/recoveryaudit.h b/kernel/recoveryaudit.h
+new file mode 100644
+index 0000000..66eed15
+--- /dev/null
++++ b/kernel/recoveryaudit.h
+@@ -0,0 +1,8 @@
++#define RC_LOG_DATA_COMPLETE      10
++#define RC_COMMIT_HEADER_COMPLETE 20
++#define RC_HOME_INSTALL_COMPLETE  30
++#define RC_HEADER_CLEAR_COMPLETE  40
++
++#define RC_HOME0 1990
++#define RC_HOME1 1991
++#define RC_HOME_COUNT 2
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1c7b92f..0013000 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,0 +105 @@ extern uint64 sys_close(void);
++extern uint64 sys_recoverycase(void);
+@@ -130,0 +132 @@ static uint64 (*syscalls[])(void) = {
++  [SYS_recoverycase] sys_recoverycase,
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 454d1b4..3db3499 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -22,0 +23 @@
++#define SYS_recoverycase 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..426ded3 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -109,0 +110,10 @@ sys_uptime(void)
++
++uint64
++sys_recoverycase(void)
++{
++  int point, epoch;
++
++  argint(0, &point);
++  argint(1, &epoch);
++  return recoveryaudit_case(point, epoch);
++}
+diff --git a/user/recoverycase.c b/user/recoverycase.c
+new file mode 100644
+index 0000000..fa3c6b2
+--- /dev/null
++++ b/user/recoverycase.c
+@@ -0,0 +1,34 @@
++#include "kernel/types.h"
++#include "kernel/recoveryaudit.h"
++#include "user/user.h"
++
++static int
++point_id(char *name)
++{
++  if (strcmp(name, "LOG_DATA_COMPLETE") == 0)
++    return RC_LOG_DATA_COMPLETE;
++  if (strcmp(name, "COMMIT_HEADER_COMPLETE") == 0)
++    return RC_COMMIT_HEADER_COMPLETE;
++  if (strcmp(name, "HOME_INSTALL_COMPLETE") == 0)
++    return RC_HOME_INSTALL_COMPLETE;
++  if (strcmp(name, "HEADER_CLEAR_COMPLETE") == 0)
++    return RC_HEADER_CLEAR_COMPLETE;
++  return -1;
++}
++
++int
++main(int argc, char **argv)
++{
++  int point, epoch;
++
++  if (argc != 3 || (point = point_id(argv[1])) < 0 ||
++      (epoch = atoi(argv[2])) <= 0) {
++    fprintf(2, "usage: recoverycase POINT EPOCH\n");
++    exit(1);
++  }
++  if (recoverycase(point, epoch) < 0) {
++    fprintf(2, "recoverycase: invalid or unfired rule\n");
++    exit(1);
++  }
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index ecd0921..ccac3e3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -26,0 +27 @@ int uptime(void);
++int recoverycase(int, int);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..7f08253 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -44,0 +45 @@ entry("uptime");
++entry("recoverycase");
