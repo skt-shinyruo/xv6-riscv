@@ -1159,17 +1159,57 @@
       "title": "故障注入与源码测试追踪",
       "stage": "evidence",
       "order": 20,
-      "status": "planned",
+      "status": "verified",
       "requires": ["core.global-invariants"],
-      "related": [],
+      "related": [
+        "core.scheduling-and-synchronization",
+        "core.filesystem",
+        "core.persistence",
+        "project.crash-recovery"
+      ],
       "black_boxes": [],
       "resolves": [],
       "owns": ["fault-injection-and-source-test-traceability"],
-      "outcomes": ["能把源码、不变量、测试、证据缺口与确定性故障触发双向关联"],
-      "source_anchors": [],
+      "outcomes": [
+        "能用稳定 record ID 把源码、解释 owner、不变量、证据维度、测试与缺口双向关联",
+        "能区分 baseline、verified tutorial fixture 与 proposed learner infrastructure，不把设计写成当前能力",
+        "能为故障 rule、调度 gate 与 event overflow 给出 site/scope/nth、锁、可睡眠性、资源和 cleanup 合同"
+      ],
+      "source_anchors": [
+        {"path": "kernel/kalloc.c", "symbol": "kalloc("},
+        {"path": "kernel/proc.c", "symbol": "scheduler("},
+        {"path": "kernel/proc.c", "symbol": "sleep("},
+        {"path": "kernel/proc.c", "symbol": "wakeup("},
+        {"path": "kernel/fs.c", "symbol": "balloc("},
+        {"path": "kernel/fs.c", "symbol": "dirlink("},
+        {"path": "kernel/bio.c", "symbol": "bget("},
+        {"path": "kernel/log.c", "symbol": "begin_op("},
+        {"path": "kernel/log.c", "symbol": "commit("},
+        {"path": "kernel/log.c", "symbol": "recover_from_log("},
+        {"path": "kernel/virtio_disk.c", "symbol": "virtio_disk_intr("},
+        {"path": "user/usertests.c", "symbol": "quicktests[]"},
+        {"path": "user/usertests.c", "symbol": "slowtests[]"},
+        {"path": "test-xv6.py", "symbol": "test_crash("}
+      ],
       "evidence_dimensions": ["S", "F", "B", "C", "R"],
-      "resources": [],
-      "reviews": []
+      "resources": [
+        "resources/filesystem/filesystem-audit.patch",
+        "resources/filesystem/run-lab.py",
+        "resources/scheduling-and-synchronization/syncproject.patch",
+        "resources/scheduling-and-synchronization/run-lab.py",
+        "resources/persistence/persistence-audit.patch",
+        "resources/persistence/scenarios.json",
+        "resources/persistence/run-lab.py",
+        "resources/recovery/recovery-audit.patch",
+        "resources/recovery/scenarios.json",
+        "resources/recovery/run-project.py",
+        "resources/fault-injection-and-traceability/rubric.md",
+        "resources/fault-injection-and-traceability/report-template.md",
+        "templates/trace-worksheet.md",
+        "questions/fault-injection-and-traceability.md",
+        "questions/answers/fault-injection-and-traceability.md"
+      ],
+      "reviews": ["reviews/fault-injection-and-traceability-0.1.0.md"]
     },
     {
       "id": "core.evidence-synthesis",

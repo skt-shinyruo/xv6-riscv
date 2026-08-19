@@ -1567,6 +1567,8 @@ def self_test():
             tx, "seq=15 point=41", "seq=16 point=27"), "tx", False),
         ("dirty-ledger", tx.replace("refs=0 locks=0 disk=0",
                                       "refs=1 locks=0 disk=0", 1), "tx", False),
+        ("event-overflow", tx.replace(" error=0", " error=1"),
+         "tx", False),
         ("capacity-inequality", good["admission-empty"].replace(
             "point=21 pid=14 hart=0 domain=-1 slot=-1 ref=-1 dev=1 block=0 "
             "buffer_generation=0 log_n=0 outstanding=3",

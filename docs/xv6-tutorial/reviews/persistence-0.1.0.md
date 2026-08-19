@@ -84,6 +84,12 @@ parallel 则以两个 hart 和两个 domain 独立证明跨域重叠。cache-ful
 focused transcript SHA-256 依次为 `eaff7910...`、`48d00bdc...`、`7520cde1...`、
 `fefed0a8...`、`371c5f30...`。`logstress f0` 只接受一次预期的 `write failed -1`，无 panic。
 
+#19 只在 `ReplaySource` self-test matrix 新增 `error=1` event-overflow mutation；runtime parser、guest
+fixture、scenario 和 candidate 均未改变。上列历史机器附录绑定的 runner 是
+`cdcdfcd358715b8aad47ae1fcfa5be01d398c3edf9ed81203738d94e634ddd00`，不是当前
+`2af2de66...`；它仍是未变动态路径的历史证据，但不得称为当前 runner 的 fresh QEMU report。当前
+runner 另以 7 good/33 rejected 的 self-test 和 static/build/reverse/cleanup 验收该增量。
+
 ## 修正与复查
 
 临时 baseline export 在 `make clean` 后按 candidate/fixture 逆序恢复并逐文件比较；QEMU/driver

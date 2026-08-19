@@ -11,6 +11,6 @@
 | 进程、调度与内存 (`processes-and-memory`) | 0 | 0 | 4 |
 | 通信与设备 I/O (`communication-and-io`) | 0 | 0 | 2 |
 | 文件系统与持久化 (`persistence`) | 0 | 0 | 3 |
-| 证据、失败与综合 (`evidence`) | 2 | 0 | 1 |
+| 证据、失败与综合 (`evidence`) | 1 | 0 | 2 |
 
 只有满足技术发布门槛并完成非作者走查的单元才能标为 `verified`。
