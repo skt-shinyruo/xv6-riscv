@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "release": {
-    "version": "0.1.0",
-    "status": "draft",
+    "version": "1.0.0",
+    "status": "verified",
     "baseline_commit": "e6fc75076de152c5446f2c6be9bb80b848e7cc5d",
-    "coverage_complete": false,
-    "compatibility": "This draft teaches the pinned baseline. Later source changes require a deliberate tutorial release."
+    "coverage_complete": true,
+    "compatibility": "This verified coverage-complete release teaches the pinned baseline. Later source changes require a deliberate tutorial release."
   },
   "stages": [
     {
@@ -157,7 +157,9 @@
       ],
       "source_anchors": [
         {"path": "Makefile", "symbol": "qemu-gdb:"},
-        {"path": ".gdbinit.tmpl-riscv", "symbol": "target remote"}
+        {"path": ".gdbinit.tmpl-riscv", "symbol": "target remote"},
+        {"path": ".vscode/extensions.json", "symbol": "recommendations"},
+        {"path": ".vscode/launch.json", "symbol": "configurations"}
       ],
       "evidence_dimensions": ["F", "B"],
       "resources": ["resources/foundation/gdb-commands.txt"],
@@ -267,9 +269,12 @@
         {"path": "user/user.ld", "symbol": "SECTIONS"},
         {"path": "user/ulib.c", "symbol": "start("},
         {"path": "user/echo.c", "symbol": "main("},
+        {"path": "user/printf.c", "symbol": "vprintf("},
+        {"path": "user/umalloc.c", "symbol": "malloc("},
         {"path": "user/user.h", "symbol": "write("},
         {"path": "user/usys.pl", "symbol": "sub entry"},
         {"path": "kernel/syscall.h", "symbol": "SYS_write"},
+        {"path": "kernel/elf.h", "symbol": "struct elfhdr"},
         {"path": "mkfs/mkfs.c", "symbol": "shortname[0] == '_'"},
         {"path": "mkfs/mkfs.c", "symbol": "iappend("},
         {"path": "kernel/proc.c", "symbol": "forkret("},
@@ -479,7 +484,10 @@
         {"path": "user/usertests.c", "symbol": "exitwait("},
         {"path": "user/usertests.c", "symbol": "reparent2("},
         {"path": "user/usertests.c", "symbol": "killstatus("},
-        {"path": "user/usertests.c", "symbol": "forktest("}
+        {"path": "user/usertests.c", "symbol": "forktest("},
+        {"path": "user/forktest.c", "symbol": "forktest("},
+        {"path": "user/kill.c", "symbol": "main("},
+        {"path": "user/zombie.c", "symbol": "main("}
       ],
       "evidence_dimensions": ["S", "F", "B"],
       "resources": [
@@ -509,6 +517,8 @@
         {"path": "kernel/proc.h", "symbol": "struct context"},
         {"path": "kernel/proc.h", "symbol": "struct cpu"},
         {"path": "kernel/proc.h", "symbol": "enum procstate"},
+        {"path": "kernel/spinlock.h", "symbol": "struct spinlock"},
+        {"path": "kernel/sleeplock.h", "symbol": "struct sleeplock"},
         {"path": "kernel/swtch.S", "symbol": "swtch:"},
         {"path": "kernel/proc.c", "symbol": "scheduler("},
         {"path": "kernel/proc.c", "symbol": "sched("},
@@ -566,6 +576,7 @@
         "能用 lazy-NX、permission、三点 OOM、late exec 和页账本区分正常、失败与最终清理"
       ],
       "source_anchors": [
+        {"path": "kernel/vm.h", "symbol": "#define SBRK_LAZY"},
         {"path": "kernel/riscv.h", "symbol": "#define PTE_V"},
         {"path": "kernel/riscv.h", "symbol": "#define PTE_X"},
         {"path": "kernel/riscv.h", "symbol": "#define MAXVA"},
@@ -732,6 +743,9 @@
         {"path": "kernel/proc.c", "symbol": "kwait("},
         {"path": "user/sh.c", "symbol": "runcmd("},
         {"path": "user/init.c", "symbol": "main("},
+        {"path": "user/grep.c", "symbol": "grep("},
+        {"path": "user/wc.c", "symbol": "wc("},
+        {"path": "kernel/printk.c", "symbol": "printk("},
         {"path": "kernel/console.c", "symbol": "consolewrite("},
         {"path": "kernel/console.c", "symbol": "consoleread("},
         {"path": "kernel/console.c", "symbol": "consoleintr("},
@@ -1032,6 +1046,8 @@
         {"path": "kernel/fs.h", "symbol": "struct dirent"},
         {"path": "kernel/proc.c", "symbol": "forkret("},
         {"path": "kernel/sysfile.c", "symbol": "sys_unlink("},
+        {"path": "user/forphan.c", "symbol": "main("},
+        {"path": "user/dorphan.c", "symbol": "main("},
         {"path": "test-xv6.py", "symbol": "test_crash("}
       ],
       "evidence_dimensions": ["S", "F", "B", "R"],
@@ -1360,6 +1376,26 @@
     {"path": "user/rm.c", "kind": "user", "owner": "core.filesystem", "secondary": []},
     {"path": "user/usertests.c", "kind": "user", "owner": "lab.add-system-call", "secondary": ["core.syscall-roundtrip", "core.process-and-memory", "core.scheduling-and-synchronization", "core.virtual-memory", "project.copy-on-write", "core.device-io", "core.filesystem", "core.persistence"]},
     {"path": "user/logstress.c", "kind": "user", "owner": "core.persistence", "secondary": []},
-    {"path": "test-xv6.py", "kind": "test", "owner": "lab.add-system-call", "secondary": ["core.device-io", "core.filesystem", "core.persistence", "project.crash-recovery"]}
+    {"path": "test-xv6.py", "kind": "test", "owner": "lab.add-system-call", "secondary": ["core.device-io", "core.filesystem", "core.persistence", "project.crash-recovery"]},
+    {"path": ".vscode/extensions.json", "kind": "editor-config", "owner": "foundation.guided-debugging", "secondary": ["foundation.command-line-build"]},
+    {"path": ".vscode/launch.json", "kind": "debug-config", "owner": "foundation.guided-debugging", "secondary": ["foundation.command-line-build"]},
+    {"path": "kernel/types.h", "kind": "header", "owner": "foundation.c-memory", "secondary": ["core.user-program-and-abi", "core.virtual-memory"]},
+    {"path": "kernel/string.c", "kind": "kernel", "owner": "foundation.machine-and-riscv", "secondary": ["foundation.c-memory", "core.user-program-and-abi"]},
+    {"path": "kernel/elf.h", "kind": "header", "owner": "core.user-program-and-abi", "secondary": ["core.process-and-memory", "core.virtual-memory"]},
+    {"path": "user/echo.c", "kind": "user", "owner": "core.user-program-and-abi", "secondary": ["core.observe-system"]},
+    {"path": "user/printf.c", "kind": "user", "owner": "core.user-program-and-abi", "secondary": ["foundation.c-memory", "core.communication-and-io"]},
+    {"path": "user/umalloc.c", "kind": "user", "owner": "core.user-program-and-abi", "secondary": ["foundation.c-memory", "core.virtual-memory"]},
+    {"path": "kernel/vm.h", "kind": "header", "owner": "core.virtual-memory", "secondary": ["core.process-and-memory", "project.copy-on-write"]},
+    {"path": "user/forktest.c", "kind": "user", "owner": "core.process-and-memory", "secondary": ["core.scheduling-and-synchronization", "core.global-invariants"]},
+    {"path": "user/kill.c", "kind": "user", "owner": "core.process-and-memory", "secondary": ["core.scheduling-and-synchronization"]},
+    {"path": "user/zombie.c", "kind": "user", "owner": "core.process-and-memory", "secondary": ["core.scheduling-and-synchronization", "core.global-invariants"]},
+    {"path": "kernel/printk.c", "kind": "kernel", "owner": "core.communication-and-io", "secondary": ["core.observe-system", "core.scheduling-and-synchronization", "core.evidence-synthesis"]},
+    {"path": "user/grep.c", "kind": "user", "owner": "core.communication-and-io", "secondary": ["core.user-program-and-abi", "core.filesystem"]},
+    {"path": "user/wc.c", "kind": "user", "owner": "core.communication-and-io", "secondary": ["core.user-program-and-abi", "core.filesystem"]},
+    {"path": "user/forphan.c", "kind": "user", "owner": "project.crash-recovery", "secondary": ["core.process-and-memory", "core.filesystem"]},
+    {"path": "user/dorphan.c", "kind": "user", "owner": "project.crash-recovery", "secondary": ["core.process-and-memory", "core.filesystem"]},
+    {"path": "kernel/defs.h", "kind": "header", "owner": "core.evidence-synthesis", "secondary": ["core.boot-traps-and-interrupts", "core.process-and-memory", "core.virtual-memory", "core.communication-and-io", "core.device-io", "core.filesystem", "core.persistence", "project.crash-recovery"]},
+    {"path": "user/grind.c", "kind": "user", "owner": "core.evidence-synthesis", "secondary": ["core.process-and-memory", "core.virtual-memory", "core.communication-and-io", "core.filesystem", "core.persistence"]},
+    {"path": "user/stressfs.c", "kind": "user", "owner": "core.evidence-synthesis", "secondary": ["core.process-and-memory", "core.communication-and-io", "core.filesystem", "core.persistence"]}
   ]
 }

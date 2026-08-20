@@ -105,6 +105,60 @@ def validate_release(manifest, validation):
     return True
 
 
+def validate_release_completion(manifest, units, validation):
+    release = manifest.get("release", {})
+    version = release.get("version", "")
+    match = re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version)
+    if match is None:
+        validation.error(f"release.version must be numeric semver: {version}")
+        return
+    major = int(match.group(1))
+    coverage_complete = release.get("coverage_complete")
+    status = release.get("status")
+    if not isinstance(coverage_complete, bool):
+        validation.error("release.coverage_complete must be a boolean")
+        return
+    if major >= 1 and not coverage_complete:
+        validation.error("1.x release must be coverage_complete")
+    if major >= 1 and status != "verified":
+        validation.error("1.x release must be verified")
+    if coverage_complete and major < 1:
+        validation.error("coverage_complete release must use version 1.x or later")
+    if coverage_complete and status != "verified":
+        validation.error("coverage_complete release must be verified")
+    if coverage_complete:
+        incomplete = sorted(
+            unit_id for unit_id, unit in units.items() if unit["status"] != "verified"
+        )
+        if incomplete:
+            validation.error(
+                "coverage_complete release has non-verified units: " + ", ".join(incomplete)
+            )
+
+
+def validate_question_migration(manifest, validation):
+    if not manifest.get("release", {}).get("coverage_complete"):
+        return
+    legacy_root = REPO_ROOT / "docs" / "questions"
+    readme = legacy_root / "README.md"
+    if not readme.is_file():
+        validation.error("coverage_complete release is missing docs/questions/README.md compatibility entry")
+        return
+    remaining = sorted(
+        path.relative_to(legacy_root).as_posix()
+        for path in legacy_root.rglob("*")
+        if path.is_file() and path != readme
+    )
+    if remaining:
+        validation.error(
+            "coverage_complete release retains legacy question files: " + ", ".join(remaining)
+        )
+    if "xv6-tutorial/questions" not in readme.read_text(encoding="utf-8"):
+        validation.error(
+            "docs/questions/README.md must point to the authoritative xv6-tutorial/questions set"
+        )
+
+
 def validate_stages(manifest, validation):
     stages = manifest.get("stages")
     if not isinstance(stages, list) or not stages:
@@ -402,6 +456,15 @@ def validate_source(manifest, units, validation):
             owner = area.get("owner")
             if owner in units and units[owner]["status"] != "verified":
                 validation.error(f"coverage_complete source owner is not verified: {area.get('path')} -> {owner}")
+            if owner in units and area.get("path") not in {
+                anchor.get("path")
+                for anchor in units[owner]["source_anchors"]
+                if isinstance(anchor, dict)
+            }:
+                validation.error(
+                    "coverage_complete source is not anchored by its owner: "
+                    f"{area.get('path')} -> {owner}"
+                )
     for unit_id, unit in units.items():
         for anchor in unit["source_anchors"]:
             if not isinstance(anchor, dict) or set(anchor) != {"path", "symbol"}:
@@ -482,7 +545,9 @@ def main():
         baseline_ready = validate_release(manifest, validation)
         stages = validate_stages(manifest, validation)
         units = validate_units(manifest, stages, validation)
+        validate_release_completion(manifest, units, validation)
         validate_source(manifest, units, validation)
+        validate_question_migration(manifest, validation)
         if baseline_ready:
             validate_baseline_sources(manifest, validation, args.development)
         validate_markdown_links(validation)

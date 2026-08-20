@@ -91,6 +91,11 @@ forkret()
 所以 redo atomicity 不能推出 namespace reachability 或 orphan cleanup，offline checker 必须在完整启动
 和 reclaim 后重新检查两者。
 
+原生 `user/forphan.c:main()` 创建并 unlink 仍保持 open 的 file，
+`user/dorphan.c:main()` unlink 当前工作目录；两者打印 `wait for kill and reclaim` 后暂停。
+`test-xv6.py:test_crash()` 用它们做 crash/reboot/`ireclaim` 回归。该路径依赖 sleep、文本和一次
+QEMU kill，只能补充真实启动回归，不能替代四个 stable crash ID、host exact-PID kill 或离线 matrix。
+
 ### 三类证据不能互相冒充
 
 | profile | 操作与 observable | 能支持 | 不能支持 |
@@ -126,6 +131,7 @@ rg -n '^read_head\(|^recover_from_log\(|^initlog\(' kernel/log.c
 rg -n '^fsinit\(|^ireclaim\(|^iput\(|^itrunc\(|^iupdate\(' kernel/fs.c
 rg -n '^sys_unlink\(' kernel/sysfile.c
 rg -n '^forkret\(' kernel/proc.c
+rg -n 'wait for kill and reclaim' user/forphan.c user/dorphan.c
 rg -n 'struct logheader|struct superblock|struct dinode|IBLOCK|BBLOCK' kernel/log.c kernel/fs.h
 rg -n '^virtio_disk_rw\(|^virtio_disk_intr\(' kernel/virtio_disk.c
 rg -n 'RC_LOG_DATA_COMPLETE|RC_COMMIT_HEADER_COMPLETE|RC_HOME_INSTALL_COMPLETE|RC_HEADER_CLEAR_COMPLETE' \

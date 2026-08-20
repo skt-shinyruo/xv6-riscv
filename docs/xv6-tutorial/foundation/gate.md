@@ -83,4 +83,4 @@ make CPUS=1 qemu-gdb
 
 ## 退出产物与后续单元
 
-提交完整 gate 包并按 rubric 自评；任一行“不满足”都不能进入核心路径。通过后进入 [从 QEMU 启动到 shell 提示符](../core/observe-system.md)。教程整体发布仍会在后续核心单元建设期间保持 `draft`，这不改变已验证 Foundation gate 的效力。
+提交完整 gate 包并按 rubric 自评；任一行“不满足”都不能进入核心路径。通过后进入 [从 QEMU 启动到 shell 提示符](../core/observe-system.md)。教程发布状态以 `curriculum.json` 和生成导航为准；后续发布状态变化不改变已验证 Foundation gate 的效力。

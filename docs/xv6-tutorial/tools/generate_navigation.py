@@ -28,6 +28,11 @@ def unit_link(unit, output_path):
 def render_root(manifest):
     release = manifest["release"]
     stages = sorted(manifest["stages"], key=lambda item: item["order"])
+    release_note = (
+        "`verified` 表示全部登记单元已完成非作者走查；`coverage_complete=true` 表示 scoped handwritten inputs 都有 verified primary owner。"
+        if release["status"] == "verified"
+        else "`draft` 表示内容已落盘并通过机械检查，但尚未完成非作者走查，不能当作 verified 教学路径。"
+    )
     lines = [
         GENERATED_HEADER.rstrip(),
         "",
@@ -42,12 +47,13 @@ def render_root(manifest):
         f"- 源码基线：`{release['baseline_commit']}`",
         f"- 完整覆盖：`{str(release['coverage_complete']).lower()}`",
         "",
-        "`draft` 表示内容已落盘并通过机械检查，但尚未完成非作者走查，不能当作 verified 教学路径。",
+        release_note,
         "",
         "## 从这里开始",
         "",
         "- 零先修学习者：从[基础路径](foundation/README.md)开始，完成 Foundation gate 后进入核心路径。",
         "- 已具备基础者：先完成 Foundation gate；通过后进入同一条[核心路径](core/README.md)。",
+        "- 问题驱动复核：使用教程内的[权威问题集](questions/README.md)；`docs/questions/` 只保留兼容入口。",
         "- 查看整体建设状态：[阶段索引](stages/README.md)。",
         "",
         "## 建设约束",
@@ -151,16 +157,53 @@ def render_stages(manifest):
     return "\n".join(lines)
 
 
+def render_questions(manifest, output_path):
+    stage_order = {stage["id"]: stage["order"] for stage in manifest["stages"]}
+    entries = []
+    for unit in manifest["units"]:
+        for resource in unit["resources"]:
+            if resource.startswith("questions/") and not resource.startswith("questions/answers/"):
+                entries.append((stage_order[unit["stage"]], unit["order"], unit, resource))
+    lines = [
+        GENERATED_HEADER.rstrip(),
+        "",
+        "# xv6 教程权威问题集",
+        "",
+        "问题从真实控制流、状态、ownership、失败路径和证据边界生成；单元依赖与状态以 `curriculum.json` 为准。",
+        "",
+        "| 阶段顺序 | 单元 | 问题路径 | 状态 |",
+        "|---:|---|---|---|",
+    ]
+    for stage, order, unit, resource in sorted(entries):
+        target = TUTORIAL_ROOT / resource
+        if unit["status"] == "planned" and not target.exists():
+            question = f"{unit['title']} (`{resource}`)"
+        else:
+            relative = os.path.relpath(target, output_path.parent)
+            question = f"[{unit['title']}]({Path(relative).as_posix()})"
+        lines.append(
+            f"| {stage}.{order} | `{unit['id']}` | {question} | `{unit['status']}` |"
+        )
+    lines.extend([
+        "",
+        "旧 `docs/questions/` 只保留指向本页的兼容入口，不维护同步副本。",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 def expected_outputs(manifest):
     root_output = TUTORIAL_ROOT / "README.md"
     foundation_output = TUTORIAL_ROOT / "foundation" / "README.md"
     core_output = TUTORIAL_ROOT / "core" / "README.md"
     stages_output = TUTORIAL_ROOT / "stages" / "README.md"
+    questions_output = TUTORIAL_ROOT / "questions" / "README.md"
     return {
         root_output: render_root(manifest),
         foundation_output: render_foundation(manifest, foundation_output),
         core_output: render_core(manifest, core_output),
         stages_output: render_stages(manifest),
+        questions_output: render_questions(manifest, questions_output),
     }
 
 

@@ -54,6 +54,10 @@ exit -> wait`；ownership 边是 `descriptor -> file ref -> pipe endpoint -> buf
 若 parent 忘记关闭 writer，right child 永远看不到 EOF；若 child 忘记关闭 reader，
 left writer 不能得到 broken-end 结果。
 
+`user/grep.c:grep()` 在多次 `read()` 间保留未完成行，只把匹配的完整行写到 fd 1；
+`user/wc.c:wc()` 逐块读取并累计行、词、字节。两者把 shell 的 fd 0/1 pipeline 约定落到
+具体 consumer，但没有检查并发顺序或最终资源账本，所以只作端到端功能回归。
+
 ### console 与 inode 的 device 边界
 
 `user/init.c:main` 打开 `console` 并通过 `dup` 保证 fd 0/1/2。`sys_read/sys_write`
@@ -62,6 +66,10 @@ descriptor 的路径选择空 slot。`FD_DEVICE` 进入 `devsw[CONSOLE]`，
 `consolewrite` 与 `consoleread` 是本单元可见的 file/device dispatch 边界；后者在
 `cons.r == cons.w` 时睡在 `&cons.r`。UART 如何推进 ring、PLIC 如何 claim/complete
 中断源，不属于 descriptor 或 file ownership，留给下一设备单元。
+
+`kernel/printk.c:printk()` 是另一条内核诊断路径：正常输出用 `pr.lock` 防止格式串交错，
+再直接调用 `consputc()`；它不经过用户 `printf`、fd table 或 `filewrite()`。panic 路径会绕开
+该锁以避免再次死锁，因此 printk 输出只能作 observable，不能充当 file/pipe owner ledger。
 
 磁盘路径是另一条 ownership 链：普通 inode read 从 `fileread -> readi -> bread`
 取得 buffer sleeplock；修改型路径才在相应 syscall 或 `filewrite` 中用
@@ -77,6 +85,8 @@ rg -n '^filealloc\(|^filedup\(|^fileclose\(|^fileread\(|^filewrite\(' kernel/fil
 rg -n '^pipealloc\(|^pipeclose\(|^pipewrite\(|^piperead\(' kernel/pipe.c
 rg -n '^argfd\(|^fdalloc\(|^sys_read\(|^sys_write\(|^sys_dup\(|^sys_close\(|^sys_pipe\(' kernel/sysfile.c
 rg -n '^runcmd\(|case PIPE|^main\(' user/sh.c user/init.c
+rg -n '^grep\(|^wc\(' user/grep.c user/wc.c
+rg -n '^printk\(' kernel/printk.c
 rg -n '^consolewrite\(|^consoleread\(|^consoleintr\(' kernel/console.c
 rg -n '^begin_op\(|^end_op\(' kernel/log.c
 rg -n 'struct io_snapshot|iosnapshot\(|fileaudit\(|pipeaudit\(|procaudit\(|freepagecount\(' \\

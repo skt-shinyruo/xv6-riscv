@@ -23,12 +23,19 @@
 
 本仓库从 `.gdbinit.tmpl-riscv` 生成 `.gdbinit`，并根据用户 ID 选择端口。不要假定模板中的 `1234` 就是实际端口；运行 `make print-gdbport` 查看。
 
+`.vscode/extensions.json:recommendations` 只建议可选调试扩展；
+`.vscode/launch.json:configurations` 把 attach、`kernel/kernel` 符号文件和一组 GDB
+初始化命令包装成 UI 配置。它硬编码的 target 不能覆盖 `make print-gdbport`，也不能替代下面的
+CLI oracle；端口或工具路径不一致时，以生成的端口和显式 GDB 命令为准。
+
 ## 源码追踪计划
 
 1. `Makefile:qemu-gdb`：QEMU 调试入口。
 2. `Makefile:print-gdbport`：实际端口。
 3. `.gdbinit.tmpl-riscv:target remote`：连接、架构和符号设置。
-4. `kernel/entry.S:_entry`、`kernel/start.c:start`、`kernel/main.c:main`：三个断点。
+4. `.vscode/extensions.json:recommendations`、`.vscode/launch.json:configurations`：可选 UI
+   如何映射到同一 attach 合同。
+5. `kernel/entry.S:_entry`、`kernel/start.c:start`、`kernel/main.c:main`：三个断点。
 
 ## 观察任务
 

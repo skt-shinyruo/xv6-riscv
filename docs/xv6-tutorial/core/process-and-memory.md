@@ -123,6 +123,12 @@ child 是 live、sleeping 还是 zombie 过滤；`/init` 的 wait 循环最终�
 `RUNNABLE`。目标在可取消等待或返回用户态的安全点观察 flag，才执行
 `kexit(-1)`，之后仍需 parent `wait()`。
 
+三个独立用户程序给出命令层边界：`user/forktest.c:forktest()` 用小型专用 ELF
+填满 proc table，确认 `fork()` 失败后已创建 child 都能 `wait()`；`user/kill.c:main()`
+只把 argv 中的 pid 逐个交给 `kill()`，不替内核等待回收；`user/zombie.c:main()` 让 child
+先退出、parent 暂停后再退出，用于观察临时 zombie 和 reparent。这些程序是回归/观察入口，
+没有稳定事件或资源账本，不能替代本单元 fixture 与 `usertests` oracle。
+
 当前分支还有两个不可推广的边界：`kkill(0)` 可能匹配 `pid==0` 的 `UNUSED`
 槽并污染 `killed`，而 `allocproc()` 不主动清它；杀 init 也没有入口拒绝，
 最终会触发 `panic("init exiting")`。本实验验证并记录前者的源码事实，但不会
@@ -147,6 +153,7 @@ rg -n '^main\(' user/init.c
 rg -n '^runcmd\(|^main\(' user/sh.c
 rg -n '^#define (NPROC|NOFILE|NFILE|MAXARG|USERSTACK)' kernel/param.h
 rg -n '^#define PGSIZE' kernel/riscv.h
+rg -n '^forktest\(|^main\(' user/forktest.c user/kill.c user/zombie.c
 rg -n '^exitwait\(|^reparent\(|^reparent2\(|^killstatus\(|^forktest\(' user/usertests.c
 ```
 

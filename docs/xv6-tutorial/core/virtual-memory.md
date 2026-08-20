@@ -83,6 +83,8 @@ trampoline 或单独所有的 trapframe PA，再以 `uvmfree()` 释放普通 use
 
 ### logical size、hole 和四种 fault 结果
 
+`kernel/vm.h:SBRK_EAGER/SBRK_LAZY` 是用户运行时传给 `sys_sbrk()` 的模式 ABI；
+它只选择 `growproc()` 立即映射或仅推进 logical size，不定义 PTE layout，也不表示已有物理页。
 正向 lazy `sys_sbrk()` 只检查 unsigned wrap 与 `<=TRAPFRAME`，再增加 `p->sz`；
 `p->sz` 是逻辑上界，不是 heap interval metadata。当前 `vmfault()` 的分类是：
 
@@ -133,6 +135,7 @@ trampoline 链接段由 `kernel/kernel.ld` 页对齐并断言恰好一页；kern
 用稳定 `path:symbol` 建立 translation、lifecycle、fault 和 trampoline 四张图：
 
 ```sh
+rg -n '^#define SBRK_(EAGER|LAZY)' kernel/vm.h
 rg -n '^#define (PTE_[VRWXU]|MAXVA)|^#define PX|MAKE_SATP|sfence_vma' kernel/riscv.h
 rg -n '^#define (TRAMPOLINE|TRAPFRAME|KSTACK)' kernel/memlayout.h
 rg -n '^kvmmake\(|^walk\(|^mappages\(|^uvmalloc\(|^uvmcopy\(' kernel/vm.c

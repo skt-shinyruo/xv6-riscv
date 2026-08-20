@@ -62,6 +62,11 @@ Makefile:UPROGS + README + mkfs/mkfs
 `user/usys.o` 时才读取编号头文件，并在 `user/usys.d` 记录依赖。因此应修改
 生成器或编号源，不应直接修改 `user/usys.S`。
 
+ULIB 的另外两条边也属于用户运行时，而不是内核 ABI：`user/printf.c:vprintf()`
+解析格式后经 `putc() -> write()` 写指定 fd；`user/umalloc.c:malloc()` 在进程内维护
+free list，只有 `morecore()` 才用 `sbrk()` 扩大 heap。前者不是
+`kernel/printk.c:printk()`，后者也不直接拥有物理页；它们最终仍经过本图中的 syscall stub。
+
 当前分支有一个会改变观察结果的例外：`Makefile:user/_forktest` 使用更小的
 库集合，并显式指定 `-e main -Ttext 0`；不要用 `_forktest` 推断普通用户
 程序的入口规则。
@@ -75,6 +80,10 @@ Makefile:UPROGS + README + mkfs/mkfs
 ```text
 ELF header.entry == symbol(start)
 ```
+
+`kernel/elf.h:struct elfhdr` 定义 `entry/phoff/phnum`，`struct proghdr` 定义每段的
+`off/vaddr/filesz/memsz/flags`；`kexec()` 只接受 `ELF_MAGIC` 并逐个装入
+`ELF_PROG_LOAD`。linker 产物与 loader 因而通过同一份磁盘格式相接，而不是共享 C 调用约定。
 
 不同程序的 `main` 大小不同，`start` 的数值地址也可能不同，不能把某次
 `0x7a` 或 `/init` 的 `0xbc` 当成全局常量。`kernel/exec.c:kexec` 读取 ELF，
@@ -136,8 +145,10 @@ Makefile:UPROGS
 
 1. `Makefile:_%`、`Makefile:ULIB`：普通用户 ELF 的输入与链接顺序。
 2. `Makefile:$U/usys.S`、`user/usys.pl:entry`：生成 stub 的权威来源。
-3. `user/user.ld:SECTIONS`、`user/ulib.c:start`：地址布局、入口包装和返回。
-4. `user/echo.c:main`、`user/user.h:write`：C 调用点与声明。
+3. `user/user.ld:SECTIONS`、`kernel/elf.h:struct elfhdr`、`user/ulib.c:start`：
+   磁盘格式、地址布局、入口包装和返回。
+4. `user/echo.c:main`、`user/printf.c:vprintf`、`user/umalloc.c:malloc`、
+   `user/user.h:write`：程序、用户运行时与 C 声明边界。
 5. `kernel/syscall.h:SYS_write`：`a7` 中编号的来源。
 6. `Makefile:UPROGS`、`Makefile:fs.img`、`mkfs/mkfs.c:main` 中的
    `shortname` 分支及 `mkfs/mkfs.c:iappend`：宿主 ELF 的镜像名称、输入边

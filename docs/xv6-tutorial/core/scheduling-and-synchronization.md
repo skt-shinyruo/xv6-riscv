@@ -68,6 +68,11 @@ scheduler: 从 swtch 返回，接住 p->lock -> clear c->proc -> release(p->lock
 acquire/release 让不同 hart 经同一锁观察临界区的 happens-before；关闭中断只
 防止当前 hart 在持锁时被会重取同锁的 handler 打断，并不阻止其他 hart 并行。
 
+`kernel/spinlock.h:struct spinlock` 保存 `locked` 以及仅用于调试的 `name/cpu` owner；
+`kernel/sleeplock.h:struct sleeplock` 则把短时 spinlock、可睡眠的 `locked` 谓词和
+持有者 pid 放在同一对象。header 给出可观察状态，真正的 acquire/release 与等待协议仍由
+对应 `.c` 实现；不能看到 `pid` 就把 sleeplock 当作进程资源所有权。
+
 `push_off()/pop_off()` 用 `struct cpu.noff/intena` 嵌套记录第一次关闭前的状态。
 `mycpu()` 只能在中断关闭时使用，因为可抢占进程可能换 hart。`sched()` 中的
 `intena` 是 C 局部状态，属于暂停的进程 kernel continuation；编译器
@@ -136,6 +141,7 @@ rg -n '^swtch:' kernel/swtch.S
 rg -n '^kernelvec:' kernel/kernelvec.S
 rg -n '^scheduler\(void\)|^sched\(void\)|^yield\(void\)' kernel/proc.c
 rg -n '^sleep\(void|^wakeup\(void' kernel/proc.c
+rg -n '^struct spinlock|^struct sleeplock' kernel/spinlock.h kernel/sleeplock.h
 rg -n '^acquire\(struct|^release\(struct|^push_off\(void\)|^pop_off\(void\)' kernel/spinlock.c
 rg -n '^usertrap\(void\)|^kerneltrap\(\)|yield\(\)' kernel/trap.c
 rg -n '^piperead\(|^pipewrite\(' kernel/pipe.c

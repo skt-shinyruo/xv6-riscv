@@ -6,17 +6,18 @@
 
 ## 当前发布版
 
-- 版本：`0.1.0`
-- 状态：`draft`
+- 版本：`1.0.0`
+- 状态：`verified`
 - 源码基线：`e6fc75076de152c5446f2c6be9bb80b848e7cc5d`
-- 完整覆盖：`false`
+- 完整覆盖：`true`
 
-`draft` 表示内容已落盘并通过机械检查，但尚未完成非作者走查，不能当作 verified 教学路径。
+`verified` 表示全部登记单元已完成非作者走查；`coverage_complete=true` 表示 scoped handwritten inputs 都有 verified primary owner。
 
 ## 从这里开始
 
 - 零先修学习者：从[基础路径](foundation/README.md)开始，完成 Foundation gate 后进入核心路径。
 - 已具备基础者：先完成 Foundation gate；通过后进入同一条[核心路径](core/README.md)。
+- 问题驱动复核：使用教程内的[权威问题集](questions/README.md)；`docs/questions/` 只保留兼容入口。
 - 查看整体建设状态：[阶段索引](stages/README.md)。
 
 ## 建设约束

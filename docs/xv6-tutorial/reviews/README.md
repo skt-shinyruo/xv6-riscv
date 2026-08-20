@@ -1,11 +1,8 @@
 # 走查记录
 
-只有完成技术检查并经过非作者走查的单元才能标记为 `verified`。走查记录使用 `../templates/walkthrough-review.md`，不保存姓名、联系方式或其他身份信息。
+`curriculum.json` 的每个 `verified` 单元都登记至少一份非作者走查记录；manifest 是单元状态与记录路径的
+机器权威。本目录保存这些增量记录以及 release audit，不另维护手工状态清单。
 
-当前 `0.1.0` 发布版仍为 `draft`。已登记的增量验证记录：
-
-- [Foundation 0.1.0 非作者走查](foundation-0.1.0.md)：基础路径五个单元按 `requires` 顺序通过。
-- [Observe-system 0.1.0 非作者走查](observe-system-0.1.0.md)：首个核心单元的启动时间线、配置实验和清理证据通过。
-- [User-program-and-ABI 0.1.0 非作者走查](user-program-and-abi-0.1.0.md)：用户程序构建、ELF/ABI、镜像路径和隔离实验通过。
-- [Syscall-roundtrip 0.1.0 非作者走查](syscall-roundtrip-0.1.0.md)：`getpid` 正常与未知编号的特权级、页表、栈、trapframe 和返回轨迹通过。
-- [Add-system-call 0.1.0 非作者走查](add-system-call-0.1.0.md)：六文件 `sysprobe` patch、missing-dispatch、三个 `int` 往返、三层回归和 cleanup 通过。
+[1.0.0 非作者发布审计](release-1.0.0.md) 在 clean candidate checkout 上复核了 76/76 source
+ownership、generated-output provenance、问题迁移、完整 publication pipeline、build/QEMU/GDB
+regressions 与 cleanup，结果为 PASS。
